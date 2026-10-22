@@ -8,8 +8,8 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.13 |
-| `development-plan.md` | v0.1 |
+| `design.md` | v0.14 |
+| `development-plan.md` | v0.2 |
 | `AGENTS.md`, `docs/AGENTS.md` | v1 |
 
 ## Version summaries
@@ -182,3 +182,11 @@ A document map at the top of the design lists the canonical section per topic. N
 | File renamed | `review-log.md` is now `revision-changes.md`. |
 | Duplicates removed | Version number and date removed from the `design.md` and `development-plan.md` headers (versions live in the table above); the per-version regression scenarios dropped from this log (the test plan in `design.md` is the single copy); the phase 0 spike list in `design.md` section 16 reduced to a pointer, since the spikes are tasks in `development-plan.md`. |
 | New documents | `AGENTS.md` (project entry point for agents) and `docs/AGENTS.md` (documentation rules). `development-plan.md` v0.1 created from design phases 0 to 5. |
+
+## Implementation language v0.14
+
+| Change | Detail |
+|---|---|
+| Core and CLI in Python | The TypeScript/Node/Bun core is replaced by Python 3.11+ (pydantic, asyncio, `uv`, `pytest`, `ruff`, `pyright`). TypeScript remains only for the OpenCode plugin, which OpenCode requires. Reason: no Node runtime for `orch` users, no native lock binding, and the subprocess-bound workload does not need a compiled language. Rust and Go were evaluated and recorded in section 12 as the revisit path. |
+| Sections touched | 1 (assumption), 2 (diagram and dependency rule), 4.4 and 5 (schema source), 6 (lock mechanism), 7.2 (Windows `.cmd` spawning), 12 (alternatives), 13.3 (plugin packaging), 15 (rewritten), 16 and 17 (spike and risk wording), 18 (IPC reference). |
+| Plan | `development-plan.md` v0.2: tasks 0.1, 0.2, 0.3, 0.10 (Spike A reduced to M to S and re-scoped), 3.7, release row and one risk row updated. Task ids unchanged. |
