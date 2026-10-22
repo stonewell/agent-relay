@@ -460,17 +460,23 @@ Rules:
 
 ### 7.1 Interface
 
-```ts
-interface AgentAdapter {
-  id: string;                                   // "claude" | "codex" | ...
-  probe(): Promise<{ available: boolean; version?: string; levels: PermissionLevel[]; notes?: string[] }>;
-  buildInvocation(task: TaskSpec, ctx: RunContext): { cmd: string; args: string[]; env: Record<string,string>; cwd: string; stdin?: string };
-  parseResult(proc: ProcessResult, task: TaskSpec, ctx: RunContext): Promise<ResultSpec>;
-  cancel(handle: WorkerHandle): Promise<void>; // kills process tree
-}
+```python
+class AgentAdapter(Protocol):
+    id: str  # "claude" | "codex" | ...
+
+    async def probe(self) -> Probe: ...  # available, version?, levels: list[PermissionLevel], notes
+    def build_invocation(
+        self, task: TaskSpec, ctx: RunContext
+    ) -> Invocation: ...  # cmd, args, env, cwd, stdin?
+    async def parse_result(
+        self, proc: ProcessResult, task: TaskSpec, ctx: RunContext
+    ) -> ResultSpec: ...
+    async def cancel(self, handle: WorkerHandle) -> None: ...  # kills the process tree
 ```
 
 Adapters never decide routing or permissions; they only translate. They declare which permission levels they can enforce (section 9.3).
+
+The `fake` adapter (tests only) drives `orch.adapters.fake_cli`, a stub agent process that follows a per-attempt scenario file: it writes, deletes and commits files, emits each output mode of section 7.3, returns `needs_input` with typed questions, fails, sleeps or hangs until killed, and records the prompt and environment it received. Scenarios are selected by node and attempt, the last one repeating, so retry, escalation, fallback and `needs_input` paths run without a real CLI.
 
 ### 7.2 Per-CLI mapping (non-interactive)
 

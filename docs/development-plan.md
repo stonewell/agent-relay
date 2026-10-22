@@ -262,3 +262,5 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.4 | done | 2026-10-22 | `orch.core.registry` and `orch.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
 | 0.5 | done | 2026-10-22 | `orch.core.store` and `runrecord`; atomic writes with a process-kill test; Windows reader and writer retry on `PermissionError` |
 | 0.6 | done | 2026-10-22 | `orch.core.events`: catalog, durable append, torn-tail repair, replay by `seq` |
+| 0.7 | done | 2026-10-22 | `orch.adapters.{base,fake,fake_cli,fake_scenario}`; test helpers in `tests/harness.py` |
+

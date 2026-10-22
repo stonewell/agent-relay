@@ -193,4 +193,5 @@ A document map at the top of the design lists the canonical section per topic. N
 | Section 5.5 added | Format of `input_answers.yaml` (submissions, provenance values, answer hash) was referenced by sections 6, 8.2 and 13.1 but never defined; found while implementing task 0.3. Sections 5 intro and the document map unchanged in meaning. |
 | Section 3 clarified | While implementing task 0.4: removed the undefined category `triage` from the example rule `claude-cheap`; defined the built-in defaults (no pricing, `default` model tier for Codex and Gemini), strict rejection of unknown keys, the permitted agent keys and the `when` attributes. |
 | Sections 6 and 11 clarified | While implementing tasks 0.5 and 0.6: run id format and reuse rule, node directory naming, `run.json` contents and run states; the flat `events.jsonl` record shape, durability on append and torn-tail rules. |
+| Section 7.1 | Adapter interface restated as a Python `Protocol` (it was TypeScript pseudocode); the `fake` adapter and its stub agent process described, for task 0.7. |
 
