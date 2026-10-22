@@ -160,7 +160,7 @@ agents:
           when: { category: [implement, refactor, bugfix] }
           use: { model: balanced }
         - id: claude-cheap
-          when: { category: [docs-for-code, triage], est_tokens: "<5000" }
+          when: { category: [docs-for-code], est_tokens: "<5000" }
           use: { model: fast }
       default: { model: balanced }
       escalate_on_failure: [fast, balanced, deep]
@@ -200,6 +200,8 @@ agents:
     categories: [implement, refactor]
     models: { default: auto }
 ```
+
+**Built-in defaults** are the example above with three differences. `pricing` is omitted, because rates are user data (section 8.5). Agents without a verified model id list (Codex, Gemini) map every tier to the literal `default`, which the adapter treats as "pass no model flag, use the CLI's own configured model"; a user config replaces those tiers with real ids. Unknown keys are rejected everywhere in `agents.yaml`, so a misspelled key cannot silently disable a rule. The permitted per-agent keys are `enabled`, `cmd`, `categories`, `strengths`, `cost`, `concurrency`, `permissions`, `env`, `pricing`, `models` and `model_routing`. Rule `when` attributes are `category`, `complexity`, `language`, `risk`, `est_tokens`, `files`, `attempt` and `cost_ceiling`; category values must be those of section 4.1.
 
 Capability probing: at startup (and via `orch doctor`) each enabled agent is probed with `<cmd> --version` and `--help`. Missing or unauthenticated agents are marked unavailable and skipped by routing; they never fail a run unless a task pins them explicitly.
 

@@ -1,0 +1,100 @@
+# Built-in defaults (design section 3). User and project files override these.
+version: 1
+
+defaults:
+  permissions: full
+  concurrency: 4
+  timeout_s: 1800
+  fallback: [codex, claude, gemini]
+
+route_log:
+  enabled: true
+  include_goal: true
+  title_max_chars: 120
+
+risk:
+  paths:
+    - "**/auth/**"
+    - "**/security/**"
+    - "**/migrations/**"
+    - ".github/workflows/**"
+    - "**/Dockerfile*"
+    - "**/infra/**"
+    - "**/*.tf"
+
+paths:
+  worktree_root: auto
+
+routes:
+  rules:
+    - id: route-bugfix-codex
+      when: { category: [bugfix], language: [typescript, python] }
+      prefer: [codex, claude]
+    - id: route-impl-codex
+      when: { category: [implement, test, migrate] }
+      prefer: [codex, claude]
+    - id: route-review-claude
+      when: { category: [review, architecture] }
+      prefer: [claude]
+    - id: route-research-gemini
+      when: { category: [codebase-research] }
+      prefer: [gemini, claude]
+  default: score
+
+agents:
+  claude:
+    enabled: true
+    cmd: claude
+    categories: [refactor, review, architecture, debug, implement]
+    strengths: [large-refactor, code-review, multi-file-reasoning]
+    cost: high
+    concurrency: 2
+    models:
+      fast: claude-haiku-5-5
+      balanced: claude-sonnet-5-5
+      deep: claude-opus-5-5
+    model_routing:
+      rules:
+        - id: claude-deep-review
+          when: { category: [review, architecture], complexity: ">=high" }
+          use: { model: deep }
+        - id: claude-impl
+          when: { category: [implement, refactor, bugfix] }
+          use: { model: balanced }
+        - id: claude-cheap
+          when: { category: [docs-for-code], est_tokens: "<5000" }
+          use: { model: fast }
+      default: { model: balanced }
+      escalate_on_failure: [fast, balanced, deep]
+
+  codex:
+    enabled: true
+    cmd: codex
+    categories: [implement, bugfix, test, migrate]
+    cost: medium
+    concurrency: 3
+    models: { fast: default, balanced: default, deep: default }
+    model_routing:
+      rules:
+        - id: codex-fast-tests
+          when: { category: [test], complexity: "<=medium" }
+          use: { model: fast, effort: low }
+        - id: codex-deep-hard
+          when: { category: [bugfix, implement], complexity: ">=high" }
+          use: { model: deep, effort: high }
+      default: { model: balanced, effort: medium }
+
+  gemini:
+    enabled: true
+    cmd: gemini
+    categories: [codebase-research, docs-for-code, large-context]
+    cost: low
+    models: { fast: default, deep: default }
+    model_routing:
+      default: { model: fast }
+
+  cursor:
+    enabled: false
+    cmd: agent
+    categories: [implement, refactor]
+    models: { default: auto }

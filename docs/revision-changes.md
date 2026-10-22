@@ -191,3 +191,5 @@ A document map at the top of the design lists the canonical section per topic. N
 | Sections touched | 1 (assumption), 2 (diagram and dependency rule), 4.4 and 5 (schema source), 6 (lock mechanism), 7.2 (Windows `.cmd` spawning), 12 (alternatives), 13.3 (plugin packaging), 15 (rewritten), 16 and 17 (spike and risk wording), 18 (IPC reference). |
 | Plan | `development-plan.md` v0.2: tasks 0.1, 0.2, 0.3, 0.10 (Spike A reduced to M to S and re-scoped), 3.7, release row and one risk row updated. Task ids unchanged. |
 | Section 5.5 added | Format of `input_answers.yaml` (submissions, provenance values, answer hash) was referenced by sections 6, 8.2 and 13.1 but never defined; found while implementing task 0.3. Sections 5 intro and the document map unchanged in meaning. |
+| Section 3 clarified | While implementing task 0.4: removed the undefined category `triage` from the example rule `claude-cheap`; defined the built-in defaults (no pricing, `default` model tier for Codex and Gemini), strict rejection of unknown keys, the permitted agent keys and the `when` attributes. |
+

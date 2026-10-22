@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from typing import Any, TypeVar
 
-import yaml
 from pydantic import BaseModel
 
+from ..yamlio import load_yaml
 from .answers import InputAnswers, Submission
 from .common import SPEC_VERSION
 from .graph import Graph, GraphNode, Policy
@@ -45,19 +45,9 @@ SCHEMAS: dict[str, type[BaseModel]] = {
 }
 
 
-class _SpecLoader(yaml.SafeLoader):
-    """Safe YAML loader that keeps timestamps and run ids such as 2026-10-22 as strings."""
-
-
-_SpecLoader.yaml_implicit_resolvers = {
-    key: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:timestamp"]
-    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-
-
 def parse_spec(model: type[M], text: str) -> M:
     """Parse YAML or JSON text (JSON is valid YAML) and validate it against `model`."""
-    data: Any = yaml.load(text, Loader=_SpecLoader)  # noqa: S506 - safe loader subclass
+    data: Any = load_yaml(text)
     return model.model_validate(data)
 
 
