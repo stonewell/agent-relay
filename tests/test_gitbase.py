@@ -16,6 +16,7 @@ from relay.core.gitbase import (
     ref_namespace,
     resolve_base,
     scan_sensitive_paths,
+    write_ref,
 )
 
 
@@ -105,6 +106,26 @@ def test_exclude_patterns_omit_paths(repo: Path) -> None:
     assert "tmp/x.tmp" in result.excluded_paths
 
 
+def test_exclude_star_stays_within_one_segment(repo: Path) -> None:
+    (repo / "sub").mkdir()
+    (repo / "top.log").write_text("t\n", encoding="utf-8", newline="\n")
+    (repo / "sub" / "deep.log").write_text("d\n", encoding="utf-8", newline="\n")
+    result = resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True, exclude=["*.log"])
+    files = tree_files(repo, result.commit)
+    assert "top.log" not in files
+    assert "sub/deep.log" in files
+
+
+def test_exclude_double_star_crosses_segments(repo: Path) -> None:
+    (repo / "sub").mkdir()
+    (repo / "top.log").write_text("t\n", encoding="utf-8", newline="\n")
+    (repo / "sub" / "deep.log").write_text("d\n", encoding="utf-8", newline="\n")
+    result = resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True, exclude=["**/*.log"])
+    files = tree_files(repo, result.commit)
+    assert "top.log" not in files
+    assert "sub/deep.log" not in files
+
+
 def test_runtime_state_is_never_captured(repo: Path) -> None:
     state = repo / ".agents" / "runs" / "r1"
     state.mkdir(parents=True)
@@ -167,8 +188,87 @@ def test_unsafe_run_ids_are_rejected(repo: Path, bad: str) -> None:
 
 
 def test_invalid_exclude_patterns_are_rejected(repo: Path) -> None:
-    with pytest.raises(InvalidRefError):
+    with pytest.raises(ValueError):
         resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True, exclude=["../etc"])
+    with pytest.raises(ValueError):
+        resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True, exclude=["/etc"])
+    with pytest.raises(InvalidRefError):
+        resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True, exclude=["   "])
+
+
+# --- ref safety ---------------------------------------------------------------------
+
+
+def test_read_ref_rejects_leading_dash(repo: Path) -> None:
+    with pytest.raises(InvalidRefError):
+        read_ref(repo, "-x")
+
+
+def test_read_ref_rejects_whitespace(repo: Path) -> None:
+    with pytest.raises(InvalidRefError):
+        read_ref(repo, "refs/relay/a b")
+
+
+def test_write_ref_rejects_leading_dash(repo: Path) -> None:
+    with pytest.raises(InvalidRefError):
+        write_ref(repo, "-x", "0" * 40)
+
+
+def test_write_ref_rejects_outside_namespace(repo: Path) -> None:
+    with pytest.raises(InvalidRefError):
+        write_ref(repo, "refs/heads/main", "0" * 40)
+
+
+def test_write_ref_accepts_relay_namespace_ref(repo: Path) -> None:
+    head = git(repo, "rev-parse", "HEAD")
+    ref = base_ref("2026-10-22-a1b2")
+    write_ref(repo, ref, head)
+    assert read_ref(repo, ref) == head
+
+
+# --- submodules ---------------------------------------------------------------------
+
+
+def _submodule_repo(tmp_path: Path) -> Path:
+    """A repo with a committed submodule at `mod`."""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    git(sub, "init", "-q", "-b", "main")
+    (sub / "s.txt").write_text("s\n", encoding="utf-8", newline="\n")
+    git(sub, "add", "-A")
+    git(sub, "commit", "-q", "-m", "sub initial")
+
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "README.md").write_text("# fixture\n", encoding="utf-8", newline="\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "initial")
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(sub),
+        "mod",
+    )
+    git(repo, "commit", "-q", "-m", "add submodule")
+    return repo
+
+
+def test_clean_submodule_is_not_reported_dirty(tmp_path: Path) -> None:
+    repo = _submodule_repo(tmp_path)
+    result = resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True)
+    assert result.dirty_submodules == ()
+
+
+def test_dirty_submodule_is_reported(tmp_path: Path) -> None:
+    repo = _submodule_repo(tmp_path)
+    (repo / "mod" / "s.txt").write_text("dirty\n", encoding="utf-8", newline="\n")
+    result = resolve_base(repo, "2026-10-22-a1b2", allow_dirty=True)
+    assert result.dirty_submodules == ("mod",)
 
 
 # --- pure helpers -------------------------------------------------------------------

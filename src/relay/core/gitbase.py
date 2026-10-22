@@ -6,6 +6,8 @@ captures the current working tree (tracked files plus untracked, non-ignored fil
 reserved runtime paths (section 6), minus sensitive-looking untracked paths, and minus any
 caller-supplied `--exclude` globs. The synthetic commit's parent is the checked-out branch HEAD,
 and it is written to objects and a ref only: the user's branch and working tree are never touched.
+Dirty submodules are not captured (a gitlink records only the checked-out commit); they are
+reported via `BaseResult.dirty_submodules` for task 1.14, which owns submodule/LFS handling.
 
 Refs under `refs/relay/` are never pushed by `relay` and are deleted by `relay clean --purge-runs`.
 """
@@ -22,6 +24,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from .classifier import match_path_glob
 from .specs.common import RESERVED_ROOTS
 
 REFS_NAMESPACE = "refs/relay"
@@ -77,7 +80,7 @@ class DirtyTreeError(GitBaseError):
 
 
 class InvalidRefError(GitBaseError):
-    """A run id or exclude pattern cannot be used safely."""
+    """A run id, ref, or exclude pattern cannot be used safely."""
 
 
 class GitFailure(GitBaseError):
@@ -98,6 +101,7 @@ class BaseResult:
     branch: str | None
     sensitive_paths: tuple[str, ...] = ()
     excluded_paths: tuple[str, ...] = ()
+    dirty_submodules: tuple[str, ...] = ()
 
 
 def ref_namespace(run_id: str) -> str:
@@ -160,7 +164,7 @@ def resolve_base(
             branch=branch,
         )
 
-    sensitive, excluded = _build_synthetic_base(repo_root, run_id, head, patterns)
+    sensitive, excluded, dirty_submodules = _build_synthetic_base(repo_root, run_id, head, patterns)
     commit = read_ref(repo_root, base_ref(run_id))
     if commit is None:
         raise GitBaseError("synthetic base was not written")
@@ -171,11 +175,13 @@ def resolve_base(
         branch=branch,
         sensitive_paths=tuple(sensitive),
         excluded_paths=tuple(excluded),
+        dirty_submodules=tuple(dirty_submodules),
     )
 
 
 def read_ref(repo_root: Path, ref: str) -> str | None:
     """Return the commit a ref points at, or `None` when it does not exist."""
+    _validate_ref(ref)
     proc = _run(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
     if proc.returncode != 0:
         return None
@@ -184,7 +190,24 @@ def read_ref(repo_root: Path, ref: str) -> str | None:
 
 def write_ref(repo_root: Path, ref: str, sha: str) -> None:
     """Point `ref` at `sha` (idempotent; creates the namespace directories as needed)."""
+    _validate_ref(ref, namespace=True)
     _git(repo_root, "update-ref", ref, sha)
+
+
+def _validate_ref(ref: str, *, namespace: bool = False) -> None:
+    """Reject refs that could be mistaken for git options or injected into the command line.
+
+    `read_ref` and `write_ref` splice `ref` into `rev-parse`/`update-ref`; a ref beginning
+    with `-` or containing whitespace/control characters must never reach git unguarded.
+    `write_ref` additionally requires the `refs/relay/` namespace, which is the only
+    namespace relay may create refs under (section 8.3).
+    """
+    if ref.startswith("-"):
+        raise InvalidRefError(f"ref {ref!r} must not begin with '-'")
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in ref):
+        raise InvalidRefError(f"ref {ref!r} must not contain whitespace or control characters")
+    if namespace and not ref.startswith(f"{REFS_NAMESPACE}/"):
+        raise InvalidRefError(f"ref {ref!r} must be under {REFS_NAMESPACE!r} to be written")
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -195,14 +218,18 @@ def _validate_run_id(run_id: str) -> None:
 
 
 def _normalize_exclude(pattern: str) -> str:
-    if not pattern.strip():
+    text = pattern.strip().replace("\\", "/")
+    if not text:
         raise InvalidRefError("--exclude patterns must be non-empty strings")
-    normalized = pattern.strip().replace("\\", "/")
-    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
-        raise InvalidRefError(f"--exclude pattern {pattern!r} must be repository-relative")
-    if ".." in normalized.split("/"):
-        raise InvalidRefError(f"--exclude pattern {pattern!r} must not contain '..'")
-    return normalized.strip("/")
+    # Mirror classifier._split_path validation: absolute and parent-traversal patterns
+    # are rejected with `ValueError` (design section 8.3; matching happens in
+    # `_matches_exclude` via `match_path_glob`, which enforces the same rules).
+    if text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        raise ValueError(f"--exclude pattern {pattern!r} must be repository-relative")
+    parts = tuple(part for part in text.split("/") if part not in ("", "."))
+    if ".." in parts:
+        raise ValueError(f"--exclude pattern {pattern!r} must not contain '..'")
+    return text
 
 
 def _is_sensitive(path: str) -> bool:
@@ -214,12 +241,22 @@ def _is_sensitive(path: str) -> bool:
     )
 
 
+_GLOB_META = frozenset("*?[")
+
+
 def _matches_exclude(path: str, pattern: str) -> bool:
-    return (
-        fnmatchcase(path, pattern)
-        or fnmatchcase(path, f"{pattern}/**")
-        or path.startswith(f"{pattern}/")
-    )
+    """True if `path` is excluded by `pattern` (classifier.match_path_glob semantics).
+
+    `**` crosses path segments; `*`, `?` and `[...]` stay within a single segment, matching
+    git's wildmatch and `classifier.match_path_glob`. A literal pattern (no glob
+    metacharacters) also matches everything beneath it, so `tmp/` and other directory
+    prefixes keep their historical meaning.
+    """
+    if match_path_glob(path, pattern):
+        return True
+    if any(ch in pattern for ch in _GLOB_META):
+        return False
+    return match_path_glob(path, f"{pattern}/**")
 
 
 def _run(
@@ -296,13 +333,54 @@ def _commit_parent(repo_root: Path, sha: str) -> str | None:
     return proc.stdout.strip()
 
 
+def _submodule_paths(repo_root: Path) -> list[str]:
+    """Repo-relative paths of every gitlink (submodule) recorded in the index."""
+    proc = _run(repo_root, "ls-files", "--stage", "-z")
+    if proc.returncode != 0:
+        raise GitFailure(("ls-files",), proc.stderr)
+    paths: list[str] = []
+    for entry in proc.stdout.split("\0"):
+        if not entry:
+            continue
+        info, sep, path = entry.partition("\t")
+        if sep and info.split(" ", 1)[0] == "160000":
+            paths.append(path)
+    return paths
+
+
+def _dirty_submodules(repo_root: Path) -> list[str]:
+    """Repo-relative paths of submodules whose working tree differs from the index.
+
+    `git add -A` records only a submodule's gitlink, so a submodule with uncommitted changes,
+    untracked files or a moved gitlink is captured lossily by the synthetic base. These paths
+    are reported on `BaseResult.dirty_submodules` so task 1.14 (submodules/LFS) can act; full
+    support is out of scope here.
+    """
+    submodules = _submodule_paths(repo_root)
+    if not submodules:
+        return []
+    proc = _run(repo_root, "status", "--porcelain=v1", "--untracked-files=all")
+    if proc.returncode != 0:
+        raise GitFailure(("status",), proc.stderr)
+    submodule_set = set(submodules)
+    dirty: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        path = line[3:].split(" -> ", 1)[-1]
+        if path in submodule_set:
+            dirty.add(path)
+    return sorted(dirty)
+
+
 def _build_synthetic_base(
     repo_root: Path,
     run_id: str,
     head: str,
     excludes: tuple[str, ...],
-) -> tuple[list[str], list[str]]:
-    """Create the `refs/relay/<run>/base` commit; returns (sensitive, excluded) path lists."""
+) -> tuple[list[str], list[str], list[str]]:
+    """Create the `refs/relay/<run>/base` commit; returns (sensitive, excluded, dirty)."""
+    dirty_submodules = _dirty_submodules(repo_root)
     # Untracked non-ignored files are scanned against the real index, not the temp one.
     untracked = _git(repo_root, "ls-files", "--others", "--exclude-standard", "-z")
     sensitive = scan_sensitive_paths(untracked.split("\0"))
@@ -334,7 +412,7 @@ def _build_synthetic_base(
             repo_root, "commit-tree", tree, "-p", head, "-m", message, env=_COMMIT_ENV
         ).strip()
         write_ref(repo_root, base_ref(run_id), commit)
-        return sensitive, remove
+        return sensitive, remove, dirty_submodules
     finally:
         shutil.rmtree(index_dir, ignore_errors=True)
 
