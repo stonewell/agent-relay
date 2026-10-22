@@ -266,5 +266,5 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.8 | done | 2026-10-22 | `orch` CLI skeleton (`orch.cli`), exit codes, phase gating; `orch.core.doctor` registry, runner, text and JSON report; checks `python`, `git`, `config`, `agent.<name>.cli` |
 | 0.9 | done | 2026-10-22 | `orch.core.gitexclude` (block, linked-worktree aware, CRLF preserving) and doctor check `git.exclude`; `store.read_text` made newline-faithful |
 | 0.10 | done | 2026-10-22 | Spike A: `orch.core.platform.locks` (stdlib and `ctypes`), tests on Windows and on Linux (ext4, tmpfs, 9p via WSL); matrix in design section 15. macOS unverified |
-| 0.11 | done | 2026-10-22 | Spike B on Claude 2.1.308 and Codex 0.163.0: `needs_input` approach is go; findings in `revision-changes.md`; recorded outputs in `tests/fixtures/recorded/`. Cursor and Gemini not run |
+| 0.11 | done | 2026-10-22 | Spike B on Claude 2.1.308 and Codex 0.163.0: `needs_input` approach is go; findings in `revision-changes.md`; recorded outputs in `tests/fixtures/recorded/`. Cursor addendum run on account login; Gemini not run |
 

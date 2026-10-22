@@ -1,6 +1,6 @@
 # Recorded agent outputs
 
-Real outputs captured on 2026-10-22 for spike 0.11 (Claude Code 2.1.308, Codex CLI 0.163.0,
+Real outputs captured on 2026-10-22 for spike 0.11 (Claude Code 2.1.308, Codex CLI 0.163.0, Cursor agent 2026.10.19,
 Windows 11), from one-line tasks in a scratch repository. They are the golden inputs for the
 adapter parsers (tasks 1.9 and 1.10). Session ids and costs are real; nothing else is.
 
@@ -15,3 +15,6 @@ adapter parsers (tasks 1.9 and 1.10). Session ids and costs are real; nothing el
 | `codex_schema_rejected.jsonl` | `--output-schema` with a non-strict schema (HTTP 400) |
 | `codex_schema_needs_input.jsonl`, `..._last_message.txt` | strict schema, ambiguous task, `-o` file |
 | `codex_resume.jsonl` | `codex exec resume <thread_id> --json -` |
+| `cursor_plain.json` | `agent -p --output-format json --mode plan --trust` (account login, no API key) |
+| `cursor_resume.json` | `--resume <session_id>` |
+| `cursor_prompt_needs_input.json` | ambiguous task, JSON shape requested in the prompt (no schema flag exists) |

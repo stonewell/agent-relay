@@ -172,3 +172,44 @@ def test_codex_runs_end_with_turn_completed_and_usage(name: str) -> None:
     last = codex_events(name)[-1]
     assert last["type"] == "turn.completed"
     assert last["usage"]["output_tokens"] > 0
+
+
+# --- Cursor -----------------------------------------------------------------------------------
+
+
+def test_cursor_json_envelope_has_session_id_and_camel_case_usage() -> None:
+    out = claude("cursor_plain.json")
+    assert (out["type"], out["subtype"], out["is_error"], out["result"]) == (
+        "result",
+        "success",
+        False,
+        "OK",
+    )
+    assert out["session_id"]
+    assert set(out["usage"]) == {
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+    }
+    assert "total_cost_usd" not in out  # tokens only; cost must be computed from pricing
+
+
+def test_cursor_resume_keeps_the_session_id_and_context() -> None:
+    assert claude("cursor_resume.json")["session_id"] == claude("cursor_plain.json")["session_id"]
+    assert claude("cursor_resume.json")["result"] == "OK"
+
+
+def test_cursor_needs_input_comes_back_as_json_text_needing_normalization() -> None:
+    """No schema flag exists, so the reply is JSON text in `result`. Cursor emits `options: []`
+    for free questions and `default: null`; the parser must normalise both before validating."""
+    text = claude("cursor_prompt_needs_input.json")["result"]
+    structured = json.loads(text)
+    assert structured["status"] == "needs_input"
+    with pytest.raises(ValueError):
+        ResultSpec.model_validate({"id": "n1", **drop_nulls(structured)})  # empty options on free
+    for question in structured["open_questions"]:
+        if question["kind"] == "free" and not question["options"]:
+            del question["options"]
+    result = ResultSpec.model_validate({"id": "n1", **drop_nulls(structured)})
+    assert [q.kind for q in result.open_questions] == ["free", "choice", "free"]

@@ -211,3 +211,14 @@ Task 0.11 ran about ten one-line prompts against Claude Code 2.1.308 (four paid 
 | Session ids: Claude `session_id`, Codex `thread_id`; resume keeps the id and context | `[verify]` removed for both in section 7.3. Cursor not run (no API key): stays `[verify]`. |
 | Not verified: Codex reasoning-effort config key; Cursor and Gemini behaviour | `[verify]` tags remain. |
 
+## Spike B addendum (Cursor) v0.14
+
+Three more runs on Cursor `agent` 2026.10.19, authenticated by account login (no `CURSOR_API_KEY` needed, contrary to the assumption in section 7.2).
+
+| Finding | Resolution |
+|---|---|
+| Session id is `session_id`; resume keeps id and context | `[verify]` removed in section 7.3. |
+| Usage is camelCase tokens with disjoint cache buckets and no cost | Fixture and test; cost comes from pricing. |
+| No schema flag: JSON came back as text in `result`, with `options: []` on free questions and `null` defaults | Parser normalisation rule added to section 5.4. |
+| The ambiguous-task run took 242 s | Noted for timeouts: Cursor attempts can be slow even without edits. |
+
