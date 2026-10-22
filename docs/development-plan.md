@@ -260,3 +260,5 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.2 | in progress | 2026-10-22 | Workflow written in `.github/workflows/ci.yml`; not yet run (no remote configured) |
 | 0.3 | done | 2026-10-22 | `orch.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; 66 tests pass locally |
 | 0.4 | done | 2026-10-22 | `orch.core.registry` and `orch.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
+| 0.5 | done | 2026-10-22 | `orch.core.store` and `runrecord`; atomic writes with a process-kill test; Windows reader and writer retry on `PermissionError` |
+| 0.6 | done | 2026-10-22 | `orch.core.events`: catalog, durable append, torn-tail repair, replay by `seq` |
