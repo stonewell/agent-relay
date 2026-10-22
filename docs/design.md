@@ -305,7 +305,7 @@ There is deliberately no shared project-wide file: runs can execute concurrently
 
 ## 5. Spec contract
 
-Three artifacts. All are YAML (JSON accepted), validated by JSON Schemas generated from the pydantic models in `orch.core.specs` (published under `schemas/`). Every spec has `spec_version`.
+The artifacts below (except `PROJECT.spec.md`) are YAML (JSON accepted), validated by JSON Schemas generated from the pydantic models in `orch.core.specs` (published under `schemas/`). Every spec has `spec_version`.
 
 ### 5.1 `PROJECT.spec.md` (shared, human-owned)
 
@@ -385,6 +385,23 @@ session: { cli_session_id: "<id>" }
 - **Untrusted content**: text coming from another agent's result is wrapped and labeled as data in downstream prompts (section 9).
 - **Human-in-the-loop**: an agent that needs operator clarification returns `status: needs_input` with structured queries in `open_questions`; the protocol (blocking, answers, limits, trust labeling) is defined in section 8.2. If `status` is `done`, populated `open_questions` are only advisory notes for downstream reviewers.
 - **Versioning**: `spec_version` is checked; unknown major versions are rejected, unknown optional fields are preserved.
+
+### 5.5 `input_answers.yaml` (operator answers for a `needs_input` node)
+
+Append-only file in the node directory; protocol and limits are in section 8.2.
+
+```yaml
+spec_version: 1
+node: n3-implement-autosave
+submissions:
+  - submission_id: 5b0c1e9a        # idempotency key; duplicates have no effect
+    question_revision: 1           # must equal the current question set revision
+    provenance: operator-tty       # operator-tty | operator-cli | host-submitted | host-attested
+    submitted_at: "2026-10-22T09:50:11Z"
+    answers: { q1: "300ms", q2: ["a", "b"] }   # question id to string or list of strings
+```
+
+`host-submitted` is input relayed through a model tool and is never elevated to trusted operator policy; `host-attested` requires the host to attest operator authorship. The content hash of the answers (not the content) is what appears in events and in the input key.
 
 ---
 

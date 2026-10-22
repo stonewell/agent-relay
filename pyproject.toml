@@ -3,7 +3,10 @@ name = "agents-coordinator"
 version = "0.0.0"
 description = "Routes programming tasks to agent CLIs and passes context between them as specs"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "pydantic>=2.8",
+    "pyyaml>=6",
+]
 
 [project.scripts]
 orch = "orch.cli.main:main"

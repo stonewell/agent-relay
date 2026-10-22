@@ -258,3 +258,4 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 |---|---|---|---|
 | 0.1 | in progress | 2026-10-22 | Python scaffold passes on Windows locally; Linux confirmed once CI (0.2) runs |
 | 0.2 | in progress | 2026-10-22 | Workflow written in `.github/workflows/ci.yml`; not yet run (no remote configured) |
+| 0.3 | done | 2026-10-22 | `orch.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; 66 tests pass locally |

@@ -1,0 +1,85 @@
+{
+  "$defs": {
+    "Submission": {
+      "additionalProperties": true,
+      "properties": {
+        "answers": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "title": "Answers",
+          "type": "object"
+        },
+        "provenance": {
+          "enum": [
+            "operator-tty",
+            "operator-cli",
+            "host-submitted",
+            "host-attested"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "question_revision": {
+          "minimum": 1,
+          "title": "Question Revision",
+          "type": "integer"
+        },
+        "submission_id": {
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        },
+        "submitted_at": {
+          "title": "Submitted At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "submission_id",
+        "question_revision",
+        "provenance",
+        "submitted_at",
+        "answers"
+      ],
+      "title": "Submission",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "node": {
+      "title": "Node",
+      "type": "string"
+    },
+    "spec_version": {
+      "default": 1,
+      "title": "Spec Version",
+      "type": "integer"
+    },
+    "submissions": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Submission"
+      },
+      "title": "Submissions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "node"
+  ],
+  "title": "InputAnswers",
+  "type": "object"
+}
