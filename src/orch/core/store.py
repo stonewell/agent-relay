@@ -89,7 +89,7 @@ def read_text(path: Path) -> str:
     """
     for attempt in range(_REPLACE_RETRIES):
         try:
-            return path.read_text(encoding="utf-8")
+            return path.read_bytes().decode("utf-8")  # no newline translation
         except PermissionError:
             if os.name != "nt" or attempt == _REPLACE_RETRIES - 1:
                 raise

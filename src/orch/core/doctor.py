@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import registry as registry_module
+from .gitexclude import check_exclude_block
 from .registry import ConfigError, LoadedConfig, load_config
 
 Status = Literal["pass", "warn", "fail", "unsupported", "skipped"]
@@ -237,6 +238,27 @@ async def check_config(ctx: DoctorContext) -> CheckResult:
     )
 
 
+async def check_git_exclude(ctx: DoctorContext) -> CheckResult:
+    state, detail = await asyncio.to_thread(check_exclude_block, ctx.repo_root)
+    if state == "current":
+        return CheckResult("pass", f"runtime state is excluded ({detail})")
+    if state == "no-repository":
+        return CheckResult(
+            "unsupported",
+            "not a git repository",
+            remedy="run `git init`; orch needs a git repository in phases 1 to 3",
+        )
+    if state == "malformed":
+        return CheckResult(
+            "fail", "exclude block is malformed", remedy=f"{detail}; repair it by hand"
+        )
+    return CheckResult(
+        "warn",
+        f"exclude block is {state}: {detail}",
+        remedy="the next `orch run` adds it; until then `git status` may list .agents/runs",
+    )
+
+
 def agent_cli_check(name: str, command: str) -> Check:
     """Probe an agent CLI: resolve it on PATH (PATHEXT aware) and run `<cmd> --version`."""
 
@@ -276,6 +298,9 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
     registry.register(Check("python", "Python version", check_python))
     registry.register(Check("git", "git is available", check_git))
     registry.register(Check("config", "agents.yaml is valid", check_config))
+    registry.register(
+        Check("git.exclude", "runtime state is excluded", check_git_exclude, requires=("git",))
+    )
     if ctx is not None:
         try:
             loaded = load_config(ctx.repo_root, user_config=ctx.user_config)

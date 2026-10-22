@@ -264,4 +264,5 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.6 | done | 2026-10-22 | `orch.core.events`: catalog, durable append, torn-tail repair, replay by `seq` |
 | 0.7 | done | 2026-10-22 | `orch.adapters.{base,fake,fake_cli,fake_scenario}`; test helpers in `tests/harness.py` |
 | 0.8 | done | 2026-10-22 | `orch` CLI skeleton (`orch.cli`), exit codes, phase gating; `orch.core.doctor` registry, runner, text and JSON report; checks `python`, `git`, `config`, `agent.<name>.cli` |
+| 0.9 | done | 2026-10-22 | `orch.core.gitexclude` (block, linked-worktree aware, CRLF preserving) and doctor check `git.exclude`; `store.read_text` made newline-faithful |
 

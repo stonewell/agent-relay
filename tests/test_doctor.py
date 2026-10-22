@@ -238,6 +238,28 @@ def test_agent_cli_check_fails_when_version_command_fails(tmp_path: Path) -> Non
     assert "exited 3" in result.summary
 
 
+def test_git_exclude_check_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from harness import init_repo
+    from orch.core.gitexclude import ensure_exclude_block
+
+    isolated(monkeypatch, tmp_path)
+
+    def status_in(directory: Path) -> str:
+        context = DoctorContext(repo_root=directory)
+        report = asyncio.run(
+            run_checks(default_registry(context), context, only=["git", "git.exclude"])
+        )
+        return next(c for c in report.checks if c.id == "git.exclude").status
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert status_in(plain) == "unsupported"
+    repo = init_repo(tmp_path / "repo")
+    assert status_in(repo) == "warn"
+    ensure_exclude_block(repo)
+    assert status_in(repo) == "pass"
+
+
 # --- CLI and exit codes -----------------------------------------------------------------------
 
 
