@@ -49,4 +49,5 @@ A change that touches several kinds is split, not copied:
 ## Tooling and hygiene
 
 - Keep backups and scratch files outside the repository tree.
+- The sensitive-information rule in the root `AGENTS.md` applies to every document; examples use placeholders, never real paths, names, ids or hosts.
 - File names are lowercase with hyphens, except the `AGENTS.md` convention.

@@ -10,7 +10,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 |---|---|
 | `design.md` | v0.15 |
 | `development-plan.md` | v0.2 |
-| `AGENTS.md`, `docs/AGENTS.md` | v1 |
+| `AGENTS.md`, `docs/AGENTS.md` | v2 |
 
 ## Version summaries
 
@@ -241,3 +241,10 @@ A second review of the same changes found that the R15-2 and R15-3 resolutions w
 | R15-6 | High | Short names were caught only in their literal form (`GIT~?`, `*~1` and hashed names passed), and folding case or cutting at `:` broke glob classes | Section 8.1 replaces the R15-3 rule: any segment with `~` before a digit or glob character, or with `:`, is treated as possibly reserved; case is ignored in the match instead of folding the glob. |
 | R15-7 | Medium | Archiving could overwrite an earlier archived result | Section 8.2: archived files are never overwritten. |
 | R15-8 | Low | `.` and `./` behaved differently; unreadable result files raised raw errors; results were validated twice; Windows sharing violations were not retried during archiving | Section 8.1: the repository root itself is rejected. The rest is code only. |
+
+## Sensitive-information rule (AGENTS v2)
+
+| Change | Detail |
+|---|---|
+| Root `AGENTS.md` | New section "No sensitive information": what must never be committed (credentials, personal and account data, machine data, internal links), the placeholders to use instead, what may stay, scrubbing of recorded outputs, and a check before committing. |
+| `docs/AGENTS.md` | One line under "Tooling and hygiene" pointing to that rule for the documents. |
