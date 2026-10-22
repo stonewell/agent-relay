@@ -5,28 +5,6 @@ Cursor) and model should do each one, runs them as concurrent sub-agents, and pa
 results between them only as versioned spec files. Two front-ends share one Python core: a
 standalone `relay` CLI and an OpenCode plugin (phase 3, not built yet).
 
-## Status
-
-Phase 0 (foundations) is nearly complete; phase 1 (the MVP foreground `relay run`) has not started.
-Phase 0 tasks 0.1 and 0.3-0.11 are done. Task 0.2 (the CI workflow) is in progress and has not
-been run, so no claim is made that CI passes, and task 0.12 is still todo. The authoritative task
-status is in [`docs/development-plan.md`](docs/development-plan.md).
-
-## What works today
-
-- Spec models (pydantic) for task, result, graph, input answers and route entries, with JSON
-  schemas generated into `schemas/`.
-- `agents.yaml` registry loading with three-level merge, keyed rule merge and predicate rules.
-- Run store with atomic spec writes and `run.json`.
-- Append-only event log with replay.
-- Adapter layer (base protocol) with fake adapters, a fake CLI and scripted scenarios.
-- Cross-platform file locks.
-- Repository-local git exclude handling.
-- `relay doctor`, the only CLI command implemented so far.
-
-Routing, scheduling, worktrees, verification, `relay run`, `relay apply` and the real CLI adapters
-are not implemented yet.
-
 ## Layout
 
 | Path | Contents |
