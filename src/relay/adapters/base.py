@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,24 +132,57 @@ def resolveCommand(
     Handles explicit paths, ``PATH`` (and ``PATHEXT`` on Windows) lookup, and Windows
     ``.cmd``/``.bat`` shims, which are wrapped through ``cmd.exe /d /s /c``. Raises
     :class:`CommandNotFound` when the command cannot be resolved.
+
+    This returns the list form only; it drops the raw Windows command line carried by
+    :func:`relay.core.platform.proc.resolve_command`. ``run_invocation`` uses the richer
+    ``resolve_command`` directly so the shim reaches ``cmd.exe`` without a second quoting
+    pass.
     """
-    return resolve_command(cmd, args, env=env, cwd=cwd)
+    return list(resolve_command(cmd, args, env=env, cwd=cwd).argv)
+
+
+def _write_prompt_file(path: Path, text: str) -> None:
+    """Write the prompt atomically with mode 0o600 (run-store atomic-write rule, section 6).
+
+    A temp file in the same directory is written, flushed and fsynced, then ``os.replace``d
+    over the target so a reader sees the old or the new bytes, never a partial write. The
+    prompt may contain secrets, so the file is created 0o600.
+    """
+    temp = path.with_name(f".tmp-{path.name}.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        with open(temp, "xb") as handle:
+            os.chmod(temp, 0o600)
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+        raise
+    if os.name != "nt":  # a rename is only durable once its directory is fsynced
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def run_invocation(invocation: Invocation, *, timeout_s: float | None = None) -> ProcessResult:
     """Resolve and supervise one invocation, passing the prompt on stdin or a file (task 1.7).
 
-    The command is resolved with :func:`resolveCommand` against the invocation's environment,
+    The command is resolved with :func:`resolve_command` against the invocation's environment,
     and the prompt text (``invocation.stdin``) is either piped to the child or, when
-    ``invocation.prompt_file`` is set, written to that file for the child to read from `args`.
+    ``invocation.prompt_file`` is set, written atomically to that file for the child to read
+    from `args`.
     """
     env = {**os.environ, **invocation.env}
-    argv = resolveCommand(invocation.cmd, invocation.args, env=env, cwd=invocation.cwd)
+    resolved = resolve_command(invocation.cmd, invocation.args, env=env, cwd=invocation.cwd)
     stdin: str | None = invocation.stdin
     if invocation.prompt_file is not None:
         if invocation.stdin is None:
             raise ValueError("prompt_file requires the prompt text in `stdin`")
         invocation.prompt_file.parent.mkdir(parents=True, exist_ok=True)
-        invocation.prompt_file.write_text(invocation.stdin, encoding="utf-8", newline="")
+        _write_prompt_file(invocation.prompt_file, invocation.stdin)
         stdin = None
-    return run_process(argv, cwd=invocation.cwd, env=env, stdin=stdin, timeout_s=timeout_s)
+    return run_process(resolved, cwd=invocation.cwd, env=env, stdin=stdin, timeout_s=timeout_s)

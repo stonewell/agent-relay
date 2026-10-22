@@ -9,6 +9,11 @@ from pathlib import Path
 import pytest
 
 from relay.adapters.base import CommandNotFound, Invocation, resolveCommand, run_invocation
+from relay.core.platform.proc import (
+    _wrap_cmd_shim,  # pyright: ignore[reportPrivateUsage]
+    resolve_command,
+    run_process,
+)
 
 WINDOWS = sys.platform == "win32"
 PY = sys.executable
@@ -47,6 +52,22 @@ def test_resolve_command_rejects_a_non_executable_file(tmp_path: Path) -> None:
         resolveCommand(str(plain))
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX: executability is not part of Windows resolution")
+def test_resolve_command_skips_a_non_executable_path_entry(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    # An earlier PATH entry has a non-executable file with the right name; resolution must
+    # keep searching later entries instead of failing at the first hit.
+    (first / "mytool").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script = second / "mytool"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    env = {**os.environ, "PATH": os.pathsep.join([str(first), str(second)])}
+    assert resolveCommand("mytool", ["--flag"], env=env) == [str(script), "--flag"]
+
+
 # --- resolveCommand: Windows PATHEXT and shims (skip cleanly on Linux) ------------------------
 
 
@@ -56,6 +77,36 @@ def test_resolve_command_uses_pathext(tmp_path: Path) -> None:
     exe.write_text("dummy", encoding="utf-8")
     env = {**os.environ, "PATH": str(tmp_path), "PATHEXT": ".COM;.EXE;.BAT;.CMD"}
     assert resolveCommand("tool", env=env) == [str(exe)]
+
+
+def test_cmd_shim_raw_command_line_has_no_double_quote_escaping() -> None:
+    """The raw command line is a single string with the `cmd /s` quote pair unescaped.
+
+    A second `list2cmdline` pass (the bug) would escape that pair as `\"`, which
+    `cmd.exe /s` cannot strip. `_wrap_cmd_shim` runs on every OS because it only builds a
+    string, so the risky construction is unit-tested here without needing Windows.
+    """
+    shim = r"C:\tools\agent.cmd"
+    resolved = _wrap_cmd_shim(shim, ["-p", "hello world"], {"COMSPEC": "cmd.exe"})
+    raw = resolved.windows_command_line
+    assert raw is not None
+    assert '\\"' not in raw
+    assert raw == 'cmd.exe /d /s /c "C:\\tools\\agent.cmd -p "hello world""'
+    assert resolved.argv == (
+        "cmd.exe",
+        "/d",
+        "/s",
+        "/c",
+        '"C:\\tools\\agent.cmd -p "hello world""',
+    )
+
+
+def test_cmd_shim_raw_command_line_preserves_embedded_quotes() -> None:
+    shim = r"C:\tools\agent.cmd"
+    resolved = _wrap_cmd_shim(shim, ["-p", 'hello "world"'], {"COMSPEC": "cmd.exe"})
+    raw = resolved.windows_command_line
+    assert raw is not None
+    assert raw == 'cmd.exe /d /s /c "C:\\tools\\agent.cmd -p "hello \\"world\\"""'
 
 
 @pytest.mark.skipif(not WINDOWS, reason=".cmd shims are Windows-only")
@@ -69,6 +120,13 @@ def test_resolve_command_wraps_a_cmd_shim(tmp_path: Path) -> None:
     wrapped = argv[3]
     assert str(shim) in wrapped
     assert "hello world" in wrapped
+    resolved = resolve_command("agent", ["-p", "hello world"], env=env)
+    assert resolved.windows_command_line is not None
+    # `argv[3]` is the inner line wrapped in one extra quote pair; the raw command line is
+    # that pair around the inner line only, unescaped by any second quoting pass.
+    assert resolved.windows_command_line == (
+        f'{env.get("COMSPEC", "cmd.exe")} /d /s /c "{wrapped[1:-1]}"'
+    )
 
 
 @pytest.mark.skipif(not WINDOWS, reason=".bat shims are Windows-only")
@@ -80,6 +138,18 @@ def test_resolve_command_wraps_a_bat_shim(tmp_path: Path) -> None:
     assert argv[0] == env.get("COMSPEC", "cmd.exe")
     assert argv[1:4] == ["/d", "/s", "/c"]
     assert str(shim) in argv[3]
+
+
+@pytest.mark.skipif(not WINDOWS, reason="the canary runs a real .cmd shim on Windows only")
+def test_cmd_shim_canary_round_trips_quotes_and_newlines(tmp_path: Path) -> None:
+    shim = tmp_path / "echo.cmd"
+    shim.write_text("@echo off\r\n@echo(%*\r\n", encoding="utf-8")
+    env = {**os.environ, "PATH": str(tmp_path), "PATHEXT": ".CMD"}
+    arg = 'a"b\nc d'
+    resolved = resolve_command("echo", [arg], env=env)
+    result = run_process(resolved, cwd=tmp_path, env=env)
+    assert result.exit_code == 0
+    assert result.stdout == arg + "\r\n"
 
 
 # --- the invocation path: prompt on stdin or a file -------------------------------------------

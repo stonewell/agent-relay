@@ -1,9 +1,10 @@
 """Process supervision and command resolution (design sections 7.1, 7.2, 15).
 
-The adapter layer resolves a CLI command to a concrete argv with :func:`resolve_command`
-(PATH and PATHEXT lookup, plus Windows ``.cmd``/``.bat`` shim wrapping), then
-:func:`run_process` spawns that argv with the resolved environment and stdin, captures
-stdout/stderr, enforces a timeout, and kills the whole process tree. No shell is ever used.
+The adapter layer resolves a CLI command to a :class:`ResolvedCommand` with
+:func:`resolve_command` (PATH and PATHEXT lookup, plus Windows ``.cmd``/``.bat`` shim
+wrapping into a raw command line), then :func:`run_process` spawns it with the resolved
+environment and stdin, captures stdout/stderr, enforces a timeout, and kills the whole
+process tree. No shell is ever used.
 
 Tree kill: on POSIX the child is started in its own session, so ``killpg`` reaches every
 process in the tree (``SIGTERM``, a short grace period, then ``SIGKILL``); on Windows the
@@ -31,6 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 _CMD_EXTENSIONS = frozenset({".cmd", ".bat"})
 _TERM_GRACE = 0.2  # seconds between SIGTERM and SIGKILL on POSIX
+_CREATE_SUSPENDED = 0x00000004  # Windows: start the process with its main thread suspended
 
 # `os.killpg` does not exist on Windows; fall back to killing the direct child.
 _killpg = getattr(os, "killpg", None)
@@ -49,6 +51,23 @@ class ProcessResult:
     stderr: str = ""
     duration_s: float = 0.0
     timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class ResolvedCommand:
+    """A resolved executable and how to spawn it (design section 7.2).
+
+    ``argv`` is the list form used on POSIX and for ordinary Windows commands; it is what
+    :func:`run_process` passes to ``subprocess.Popen`` when there is no raw Windows command
+    line. On Windows a ``.cmd``/``.bat`` shim must reach ``cmd.exe /d /s /c`` as a single
+    raw string: ``Popen`` re-applies ``list2cmdline`` to a list argument, which would corrupt
+    the already-quoted inner command line (``cmd /s`` would then be unable to strip the outer
+    quotes). In that case ``windows_command_line`` holds the exact command line and
+    :func:`run_process` passes it to ``Popen`` verbatim, bypassing the second quoting pass.
+    """
+
+    argv: tuple[str, ...]
+    windows_command_line: str | None = None
 
 
 def _split_pathext(pathext: str) -> list[str]:
@@ -85,16 +104,33 @@ def _iter_candidates(
             yield from (candidate + ext for ext in extensions)
 
 
-def _wrap_cmd_shim(shim: str, args: Sequence[str], env: Mapping[str, str]) -> list[str]:
+def _cmd_shim_command_line(shim: str, args: Sequence[str], comspec: str) -> str:
+    """Build the raw command line for a ``.cmd``/``.bat`` shim (Windows only).
+
+    ``subprocess.list2cmdline`` quotes each argument for the Windows command line; wrapping
+    the result in one extra pair of quotes makes ``cmd.exe /d /s /c`` strip exactly that
+    outer pair (its ``/s`` rule) and execute the inner, correctly-quoted command line. The
+    returned string must be passed to ``subprocess.Popen`` as a single string so it is *not*
+    re-quoted by a second ``list2cmdline`` pass.
+    """
+    inner = subprocess.list2cmdline([shim, *args])
+    return f'{comspec} /d /s /c "{inner}"'
+
+
+def _wrap_cmd_shim(shim: str, args: Sequence[str], env: Mapping[str, str]) -> ResolvedCommand:
     """Wrap a ``.cmd``/``.bat`` shim so it runs through ``cmd.exe`` (design section 7.2).
 
-    ``subprocess.list2cmdline`` quotes each argument for the Windows command line, and the
-    whole line is wrapped in one extra pair of quotes that ``cmd.exe /s`` strips, preserving
-    the inner quoting.
+    Returns a :class:`ResolvedCommand` whose ``windows_command_line`` is the raw command line
+    (see :func:`_cmd_shim_command_line`); ``argv`` is the equivalent list form, kept only for
+    inspection. ``run_process`` uses the raw string on Windows, never the list, so the inner
+    quoting is preserved.
     """
     comspec = env.get("COMSPEC", "cmd.exe")
-    command_line = subprocess.list2cmdline([shim, *args])
-    return [comspec, "/d", "/s", "/c", f'"{command_line}"']
+    command_line = _cmd_shim_command_line(shim, args, comspec)
+    return ResolvedCommand(
+        argv=(comspec, "/d", "/s", "/c", f'"{subprocess.list2cmdline([shim, *args])}"'),
+        windows_command_line=command_line,
+    )
 
 
 def resolve_command(
@@ -103,13 +139,16 @@ def resolve_command(
     *,
     env: Mapping[str, str] | None = None,
     cwd: Path | str | None = None,
-) -> list[str]:
-    """Resolve `cmd` to a concrete executable and return the full argv (never via a shell).
+) -> ResolvedCommand:
+    """Resolve `cmd` to a concrete executable and return the full command (never via a shell).
 
     - A command containing a path separator is an explicit path; it must be a file and, on
       POSIX, executable.
     - Otherwise the command is looked up on ``PATH`` and, on Windows, ``PATHEXT``.
-    - On Windows a resolved ``.cmd``/``.bat`` file is wrapped through ``cmd.exe /d /s /c``.
+    - On Windows a resolved ``.cmd``/``.bat`` file is wrapped through ``cmd.exe /d /s /c``;
+      the returned :class:`ResolvedCommand` then carries a raw ``windows_command_line`` so
+      ``run_process`` can pass it to ``Popen`` without a second quoting pass (see
+      :class:`ResolvedCommand`).
 
     Raises :class:`CommandNotFound` when nothing resolves. `args` are appended verbatim to
     the resolved executable (or folded into the shim command line).
@@ -130,14 +169,28 @@ def resolve_command(
         if not path.is_absolute():
             path = base / path
         tried.append(str(path))
-        if not path.is_file():
+        try:
+            is_file = path.is_file()
+        except OSError:
+            # An unreadable PATH entry is skipped, not fatal; an explicit path still rejects.
+            if explicit:
+                raise CommandNotFound(f"{path} is not executable") from None
             continue
-        if not IS_WINDOWS and not os.access(path, os.X_OK):
-            raise CommandNotFound(f"{path} is not executable")
+        if not is_file:
+            continue
+        if not IS_WINDOWS:
+            try:
+                executable = os.access(path, os.X_OK)
+            except OSError:
+                executable = False
+            if not executable:
+                if explicit:
+                    raise CommandNotFound(f"{path} is not executable")
+                continue  # keep searching later PATH entries for an executable one
         resolved = str(path)
         if IS_WINDOWS and os.path.splitext(resolved)[1].lower() in _CMD_EXTENSIONS:
             return _wrap_cmd_shim(resolved, args, effective)
-        return [resolved, *args]
+        return ResolvedCommand(argv=(resolved, *args))
 
     tried_note = f" (tried: {', '.join(tried)})" if tried else ""
     raise CommandNotFound(f"command {cmd!r} not found{tried_note}")
@@ -184,6 +237,17 @@ if sys.platform == "win32":
             ("PeakJobMemoryUsed", _ctypes.c_size_t),
         ]
 
+    class _THREADENTRY32(_ctypes.Structure):
+        _fields_ = [  # noqa: RUF012 - ctypes protocol
+            ("dwSize", _wintypes.DWORD),
+            ("cntUsage", _wintypes.DWORD),
+            ("th32ThreadID", _wintypes.DWORD),
+            ("th32OwnerProcessID", _wintypes.DWORD),
+            ("tpBasePri", _ctypes.c_long),
+            ("tpDeltaPri", _ctypes.c_long),
+            ("dwFlags", _wintypes.DWORD),
+        ]
+
     _kernel32.CreateJobObjectW.argtypes = [_ctypes.c_void_p, _wintypes.LPCWSTR]
     _kernel32.CreateJobObjectW.restype = _wintypes.HANDLE
     _kernel32.SetInformationJobObject.argtypes = [
@@ -201,11 +265,24 @@ if sys.platform == "win32":
     _kernel32.TerminateJobObject.restype = _wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [_wintypes.HANDLE]
     _kernel32.CloseHandle.restype = _wintypes.BOOL
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [_wintypes.DWORD, _wintypes.DWORD]
+    _kernel32.CreateToolhelp32Snapshot.restype = _wintypes.HANDLE
+    _kernel32.Thread32First.argtypes = [_wintypes.HANDLE, _ctypes.POINTER(_THREADENTRY32)]
+    _kernel32.Thread32First.restype = _wintypes.BOOL
+    _kernel32.Thread32Next.argtypes = [_wintypes.HANDLE, _ctypes.POINTER(_THREADENTRY32)]
+    _kernel32.Thread32Next.restype = _wintypes.BOOL
+    _kernel32.OpenThread.argtypes = [_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD]
+    _kernel32.OpenThread.restype = _wintypes.HANDLE
+    _kernel32.ResumeThread.argtypes = [_wintypes.HANDLE]
+    _kernel32.ResumeThread.restype = _wintypes.DWORD
 
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
     _PROCESS_SET_QUOTA = 0x0100
     _PROCESS_TERMINATE = 0x0001
+    _TH32CS_SNAPTHREAD = 0x00000004
+    _THREAD_SUSPEND_RESUME = 0x0002
+    _INVALID_HANDLE_VALUE = _wintypes.HANDLE(-1).value
 
     def _assign_to_job(pid: int) -> int | None:
         """Put `pid` in a new kill-on-close Job Object; returns the handle, or None on failure."""
@@ -240,6 +317,37 @@ if sys.platform == "win32":
         if handle is not None:
             _kernel32.CloseHandle(handle)
 
+    def _resume_main_thread(pid: int) -> bool:
+        """Resume the single suspended main thread of a ``CREATE_SUSPENDED`` process.
+
+        A process created with ``CREATE_SUSPENDED`` has exactly one thread (its main thread),
+        which has not run any code yet, so enumerating the threads that belong to `pid` and
+        resuming them is safe and unambiguous. Returns True when at least one thread was
+        resumed, False on failure (the caller then terminates the still-suspended child).
+        """
+        snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if snapshot is None or snapshot == _INVALID_HANDLE_VALUE:
+            return False
+        try:
+            entry = _THREADENTRY32()
+            entry.dwSize = _ctypes.sizeof(_THREADENTRY32)
+            if not _kernel32.Thread32First(snapshot, _ctypes.byref(entry)):
+                return False
+            resumed = False
+            while True:
+                if entry.th32OwnerProcessID == pid:
+                    thread = _kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    if thread:
+                        try:
+                            resumed = _kernel32.ResumeThread(thread) != 0xFFFFFFFF
+                        finally:
+                            _kernel32.CloseHandle(thread)
+                if not _kernel32.Thread32Next(snapshot, _ctypes.byref(entry)):
+                    break
+            return resumed
+        finally:
+            _kernel32.CloseHandle(snapshot)
+
 else:
 
     def _assign_to_job(pid: int) -> int | None:
@@ -250,6 +358,9 @@ else:
 
     def _close_job(handle: int | None) -> None:
         return None
+
+    def _resume_main_thread(pid: int) -> bool:
+        return True
 
 
 def _wait_exit(popen: subprocess.Popen[str], grace: float) -> None:
@@ -341,12 +452,28 @@ class SupervisedProcess:
         )
 
 
-def _spawn(argv: Sequence[str], *, cwd: Path | str, env: Mapping[str, str]) -> SupervisedProcess:
-    args = [str(arg) for arg in argv]
+def _spawn(
+    command: Sequence[str] | ResolvedCommand,
+    *,
+    cwd: Path | str,
+    env: Mapping[str, str],
+) -> SupervisedProcess:
     environment = {str(key): str(value) for key, value in env.items()}
+    if isinstance(command, ResolvedCommand):
+        argv = list(command.argv)
+        windows_command_line = command.windows_command_line
+    else:
+        argv = [str(arg) for arg in command]
+        windows_command_line = None
     if IS_WINDOWS:
+        # The raw command line, when present, must be handed to `Popen` as a single string
+        # (no `list2cmdline` pass). Spawn suspended, assign to the kill-on-close Job Object,
+        # then resume so no grandchild can escape the tree kill in between.
+        cmd_or_argv: str | list[str] = (
+            windows_command_line if windows_command_line is not None else argv
+        )
         popen = subprocess.Popen(
-            args,
+            cmd_or_argv,
             cwd=str(cwd),
             env=environment,
             stdin=subprocess.PIPE,
@@ -355,11 +482,20 @@ def _spawn(argv: Sequence[str], *, cwd: Path | str, env: Mapping[str, str]) -> S
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=_CREATE_SUSPENDED,
         )
         job = _assign_to_job(popen.pid)
+        if job is None or not _resume_main_thread(popen.pid):
+            # Could not guarantee a supervised tree: terminate the still-suspended child
+            # rather than run it unmanaged.
+            with contextlib.suppress(OSError):
+                popen.kill()
+            popen.communicate()
+            _close_job(job)
+            raise OSError(f"could not attach process {popen.pid} to a Job Object")
         return SupervisedProcess(popen, _windows_killer(popen, job), lambda: _close_job(job))
     popen = subprocess.Popen(
-        args,
+        argv,
         cwd=str(cwd),
         env=environment,
         stdin=subprocess.PIPE,
@@ -374,7 +510,7 @@ def _spawn(argv: Sequence[str], *, cwd: Path | str, env: Mapping[str, str]) -> S
 
 
 def run_process(
-    argv: Sequence[str],
+    argv: Sequence[str] | ResolvedCommand,
     *,
     cwd: Path | str,
     env: Mapping[str, str],
@@ -383,8 +519,10 @@ def run_process(
 ) -> ProcessResult:
     """Spawn `argv` (already resolved, no shell), capture output, enforce `timeout_s`.
 
-    On timeout the whole process tree is killed. `stdin`, when given, is the prompt text piped
-    to the child's stdin and then closed; otherwise stdin is closed immediately so the child
-    cannot hang waiting for input.
+    `argv` is a plain argv list, or a :class:`ResolvedCommand` from :func:`resolve_command`
+    whose ``windows_command_line`` (for ``.cmd``/``.bat`` shims) is passed to ``Popen``
+    verbatim on Windows. On timeout the whole process tree is killed. `stdin`, when given, is
+    the prompt text piped to the child's stdin and then closed; otherwise stdin is closed
+    immediately so the child cannot hang waiting for input.
     """
     return _spawn(argv, cwd=cwd, env=env).run(stdin, timeout_s)
