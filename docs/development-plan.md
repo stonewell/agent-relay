@@ -160,7 +160,7 @@ Goal: detached per-run supervisor with correct ownership, IPC and crash recovery
 
 | ID | Task | Pri | Size | Depends | Design | Done when |
 |---|---|---|---|---|---|---|
-| 2.12 | Native lifetime lock integration (binding from 0.10), lock objects outside purgeable dirs, non-inheritance, `doctor` filesystem check, target locks | P0 | L | 0.10, M3 | 6, 15 | Simultaneous cold start and stale-socket tests green |
+| 2.12 | Native lifetime lock integration (`orch.core.platform.locks` from 0.10), lock objects outside purgeable dirs, non-inheritance, `doctor` filesystem check, target locks | P0 | L | 0.10, M3 | 6, 15 | Simultaneous cold start and stale-socket tests green |
 | 2.13 | Supervisor process: detached start (hidden on Windows), readiness acknowledgement, scheduler hosting, redirected logs | P0 | L | 2.12, 2.2 | 8.6 | Run survives front-end exit |
 | 2.14 | IPC transport: Unix socket and Windows named pipe, path-length fallback, endpoint file, observer token, protocol versioning | P0 | L | 2.13 | 8.6 | Attach, status and cancel over IPC on both OSes |
 | 2.15 | Privileged command path: observer/privileged split, peer-process check against worker trees, operation digests, confirmation flow, `approval_required` result | P0 | M | 2.14 | 8.6, 9 | IPC test area green; no test treats `--yes` as human proof |
@@ -265,4 +265,5 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.7 | done | 2026-10-22 | `orch.adapters.{base,fake,fake_cli,fake_scenario}`; test helpers in `tests/harness.py` |
 | 0.8 | done | 2026-10-22 | `orch` CLI skeleton (`orch.cli`), exit codes, phase gating; `orch.core.doctor` registry, runner, text and JSON report; checks `python`, `git`, `config`, `agent.<name>.cli` |
 | 0.9 | done | 2026-10-22 | `orch.core.gitexclude` (block, linked-worktree aware, CRLF preserving) and doctor check `git.exclude`; `store.read_text` made newline-faithful |
+| 0.10 | done | 2026-10-22 | Spike A: `orch.core.platform.locks` (stdlib and `ctypes`), tests on Windows and on Linux (ext4, tmpfs, 9p via WSL); matrix in design section 15. macOS unverified |
 
