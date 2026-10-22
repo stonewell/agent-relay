@@ -2,7 +2,7 @@
 
 Status: Draft · Scope: programming tasks
 
-This document is the specification: it states each rule once, in the section named in the map below, and other sections refer to it. Change history is in [`revision-changes.md`](revision-changes.md), the task breakdown in [`development-plan.md`](development-plan.md), and the rule for which file holds what in [`AGENTS.md`](AGENTS.md).
+This document is the specification: it states each rule once, in the section named in the map below, and other sections refer to it. Change history is in [`revision-changes.md`](revision-changes.md), the task breakdown in [`development-plan.md`](development-plan.md), and the rule for which file holds what in the documentation rules of [`AGENTS.md`](../AGENTS.md).
 
 A router that takes software-engineering tasks, decides which agent CLI (Claude Code, Codex, Gemini CLI, Cursor, ...) and which model should do each one, runs them as concurrent sub-agents, and passes context and results between them as specs (files). It ships as two front-ends over one core: a standalone `orch` CLI and an OpenCode plugin. The core and the CLI are Python; the only TypeScript is the OpenCode plugin, which OpenCode requires to be JS/TS (section 15).
 

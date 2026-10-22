@@ -1,6 +1,6 @@
 # Revision changes
 
-The history of changes to the project documents: version summaries, review findings and resolutions, and restructures. It is the only place that records *what changed and why*; the documents themselves state only the current design (`design.md`) and the current tasks (`development-plan.md`). Which file holds what is defined in `AGENTS.md`.
+The history of changes to the project documents: version summaries, review findings and resolutions, and restructures. It is the only place that records *what changed and why*; the documents themselves state only the current design (`design.md`) and the current tasks (`development-plan.md`). Which file holds what is defined in the documentation rules of the root `AGENTS.md`.
 
 Section references (`section N`) in older entries point into `design.md` as it was at that revision, and may have moved since. The per-version regression scenarios are consolidated into the test plan in design.md section 16; the original per-version wording is kept here for traceability.
 
@@ -10,7 +10,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 |---|---|
 | `design.md` | v0.15 |
 | `development-plan.md` | v0.2 |
-| `AGENTS.md`, `docs/AGENTS.md` | v2 |
+| `AGENTS.md` | v3 |
 
 ## Version summaries
 
@@ -248,3 +248,10 @@ A second review of the same changes found that the R15-2 and R15-3 resolutions w
 |---|---|
 | Root `AGENTS.md` | New section "No sensitive information": what must never be committed (credentials, personal and account data, machine data, internal links), the placeholders to use instead, what may stay, scrubbing of recorded outputs, and a check before committing. |
 | `docs/AGENTS.md` | One line under "Tooling and hygiene" pointing to that rule for the documents. |
+
+## Single AGENTS.md (AGENTS v3)
+
+| Change | Detail |
+|---|---|
+| `docs/AGENTS.md` removed | Its documentation rules moved unchanged into a "Documentation rules" section of the root `AGENTS.md`, so agents have one instruction file. Its hygiene lines were already covered by the root file (scratch files) or are now part of "Working here" (file names). |
+| References | `design.md` header, `development-plan.md` task-status note, this file's introduction and the version table now point to the root file. Older entries above still name `docs/AGENTS.md` as it was then. |

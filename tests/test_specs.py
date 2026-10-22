@@ -34,7 +34,7 @@ def phase4(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_design_code_blocks_parse() -> None:
-    """docs/AGENTS.md: every yaml and json block in the design must parse."""
+    """AGENTS.md documentation rules: every yaml and json block in the design must parse."""
     for block in design_blocks():
         if block.lang == "json":
             json.loads(block.text)

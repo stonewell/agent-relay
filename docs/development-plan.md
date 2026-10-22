@@ -252,7 +252,7 @@ Goal: more agents, spawning, cost control and non-git workspaces. Tasks are inde
 
 ## Task status
 
-Only tasks that are not `todo` are listed. Status values: `in progress`, `done`, `dropped`. Rules: `docs/AGENTS.md`.
+Only tasks that are not `todo` are listed. Status values: `in progress`, `done`, `dropped`. Rules: documentation rules in the root `AGENTS.md`.
 
 | ID | Status | Date | Note |
 |---|---|---|---|
