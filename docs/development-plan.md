@@ -267,4 +267,8 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.9 | done | 2026-10-22 | `relay.core.gitexclude` (block, linked-worktree aware, CRLF preserving) and doctor check `git.exclude`; `store.read_text` made newline-faithful |
 | 0.10 | done | 2026-10-22 | Spike A: `relay.core.platform.locks` (stdlib and `ctypes`), tests on Windows and on Linux (ext4, tmpfs, 9p via WSL); matrix in design section 15. macOS unverified |
 | 0.11 | done | 2026-10-22 | Spike B on Claude 2.1.308 and Codex 0.163.0: `needs_input` approach is go; findings in `revision-changes.md`; recorded outputs in `tests/fixtures/recorded/`. Cursor addendum run on account login; Gemini not run |
+| 1.1 | done | 2026-10-22 | `relay.core.classifier`: deterministic category, complexity, risk (default globs + keywords) and language resolution; 50 fixture tests; risk keywords are module defaults because no config key exists yet |
+| 1.7 | in progress | 2026-10-22 | Adapter interface, `resolve_command`/`resolveCommand` (PATH/PATHEXT/`.cmd` shims) and `relay.core.platform.proc` supervision with tree kill; Linux canary and tree-kill tests green, Windows canary still unrun (3 Windows-only tests skip) |
+| 1.13 | done | 2026-10-22 | `relay.core.gitbase`: clean-tree pinning, synthetic `--allow-dirty` base with sensitive/`--exclude` filtering, `refs/relay/<run>/...`; 21 tests; `run.started` can consume `sensitive_paths` |
+| 1.18 | in progress | 2026-10-22 | `relay.core.runlock` + `platform.procid`: phase-1 exclusive-create lock (create-new semantics, `O_EXCL`) with PID and process-start identity, stale detection and retry/resume takeover; 15 tests green on Linux, Windows unverified |
 
