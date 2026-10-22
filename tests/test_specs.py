@@ -147,6 +147,83 @@ def test_task_spec_accepts_whole_repo_and_agents_yaml_scopes() -> None:
     assert task.owns == ["**", ".agents/agents.yaml", "src/editor/*.ts"]
 
 
+@pytest.mark.parametrize(
+    "scope", [".agents/./runs/**", ".agents//runs/**", ".git/./hooks/*", ".agents\\.\\runs\\**"]
+)
+@pytest.mark.parametrize("field", ["owns", "diff_scope"])
+def test_reserved_paths_reject_equivalent_spellings(scope: str, field: str) -> None:
+    changes = {"owns": [scope]} if field == "owns" else {"acceptance": [{"diff_scope": [scope]}]}
+    with pytest.raises(ValidationError, match="reserved runtime paths"):
+        TaskSpec.model_validate(_mut(_task(), **changes))
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        ".GIT/**",
+        ".AGENTS/runs/**",
+        ".agents/RUNS/**",
+        ".[G]IT/**",
+        ".git./hooks/*",
+        ".git /hooks/*",
+        ".agents/runs./**",
+        ".git::$INDEX_ALLOCATION/**",
+        "GIT~1/hooks/*",
+        "AGENTS~1/runs/**",
+        ".agents/SHADOW~1/**",
+        ".git/",
+        ".agents/*/**",
+        ".AGENTS/*/**",
+        ".agents/*",
+        "*/runs/**",
+        "**/.git/**",
+        "**/runs/**",
+        "GIT~?/hooks/*",
+        "GIT~[1]/hooks/*",
+        "*~1/hooks/*",
+        "AG1F2B~1/runs/**",
+        ".[A-Z]it/**",
+        ".git[.]/**",
+        ".git[:]x/**",
+    ],
+)
+@pytest.mark.parametrize("field", ["owns", "diff_scope"])
+def test_reserved_paths_reject_case_and_windows_spellings(scope: str, field: str) -> None:
+    changes = {"owns": [scope]} if field == "owns" else {"acceptance": [{"diff_scope": [scope]}]}
+    with pytest.raises(ValidationError, match="reserved runtime paths"):
+        TaskSpec.model_validate(_mut(_task(), **changes))
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "gitx/**",
+        "docs~old/**",
+        "src/a~1.txt",
+        ".github/**",
+        ".agents/runsheet.md",
+        ".agents/*.yaml",
+        "**/*.py",
+        "*/hooks/*",
+    ],
+)
+def test_names_near_reserved_paths_stay_legal(scope: str) -> None:
+    assert TaskSpec.model_validate(_mut(_task(), owns=[scope])).owns == [scope]
+
+
+@pytest.mark.parametrize("scope", [".", "./", "././", "./.", ".//."])
+def test_repository_root_spellings_are_rejected(scope: str) -> None:
+    with pytest.raises(ValidationError, match="below the repository root"):
+        TaskSpec.model_validate(_mut(_task(), owns=[scope]))
+
+
+def test_scope_paths_canonicalize_segments() -> None:
+    task = TaskSpec.model_validate(
+        _mut(_task(), owns=["./src//./editor/*.ts", ".agents//./agents.yaml", "docs//"])
+    )
+    assert task.owns == ["src/editor/*.ts", ".agents/agents.yaml", "docs/"]
+
+
 def test_verify_none_with_reason_is_allowed() -> None:
     task = TaskSpec.model_validate(
         _mut(_task(), verify="none", verification_skip_reason="docs only")

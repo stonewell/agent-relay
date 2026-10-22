@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from fnmatch import fnmatchcase
+from collections.abc import Sequence
+from fnmatch import translate
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
@@ -67,38 +68,71 @@ def _check_id(value: str) -> str:
 
 
 def normalize_repo_path(value: str) -> str:
-    """Normalise a repository-relative path or glob and reject unsafe forms."""
+    """Normalise a repository-relative path or glob and reject unsafe forms.
+
+    Empty and `.` segments are dropped; a trailing `/` is kept.
+    """
     path = value.strip().replace("\\", "/")
-    while path.startswith("./"):
-        path = path[2:]
-    if not path or "\x00" in path:
-        raise ValueError("path must not be empty")
+    if "\x00" in path:
+        raise ValueError(f"{value!r} must not contain NUL")
     if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
         raise ValueError(f"{value!r} must be relative to the repository root")
-    if ".." in path.split("/"):
+    segments = [segment for segment in path.split("/") if segment not in ("", ".")]
+    if ".." in segments:
         raise ValueError(f"{value!r} must not contain '..'")
-    return path
+    if not segments:
+        raise ValueError(f"{value!r} must name a path below the repository root")
+    canonical = "/".join(segments)
+    return canonical + "/" if path.endswith("/") else canonical
+
+
+_GENERIC = frozenset({"*", "**"})
+# `~` before a digit or glob character may be an 8.3 short name; `:` may be an NTFS stream.
+_ALIAS = re.compile(r"~[0-9?*\[]|:")
+_TRAILING = ("", ".", " ", "..", ". ", " .", "  ")
+
+
+def _may_name(segment: str, name: str) -> bool:
+    """True if a glob segment can refer to the reserved segment `name` on some host.
+
+    Case is ignored on every host, so a spec validates the same everywhere. Windows also
+    resolves trailing dots and spaces, stream suffixes and 8.3 short names to the same file;
+    a segment that could be one of those is assumed to match.
+    """
+    if _ALIAS.search(segment):
+        return True
+    pattern = re.compile(translate(segment), re.IGNORECASE)
+    stripped = segment if segment.endswith("]") else segment.rstrip(". ") or segment
+    stripped_pattern = re.compile(translate(stripped), re.IGNORECASE)
+    return stripped_pattern.match(name) is not None or any(
+        pattern.match(name + suffix) for suffix in _TRAILING
+    )
+
+
+def _reaches(segments: Sequence[str], root: tuple[str, ...], named: bool = False) -> bool:
+    """True if `segments` can match `root` or a path inside it with a non-generic segment.
+
+    Only `*` and `**` are generic: they match runtime state by accident, which the
+    orchestrator filters out of broad scopes separately (section 6).
+    """
+    if not root:
+        return named
+    if not segments:
+        return False
+    head, rest = segments[0], segments[1:]
+    if head == "**":
+        return _reaches(rest, root, named) or _reaches(segments, root[1:], named)
+    return _may_name(head, root[0]) and _reaches(rest, root[1:], named or head not in _GENERIC)
 
 
 def intersects_reserved(pattern: str) -> bool:
-    """True if a glob names a reserved path or something inside it (sections 6 and 8.1).
+    """True if a normalised glob names a reserved path or something inside it (sections 6, 8.1).
 
-    A bare ``*`` or ``**`` does not name a path, so whole-repository scopes stay legal;
-    the orchestrator filters runtime state out of them separately.
+    `pattern` is the output of `normalize_repo_path`. Scopes made only of `*` and `**`
+    segments, such as `**` or `*/hooks/*`, do not name a reserved path and stay legal.
     """
-    segments = pattern.split("/")
-    for root in RESERVED_ROOTS:
-        # `position` equals the segments matched so far: the loop breaks on the first miss.
-        for position, segment in enumerate(segments):
-            if segment == "**":
-                if position > 0:
-                    return True
-                break
-            if position >= len(root) or segment == "*" or not fnmatchcase(root[position], segment):
-                break
-            if position + 1 == len(root):
-                return True
-    return False
+    segments = pattern.rstrip("/").split("/")
+    return any(_reaches(segments, root) for root in RESERVED_ROOTS)
 
 
 def _check_scope_path(value: str) -> str:
