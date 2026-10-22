@@ -197,3 +197,17 @@ A document map at the top of the design lists the canonical section per topic. N
 | Section 14 | `orch doctor` semantics defined for task 0.8: check statuses, stable ids, `paid` checks gated behind `--paid`, exit codes. |
 | Section 15 | Spike A result for task 0.10: supported platform matrix, the lock and IPC mechanisms, the exec-only worker rule and the no-unlink rule. Replaces the sentence that promised the spike. |
 
+## Spike B results v0.14
+
+Task 0.11 ran about ten one-line prompts against Claude Code 2.1.308 (four paid runs, roughly $0.60 in total, mostly context overhead) and Codex 0.163.0 in a scratch repository. Recorded outputs are in `tests/fixtures/recorded/`; the findings are executable in `tests/test_recorded_outputs.py`.
+
+| Finding | Resolution |
+|---|---|
+| Claude rejects a schema carrying `$schema` (`no schema with key or ref ...`) | Adapter strips it; section 5.4 and the flag table updated. |
+| Codex `--output-schema` accepts only strict schemas (all properties required, `additionalProperties: false`); a non-strict schema fails with HTTP 400 before generation | Adapter converts the generated schema and drops nulls from the reply; section 5.4. Tasks 1.10 and 1.11 carry it. |
+| Codex `input_tokens` includes cached tokens; Claude's buckets are disjoint | Already covered by the disjoint-bucket rule in section 8.5; recorded as tests. |
+| Claude ran a different model than the one requested (`--model haiku` ran as `claude-sonnet-5-5` with the local user config) | Adapter records the model from `modelUsage`; no design change. |
+| Both CLIs returned typed `needs_input` for an ambiguous task | Go for the `needs_input` approach (risk row in section 17 updated, with the sample-size caveat). |
+| Session ids: Claude `session_id`, Codex `thread_id`; resume keeps the id and context | `[verify]` removed for both in section 7.3. Cursor not run (no API key): stays `[verify]`. |
+| Not verified: Codex reasoning-effort config key; Cursor and Gemini behaviour | `[verify]` tags remain. |
+

@@ -86,8 +86,8 @@ Goal: `orch run "<request>"` routes a task, runs Claude or Codex in an isolated 
 | 1.7 | Adapter interface, `probe()`, `resolveCommand()` (PATHEXT, `.cmd` shims), process supervision with tree kill, stdin/file prompt passing | P0 | M | 0.7 | 7.1, 7.2 | Quoting and newline canary round-trips on Windows and Linux; tree kill works |
 | 1.8 | Environment builder: platform allowlists, proxy/CA variables, config-home overrides, `env:` additions, secret redaction in logs | P0 | M | 1.7 | 9.4 | Allowlist tests per platform; proxy URLs never logged |
 | 1.9 | Claude adapter: invocation, permission mapping, `--json-schema`, `--bare` only with API-key auth, session id and resume, usage parsing, result parsing order | P0 | L | 1.7, 1.8, 0.11 | 7.2, 7.3 | Golden-output tests; live smoke test passes |
-| 1.10 | Codex adapter: `exec`, `--output-schema`, `-o`, sandbox flags, long-form bypass flag, session resume, JSONL parsing | P0 | L | 1.7, 1.8, 0.11 | 7.2, 7.3 | Golden-output tests; live smoke test passes |
-| 1.11 | Result parsing and validation: native structured output, node-dir spec, stdout block, synthesized candidate; one schema-repair follow-up | P0 | M | 0.3, 1.9, 1.10 | 5.4, 7.3 | Parsing order tests; second validation failure marks node `failed` |
+| 1.10 | Codex adapter: `exec`, `--output-schema` (strict-form conversion, section 5.4), `-o`, sandbox flags, long-form bypass flag, session resume, JSONL parsing | P0 | L | 1.7, 1.8, 0.11 | 7.2, 7.3 | Golden-output tests; live smoke test passes |
+| 1.11 | Result parsing and validation: native structured output (drop nulls from strict-schema replies), node-dir spec, stdout block, synthesized candidate; one schema-repair follow-up | P0 | M | 0.3, 1.9, 1.10 | 5.4, 7.3 | Parsing order tests; second validation failure marks node `failed` |
 | 1.12 | `doctor` canaries for adapters: version, auth mode, session id extraction and resume, structured output, quoting | P1 | M | 0.8, 1.9, 1.10 | 7, 17 | `orch doctor` reports each adapter's observed behaviour |
 
 ### 1C. Worktrees, capture and verification (GIT)
@@ -266,4 +266,5 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.8 | done | 2026-10-22 | `orch` CLI skeleton (`orch.cli`), exit codes, phase gating; `orch.core.doctor` registry, runner, text and JSON report; checks `python`, `git`, `config`, `agent.<name>.cli` |
 | 0.9 | done | 2026-10-22 | `orch.core.gitexclude` (block, linked-worktree aware, CRLF preserving) and doctor check `git.exclude`; `store.read_text` made newline-faithful |
 | 0.10 | done | 2026-10-22 | Spike A: `orch.core.platform.locks` (stdlib and `ctypes`), tests on Windows and on Linux (ext4, tmpfs, 9p via WSL); matrix in design section 15. macOS unverified |
+| 0.11 | done | 2026-10-22 | Spike B on Claude 2.1.308 and Codex 0.163.0: `needs_input` approach is go; findings in `revision-changes.md`; recorded outputs in `tests/fixtures/recorded/`. Cursor and Gemini not run |
 
