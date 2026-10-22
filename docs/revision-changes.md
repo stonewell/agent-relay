@@ -194,4 +194,5 @@ A document map at the top of the design lists the canonical section per topic. N
 | Section 3 clarified | While implementing task 0.4: removed the undefined category `triage` from the example rule `claude-cheap`; defined the built-in defaults (no pricing, `default` model tier for Codex and Gemini), strict rejection of unknown keys, the permitted agent keys and the `when` attributes. |
 | Sections 6 and 11 clarified | While implementing tasks 0.5 and 0.6: run id format and reuse rule, node directory naming, `run.json` contents and run states; the flat `events.jsonl` record shape, durability on append and torn-tail rules. |
 | Section 7.1 | Adapter interface restated as a Python `Protocol` (it was TypeScript pseudocode); the `fake` adapter and its stub agent process described, for task 0.7. |
+| Section 14 | `orch doctor` semantics defined for task 0.8: check statuses, stable ids, `paid` checks gated behind `--paid`, exit codes. |
 
