@@ -2,13 +2,36 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from relay.core.platform.proc import (
+    CommandNotFound,
+    ProcessResult,
+    resolve_command,
+    run_process,
+)
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
 from relay.core.store import replace_file
+
+__all__ = [
+    "AgentAdapter",
+    "CommandNotFound",
+    "Invocation",
+    "Probe",
+    "ProcessResult",
+    "RESULT_FILE",
+    "RunContext",
+    "WorkerHandle",
+    "archive_previous_result",
+    "resolveCommand",
+    "run_invocation",
+    "start_attempt",
+]
 
 
 @dataclass(frozen=True)
@@ -39,15 +62,9 @@ class Invocation:
     cwd: Path
     env: dict[str, str] = field(default_factory=lambda: {})
     stdin: str | None = None
-
-
-@dataclass(frozen=True)
-class ProcessResult:
-    exit_code: int | None
-    stdout: str = ""
-    stderr: str = ""
-    duration_s: float = 0.0
-    timed_out: bool = False
+    prompt_file: Path | None = None
+    """When set, the prompt text in `stdin` is written to this file instead of being piped to
+    the child's stdin. The adapter must reference the same path in `args`."""
 
 
 RESULT_FILE = "result.spec.yaml"
@@ -99,3 +116,38 @@ def start_attempt(adapter: AgentAdapter, task: TaskSpec, ctx: RunContext) -> Inv
     """The orchestrator's single entry point for starting an attempt with any adapter."""
     archive_previous_result(ctx)
     return adapter.build_invocation(task, ctx)
+
+
+def resolveCommand(
+    cmd: str,
+    args: Sequence[str] = (),
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | str | None = None,
+) -> list[str]:
+    """Resolve a CLI command to a concrete argv, never through a shell (design section 7.2).
+
+    Handles explicit paths, ``PATH`` (and ``PATHEXT`` on Windows) lookup, and Windows
+    ``.cmd``/``.bat`` shims, which are wrapped through ``cmd.exe /d /s /c``. Raises
+    :class:`CommandNotFound` when the command cannot be resolved.
+    """
+    return resolve_command(cmd, args, env=env, cwd=cwd)
+
+
+def run_invocation(invocation: Invocation, *, timeout_s: float | None = None) -> ProcessResult:
+    """Resolve and supervise one invocation, passing the prompt on stdin or a file (task 1.7).
+
+    The command is resolved with :func:`resolveCommand` against the invocation's environment,
+    and the prompt text (``invocation.stdin``) is either piped to the child or, when
+    ``invocation.prompt_file`` is set, written to that file for the child to read from `args`.
+    """
+    env = {**os.environ, **invocation.env}
+    argv = resolveCommand(invocation.cmd, invocation.args, env=env, cwd=invocation.cwd)
+    stdin: str | None = invocation.stdin
+    if invocation.prompt_file is not None:
+        if invocation.stdin is None:
+            raise ValueError("prompt_file requires the prompt text in `stdin`")
+        invocation.prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        invocation.prompt_file.write_text(invocation.stdin, encoding="utf-8", newline="")
+        stdin = None
+    return run_process(argv, cwd=invocation.cwd, env=env, stdin=stdin, timeout_s=timeout_s)

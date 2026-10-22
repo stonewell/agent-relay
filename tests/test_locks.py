@@ -51,7 +51,9 @@ def pid_alive(pid: int) -> bool:
     if WINDOWS:
         import ctypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # `getattr` instead of `ctypes.WinDLL`: the Windows-only attribute is absent from the
+        # Linux typeshed, so strict pyright reports direct access as unknown.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
         kernel32.OpenProcess.restype = ctypes.c_void_p
         handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
