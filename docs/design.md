@@ -373,6 +373,7 @@ verification:           # filled by the Verifier
   acceptance: passed
   details: [{ run: "npm test -- autosave", exit: 0 }]
 open_questions: []       # for needs_input: [{id, text, kind: free|choice, options?, default?, required}] with question_revision (section 8.2)
+# phase 4
 spawn_requests:          # optional follow-up work proposed by this node
   - { category: review, goal: "Review debounce edge cases", depends_on: [n3-implement-autosave] }
 usage: { duration_s: 212, tokens_in: 0, tokens_out: 0, cost_usd: 0.0 }
@@ -574,12 +575,12 @@ n1-research ┤                        ├─▶ n4-tests ─▶ n5-review (clau
   - Outcome is recorded as `apply.finished` keyed by operation id, target identity and delivered tree, not by run id alone. A crash after file installation but before this event is recovered from the journal; reapplying the same run to another branch is a distinct operation. Advance only the workspace delivery ledger after successful sync, never the run's baseline. Application failure has its own status and does not rewrite a previously successful run as failed. Original final-integration merge/verification failure still fails the run.
 - **Merge ancestry:** both automatic and resolved merges publish a merge commit with the contributing output commits as parents (or fast-forward when possible). A resolver's ordinary single-parent attempt commit supplies the verified resolution tree only; the supervisor publishes that tree with the original merge parents. Never flatten a fan-in into a single-parent commit, which would lose ancestry and reintroduce resolved conflicts in later fan-ins. Conflict-task scope includes the full combined delta of the merge inputs, with resolution edits restricted to declared unresolved paths unless explicitly widened. Keep immutable per-attempt output refs and merge refs under the `refs/relay/<run>/...` namespace until explicit run purge (`relay clean --purge-runs`) so worktree pruning, retries, and Git garbage collection do not remove reusable snapshots.
 
-### 8.4 Sub-agents requesting work
+### 8.4 Sub-agents requesting work (phase 4)
 A result may include `spawn_requests`. The router validates each against `max_depth`, `max_nodes`, remaining budget and permission policy, then adds accepted nodes to the DAG. Rejected requests are logged in `events.jsonl` and returned to the requester's summary. No unbounded recursion.
 
 Requests may add fresh nodes and edges into those nodes only; they cannot change inputs of running or completed nodes. Added nodes undergo the full graph validation (section 8.1: acyclicity and reserved-path checks) and write-scope reservation checks before admission. Conflict resolution is an internal operation with an explicit supported task kind (`resolve-conflict`), not an unknown user taxonomy category, and cannot recursively request another resolver for the same merge.
 
-### 8.5 Cost admission and accounting
+### 8.5 Cost admission and accounting (phase 4)
 
 - `policy.cost_mode` is `advisory` by default; `cost_ceiling_usd` and node `max_cost_usd` are scheduling thresholds in this mode, not guaranteed billing caps. Node limits cover all attempts, validation-repair calls, escalation, and fallback. Run accounting also includes classifier/planner calls, conflict resolution, and spawned work.
 - Pricing basis and settlement: rates (`input_per_m`, `output_per_m`, `cache_read_per_m`, `cache_write_per_m`) are snapshotted with currency, source, and effective date. Adapters normalize provider usage into disjoint uncached-input, cached-read, cache-write, and output token counts. If a provider includes cache reads in total input, subtract them before applying the uncached rate; never charge the same tokens twice. Compute USD as the sum of each disjoint bucket times its per-million rate, divided by 1,000,000: `(uncached_in * input_per_m + cache_read * cache_read_per_m + cache_write * cache_write_per_m + out * output_per_m) / 1,000,000`. Missing rates or ambiguous usage are labeled `estimated` or `unknown`, never exact or zero; a cache rate omitted from `agents.yaml` counts as missing for labeling purposes even though section 3 supplies the `input_per_m` placeholder for the arithmetic, so such costs are `estimated` and never satisfy hard mode. Direct monetary cost takes precedence, with its billing basis recorded (metered API charge versus subscription-equivalent estimate). Unknown pricing cannot qualify for hard mode.
@@ -685,7 +686,7 @@ The Verifier runs after every write node and after merges, against the captured 
 
 Findings from the OpenCode docs: plugins are TS/JS modules (`.opencode/plugins/`, `~/.config/opencode/plugins/`, or npm via the `plugin` array in `opencode.json`) exporting `async ({ project, client, $, directory, worktree }) => hooks`. Hooks include `tool` (custom tools with `tool()` and zod from `@opencode-ai/plugin`; tool context has `agent, sessionID, messageID, directory, worktree`), `tool.execute.before/after`, `permission.asked/replied`, `session.*` events, `shell.env`. Agents are defined in `opencode.json` or `.opencode/agents/*.md` with `mode: primary|subagent|all`, `model`, `permission` (including `permission.task`), `prompt`, `steps`. The SDK offers `client.session.create/prompt/children/abort`, event subscription and structured output (`format: json_schema` → `info.structured_output`). Custom model providers are configured through `provider.<id>` with `@ai-sdk/openai-compatible` and `options.baseURL`; the docs do not show plugins registering providers.
 
-### 13.1 Surface 1: router tools (primary, v1)
+### 13.1 Surface 1: router tools (primary, phase 3)
 
 The plugin registers tools; OpenCode's LLM is the planner, the plugin is the deterministic scheduler/adapter layer:
 
@@ -711,7 +712,7 @@ Behavior notes:
 - External workers are mirrored into OpenCode: progress is emitted with `client.app.log` and, optionally, as child sessions created via `client.session.create` that hold a short transcript of the worker's summary, so the TUI shows what is running. Mirroring is best-effort; the run store is the source of truth.
 - Waiting and cancellation semantics are defined in section 8.6. Plugin specifics: both execution tools default to `wait: false` and return the run id after supervisor-ready acknowledgement; `wait: true` blocks at most `wait_timeout_s` (default 45) and returns the actual persisted state on expiry. Explicit user session abort maps to `task_cancel` for runs owned by that session; an undifferentiated request abort signal alone is not treated as user cancellation. Poll `task_status` for authoritative completion; session-idle events are not proof, and completion notifications are best-effort projections of supervisor events.
 
-### 13.2 Surface 2: provider gateway (optional, v2)
+### 13.2 Surface 2: provider gateway (optional, phase 5)
 
 To select an external CLI as a *model* inside OpenCode (`/models`), the plugin starts a local OpenAI-compatible server (`/v1/chat/completions`, `/v1/models`) on a loopback port with a random bearer token. Model ids: `router/auto` (route by category), `router/claude-deep`, `router/codex`, etc. Each request becomes a single-node task run, and the final text is returned (streamed as SSE chunks of the CLI's progress/summary).
 
@@ -860,7 +861,7 @@ Tests are organized by area; the phase in brackets says when each area must be g
 | Route log leaks goal text, or loses decisions on write failure | Redaction and `include_goal: false`; the decision is durable in `events.jsonl` before dispatch and projections are rebuilt (section 4.4). |
 | Provider gateway fidelity | Documented as lossy; surface 1 recommended; gateway behind a flag. |
 | OpenCode plugin API drift (e.g. `config` hook, subagent session creation) | Isolate OpenCode-specific code in `plugin/`; test against a pinned version range. |
-| Open: which task graph planner is default outside OpenCode? | Proposal: template pipelines (bugfix, feature, refactor, upgrade) plus user-supplied graphs in v1; LLM planning in phase 5. |
+| Open: which task graph planner is default outside OpenCode? | Proposal: template pipelines (bugfix, feature, refactor, upgrade) plus user-supplied graphs in phase 2a; LLM planning in phase 5. |
 | Open: do users want a TUI/dashboard? | Out of scope for v1; `status --json` is the integration point. |
 
 ---

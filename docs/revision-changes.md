@@ -263,3 +263,15 @@ A second review of the same changes found that the R15-2 and R15-3 resolutions w
 | Name | The project is now "Agent Relay" (distribution `agent-relay`), replacing "Agents Coordinator" (`agents-coordinator`). |
 | CLI and package | The `orch` command and Python package became `relay` (`src/relay/`). Names derived from it changed too: the `refs/orch/` ref namespace, the `.orch-incoming` directory, the `ORCH_*` environment variables and the `orch-` temp prefixes now use `relay`. The role word "orchestrator" is unchanged. |
 | Older entries | Entries above keep the old names as they were then. |
+
+## Phase tag corrections (design v0.16)
+
+Review finding R16-1 (low): two phase-4 features had no in-place phase tag, and three `v1`/`v2` labels conflicted with the phase numbering in section 16. Wording and clarification only; no rule changed, so the design version stays v0.16.
+
+| Change | Detail |
+|---|---|
+| Section 5.3 | The `spawn_requests` field in the `result.spec.yaml` example carries a `# phase 4` comment. |
+| Sections 8.4 and 8.5 | Headings tagged `(phase 4)`. |
+| Section 13.1 | Surface 1 is marked `phase 3` instead of `v1`. |
+| Section 13.2 | Surface 2 is marked `phase 5` instead of `v2`. |
+| Section 17 | The open planner risk row says user-supplied graphs arrive in `phase 2a` instead of `v1`. |
