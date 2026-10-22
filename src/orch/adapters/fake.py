@@ -8,17 +8,23 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
+import yaml
 from pydantic import ValidationError
 
-from orch.core.specs import ResultSpec, TaskSpec, parse_spec
+from orch.core.specs import ResultSpec, TaskSpec
 from orch.core.specs.common import PermissionLevel
+from orch.core.store import read_text
+from orch.core.yamlio import load_yaml
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle
+from .base import RESULT_FILE, Invocation, Probe, ProcessResult, RunContext, WorkerHandle
 from .fake_scenario import Scenario
 
 ScenarioFn = Callable[[TaskSpec, RunContext], Scenario]
 Scripted = Scenario | Sequence[Scenario]
 ScenarioSource = Scripted | Mapping[str, Scripted] | ScenarioFn
+
+_ABSENT = object()
+"""A parsing source that produced nothing (unlike one that produced `null`)."""
 
 _BLOCK = re.compile(r"```(?:json|yaml)\s*\n(.*?)\n```", re.DOTALL)
 
@@ -110,16 +116,17 @@ class FakeAdapter:
         self, proc: ProcessResult, task: TaskSpec, ctx: RunContext
     ) -> ResultSpec:
         """Parsing order of design section 7.3: native, node-dir file, stdout block, synthesized."""
-        for candidate in (
-            self._native(proc),
-            self._node_file(ctx),
-            self._stdout_block(proc),
+        for parser in (
+            lambda: self._native(proc),
+            lambda: self._node_file(ctx),
+            lambda: self._stdout_block(proc),
         ):
-            if candidate is not None:
-                try:
+            try:
+                candidate = parser()
+                if candidate is not _ABSENT:
                     return ResultSpec.model_validate(candidate)
-                except ValidationError as exc:
-                    raise ResultInvalid(str(exc)) from exc
+            except (ValidationError, yaml.YAMLError, UnicodeDecodeError, OSError) as exc:
+                raise ResultInvalid(str(exc)) from exc
         return self._synthesized(proc, ctx)
 
     async def cancel(self, handle: WorkerHandle) -> None:
@@ -129,34 +136,32 @@ class FakeAdapter:
     # --- parsing helpers ------------------------------------------------------------------
 
     @staticmethod
-    def _native(proc: ProcessResult) -> dict[str, Any] | None:
+    def _native(proc: ProcessResult) -> object:
         for line in reversed(proc.stdout.splitlines()):
             if line.startswith("{"):
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
-                    return None
+                    return _ABSENT
                 if not isinstance(payload, dict):
-                    return None
+                    return _ABSENT
                 result: Any = cast("dict[str, Any]", payload).get("result")
-                return cast("dict[str, Any]", result) if isinstance(result, dict) else None
-        return None
+                return cast("dict[str, Any]", result) if isinstance(result, dict) else _ABSENT
+        return _ABSENT
 
     @staticmethod
-    def _node_file(ctx: RunContext) -> dict[str, Any] | None:
-        path = ctx.node_dir / "result.spec.yaml"
+    def _node_file(ctx: RunContext) -> object:
+        path = ctx.node_dir / RESULT_FILE
         if not path.is_file():
-            return None
-        spec = parse_spec(ResultSpec, path.read_text(encoding="utf-8"))
-        return spec.model_dump(mode="json")
+            return _ABSENT
+        return load_yaml(read_text(path))
 
     @staticmethod
-    def _stdout_block(proc: ProcessResult) -> dict[str, Any] | None:
+    def _stdout_block(proc: ProcessResult) -> object:
         match = _BLOCK.search(proc.stdout)
         if match is None:
-            return None
-        spec = parse_spec(ResultSpec, match.group(1))
-        return spec.model_dump(mode="json")
+            return _ABSENT
+        return load_yaml(match.group(1))
 
     @staticmethod
     def _synthesized(proc: ProcessResult, ctx: RunContext) -> ResultSpec:

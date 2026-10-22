@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from harness import context, git, init_repo, run_invocation, task
-from orch.adapters.base import Invocation, RunContext
+from orch.adapters.base import (
+    RESULT_FILE,
+    Invocation,
+    ProcessResult,
+    RunContext,
+    archive_previous_result,
+    start_attempt,
+)
 from orch.adapters.fake import FakeAdapter, ResultInvalid
 from orch.adapters.fake_scenario import Scenario
 from orch.core.specs import TaskSpec
@@ -17,7 +24,7 @@ def run(adapter: FakeAdapter, tmp: Path, *, attempt: int = 1, node: str = "n1", 
     """Build, execute and parse one attempt; returns (result, process result, context)."""
     ctx = context(tmp, node, attempt, resume_session=kw.get("resume_session"))  # type: ignore[arg-type]
     spec = task(node)
-    proc = run_invocation(adapter.build_invocation(spec, ctx))
+    proc = run_invocation(start_attempt(adapter, spec, ctx))
     result = asyncio.run(adapter.parse_result(proc, spec, ctx))
     return result, proc, ctx
 
@@ -106,6 +113,80 @@ def test_no_result_is_synthesized_from_exit_code_and_last_line(repo: Path) -> No
 def test_failure_with_a_native_result_keeps_the_agents_status(repo: Path) -> None:
     result, proc, _ = run(FakeAdapter(Scenario(status="failed", exit_code=1)), repo)
     assert (proc.exit_code, result.status) == (1, "failed")
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_valid_result_ignores_malformed_lower_priority_sources(
+    tmp_path: Path, native: bool
+) -> None:
+    ctx = context(tmp_path)
+    candidate = {"id": "n1", "status": "done", "summary": "current"}
+    (ctx.node_dir / RESULT_FILE).write_text(
+        "status: invalid" if native else json.dumps(candidate), encoding="utf-8"
+    )
+    stdout = "```yaml\nstatus: invalid\n```"
+    if native:
+        stdout += "\n" + json.dumps({"result": candidate})
+    proc = ProcessResult(exit_code=0, stdout=stdout, stderr="", duration_s=0)
+    result = asyncio.run(FakeAdapter().parse_result(proc, task(), ctx))
+    assert (result.status, result.summary) == ("done", "current")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"status: invalid", b"id: [unclosed", b"", "id: n1".encode("utf-16")],
+    ids=["schema", "yaml", "empty", "utf-16"],
+)
+def test_malformed_node_file_raises_result_invalid(tmp_path: Path, content: bytes) -> None:
+    ctx = context(tmp_path)
+    (ctx.node_dir / RESULT_FILE).write_bytes(content)
+    proc = ProcessResult(exit_code=0, stdout="", stderr="", duration_s=0)
+    with pytest.raises(ResultInvalid):
+        asyncio.run(FakeAdapter().parse_result(proc, task(), ctx))
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_retry_does_not_parse_previous_attempt_result(repo: Path, timeout: bool) -> None:
+    adapter = FakeAdapter(
+        [
+            Scenario(output="file", summary="previous attempt"),
+            Scenario(output="none", exit_code=3, hang=timeout),
+        ]
+    )
+    first, _, ctx = run(adapter, repo)
+    assert first.status == "done"
+    assert (ctx.node_dir / RESULT_FILE).is_file()
+    ctx = context(repo, attempt=2)
+    invocation = start_attempt(adapter, task(), ctx)
+    archived = ctx.node_dir / "attempts" / "01" / RESULT_FILE
+    assert "previous attempt" in archived.read_text(encoding="utf-8")
+    assert not (ctx.node_dir / RESULT_FILE).exists()
+    proc = run_invocation(invocation, timeout_s=1.5 if timeout else 30)
+    assert proc.timed_out == timeout
+    result = asyncio.run(adapter.parse_result(proc, task(), ctx))
+    assert result.status == "failed"
+    assert result.summary != "previous attempt"
+
+
+def test_first_attempt_archives_nothing(tmp_path: Path) -> None:
+    ctx = context(tmp_path)
+    (ctx.node_dir / RESULT_FILE).write_text("{}", encoding="utf-8")
+    assert archive_previous_result(ctx) is None
+    assert (ctx.node_dir / RESULT_FILE).is_file()
+
+
+def test_archive_never_overwrites_an_earlier_result(tmp_path: Path) -> None:
+    ctx = context(tmp_path, attempt=2)
+    archived: list[Path | None] = []
+    for text in ("questions", "re-entered attempt"):
+        (ctx.node_dir / RESULT_FILE).write_text(text, encoding="utf-8")
+        archived.append(archive_previous_result(ctx))
+    directory = ctx.node_dir / "attempts" / "01"
+    assert archived == [directory / RESULT_FILE, directory / "result-2.spec.yaml"]
+    assert [path.read_text(encoding="utf-8") for path in archived if path] == [
+        "questions",
+        "re-entered attempt",
+    ]
 
 
 def test_needs_input_returns_typed_questions(repo: Path) -> None:

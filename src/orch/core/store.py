@@ -61,7 +61,7 @@ def atomic_write(path: Path, data: bytes | str) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        _replace(temp, path)
+        replace_file(temp, path)
         _fsync_dir(path.parent)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -69,7 +69,8 @@ def atomic_write(path: Path, data: bytes | str) -> None:
         raise
 
 
-def _replace(source: Path, target: Path) -> None:
+def replace_file(source: Path, target: Path) -> None:
+    """`os.replace` that retries briefly on Windows sharing violations."""
     # On Windows a reader, antivirus scanner or indexer can briefly hold the target open.
     for attempt in range(_REPLACE_RETRIES):
         try:
