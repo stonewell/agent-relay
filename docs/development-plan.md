@@ -105,7 +105,7 @@ Goal: `orch run "<request>"` routes a task, runs Claude or Codex in an isolated 
 | ID | Task | Pri | Size | Depends | Design | Done when |
 |---|---|---|---|---|---|---|
 | 1.18 | Interim run lock: exclusive-create, PID plus process-start identity, stale detection, `interrupted` marking, takeover only on `--retry`/`resume` | P0 | M | 0.5 | 6 | Ownership test area (phase 1 part) green on Windows and Linux |
-| 1.19 | Foreground `orch run`: intake, routing, attempt state machine (phases `agent`, `capture`, `verify`, `publish`), `max_attempts` across escalation and fallback, timeouts, events, run result and exit codes | P0 | L | 1.4, 1.11, 1.17, 1.18 | 8.2, 14 | Single-node end-to-end passes with the fake adapter (**M1**) |
+| 1.19 | Foreground `orch run`: intake, routing, attempt state machine (phases `agent`, `capture`, `verify`, `publish`), every attempt started through `start_attempt` so earlier results are moved aside, `max_attempts` across escalation and fallback, timeouts, events, run result and exit codes | P0 | L | 1.4, 1.11, 1.17, 1.18 | 8.2, 14 | Single-node end-to-end passes with the fake adapter (**M1**) |
 | 1.20 | Permission levels: precedence resolution, mapping per adapter, `probe().levels`, fail-closed behaviour, run-start banner; doctor canaries for the profiles that exist (Codex native sandbox, Claude/Cursor read-only modes) | P0 | L | 1.9, 1.10, 0.8 | 9 | Permission test area green; unsupported levels fail closed |
 | 1.21 | `needs_input` foreground: adapter prompt and typed questions, TTY prompt, answer recording and provenance, `--non-interactive` blocked exit 6, `orch reply`, `orch resume` for one node, limits and idempotency | P0 | L | 1.19, 0.11 | 8.2, 5.3 | `needs_input` foreground test area green; doctor canary on real agents |
 | 1.22 | `orch status`, `orch result`, `orch agents`, `orch clean` (worktrees, scratch; `--purge-runs` with lock) | P1 | M | 1.19 | 14 | Commands read run directory directly; clean never touches lock objects |
@@ -258,11 +258,11 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 |---|---|---|---|
 | 0.1 | done | 2026-10-22 | `uv` project; full suite passes on Windows (Python 3.11) and on Linux (WSL2, Python 3.12) |
 | 0.2 | in progress | 2026-10-22 | Workflow written in `.github/workflows/ci.yml`; not yet run (no remote configured) |
-| 0.3 | done | 2026-10-22 | `orch.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; 66 tests pass locally |
+| 0.3 | done | 2026-10-22 | `orch.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; reserved-scope check is host-independent and conservative (case, globs, Windows aliases) with regression tests |
 | 0.4 | done | 2026-10-22 | `orch.core.registry` and `orch.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
 | 0.5 | done | 2026-10-22 | `orch.core.store` and `runrecord`; atomic writes with a process-kill test; Windows reader and writer retry on `PermissionError` |
 | 0.6 | done | 2026-10-22 | `orch.core.events`: catalog, durable append, torn-tail repair, replay by `seq` |
-| 0.7 | done | 2026-10-22 | `orch.adapters.{base,fake,fake_cli,fake_scenario}`; test helpers in `tests/harness.py` |
+| 0.7 | done | 2026-10-22 | `orch.adapters.{base,fake,fake_cli,fake_scenario}`; test helpers in `tests/harness.py`; lazy result precedence; malformed or unreadable results raise `ResultInvalid`; `start_attempt` in `base` archives the previous attempt's result so a retry cannot parse it |
 | 0.8 | done | 2026-10-22 | `orch` CLI skeleton (`orch.cli`), exit codes, phase gating; `orch.core.doctor` registry, runner, text and JSON report; checks `python`, `git`, `config`, `agent.<name>.cli` |
 | 0.9 | done | 2026-10-22 | `orch.core.gitexclude` (block, linked-worktree aware, CRLF preserving) and doctor check `git.exclude`; `store.read_text` made newline-faithful |
 | 0.10 | done | 2026-10-22 | Spike A: `orch.core.platform.locks` (stdlib and `ctypes`), tests on Windows and on Linux (ext4, tmpfs, 9p via WSL); matrix in design section 15. macOS unverified |

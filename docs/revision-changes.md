@@ -8,7 +8,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.14 |
+| `design.md` | v0.15 |
 | `development-plan.md` | v0.2 |
 | `AGENTS.md`, `docs/AGENTS.md` | v1 |
 
@@ -222,3 +222,22 @@ Three more runs on Cursor `agent` 2026.10.19, authenticated by account login (no
 | No schema flag: JSON came back as text in `result`, with `options: []` on free questions and `null` defaults | Parser normalisation rule added to section 5.4. |
 | The ambiguous-task run took 242 s | Noted for timeouts: Cursor attempts can be slow even without edits. |
 
+## Phase 0 code review v0.15
+
+A review of the uncommitted fixes to tasks 0.3 and 0.7 found that the reserved-path check depended on the host and that the retry fix lived in the fake adapter only.
+
+| Id | Severity | Finding | Resolution |
+|---|---|---|---|
+| R15-1 | High | A retry deleted the previous `result.spec.yaml`, losing a `needs_input` question set, and only the fake adapter did it | Section 8.2: the orchestrator moves earlier results to `attempts/NN/` for every adapter; section 6 layout lists the directory. |
+| R15-2 | High | Case folding used the host's rules, so `.GIT/**` passed on macOS and one spec validated differently on Windows and Linux | Section 8.1: the check folds ASCII case on every host. |
+| R15-3 | Medium | Windows-equivalent spellings (trailing dots or spaces, stream suffixes, 8.3 short names) bypassed the check | Section 8.1: those spellings are compared as the name they resolve to. |
+| R15-4 | Low | Path canonicalisation dropped a trailing slash; malformed node-dir or stdout results raised raw errors | Code only: trailing slash kept; parse errors raise `ResultInvalid` (section 7.3 unchanged). |
+
+A second review of the same changes found that the R15-2 and R15-3 resolutions were still incomplete.
+
+| Id | Severity | Finding | Resolution |
+|---|---|---|---|
+| R15-5 | High | A `*` segment after a literal one stopped the check, so `.agents/*/**` and `*/runs/**` were accepted | Section 8.1: a scope is rejected when it can reach a reserved path through a non-wildcard segment; the exemption is limited to scopes made only of `*` and `**`. |
+| R15-6 | High | Short names were caught only in their literal form (`GIT~?`, `*~1` and hashed names passed), and folding case or cutting at `:` broke glob classes | Section 8.1 replaces the R15-3 rule: any segment with `~` before a digit or glob character, or with `:`, is treated as possibly reserved; case is ignored in the match instead of folding the glob. |
+| R15-7 | Medium | Archiving could overwrite an earlier archived result | Section 8.2: archived files are never overwritten. |
+| R15-8 | Low | `.` and `./` behaved differently; unreadable result files raised raw errors; results were validated twice; Windows sharing violations were not retried during archiving | Section 8.1: the repository root itself is rejected. The rest is code only. |
