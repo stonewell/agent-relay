@@ -8,7 +8,7 @@ A router that sends programming tasks to different agent CLIs and passes context
 
 ## Current state
 
-Phase 0 is being implemented: the Python package is in `src/orch/` and the tests in `tests/`. Which tasks are done is recorded only in the task status section of `docs/development-plan.md`.
+Phase 0 is being implemented: the Python package is in `src/relay/` and the tests in `tests/`. Which tasks are done is recorded only in the task status section of `docs/development-plan.md`.
 
 ## Where things are
 
@@ -17,7 +17,7 @@ Phase 0 is being implemented: the Python package is in `src/orch/` and the tests
 | `docs/design.md` | The specification (current design only) |
 | `docs/development-plan.md` | Tasks, priorities, milestones and task status |
 | `docs/revision-changes.md` | History of changes to the documents above |
-| `src/orch/`, `tests/` | Code and tests; layout defined in design section 15 |
+| `src/relay/`, `tests/` | Code and tests; layout defined in design section 15 |
 
 ## Working here
 

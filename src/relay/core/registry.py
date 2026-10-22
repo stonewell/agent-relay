@@ -19,7 +19,7 @@ from .specs.common import PermissionLevel
 from .yamlio import load_yaml
 
 CONFIG_VERSION = 1
-USER_CONFIG = Path.home() / ".config" / "orch" / "agents.yaml"
+USER_CONFIG = Path.home() / ".config" / "relay" / "agents.yaml"
 PROJECT_CONFIG = Path(".agents") / "agents.yaml"
 
 R = TypeVar("R", bound="_RuleBase")
@@ -263,7 +263,7 @@ def read_source(text: str, label: str) -> dict[str, Any]:
 
 
 def builtin_text() -> str:
-    return resources.files("orch.core").joinpath("builtin_agents.yaml").read_text("utf-8")
+    return resources.files("relay.core").joinpath("builtin_agents.yaml").read_text("utf-8")
 
 
 @dataclass(frozen=True)

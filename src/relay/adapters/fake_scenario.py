@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from orch.core.specs.common import NodeStatus
+from relay.core.specs.common import NodeStatus
 
 OutputMode = Literal["json", "file", "block", "none"]
 

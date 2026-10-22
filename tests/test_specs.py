@@ -10,8 +10,8 @@ import yaml
 from pydantic import ValidationError
 
 from design_blocks import blocks_in, design_blocks
-from orch.core import specs
-from orch.core.specs import (
+from relay.core import specs
+from relay.core.specs import (
     Graph,
     InputAnswers,
     ResultSpec,
@@ -388,7 +388,7 @@ def test_json_is_accepted_as_spec_text() -> None:
 
 
 def test_committed_schemas_are_current(tmp_path: Path) -> None:
-    """`schemas/*.json` is generated; regenerate with `python -m orch.core.specs`."""
+    """`schemas/*.json` is generated; regenerate with `python -m relay.core.specs`."""
     specs.export_schemas(tmp_path)
     for generated in tmp_path.glob("*.json"):
         committed = ROOT / "schemas" / generated.name

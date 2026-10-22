@@ -8,7 +8,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.15 |
+| `design.md` | v0.16 |
 | `development-plan.md` | v0.2 |
 | `AGENTS.md` | v3 |
 
@@ -255,3 +255,11 @@ A second review of the same changes found that the R15-2 and R15-3 resolutions w
 |---|---|
 | `docs/AGENTS.md` removed | Its documentation rules moved unchanged into a "Documentation rules" section of the root `AGENTS.md`, so agents have one instruction file. Its hygiene lines were already covered by the root file (scratch files) or are now part of "Working here" (file names). |
 | References | `design.md` header, `development-plan.md` task-status note, this file's introduction and the version table now point to the root file. Older entries above still name `docs/AGENTS.md` as it was then. |
+
+## Project rename to Agent Relay (design v0.16)
+
+| Change | Detail |
+|---|---|
+| Name | The project is now "Agent Relay" (distribution `agent-relay`), replacing "Agents Coordinator" (`agents-coordinator`). |
+| CLI and package | The `orch` command and Python package became `relay` (`src/relay/`). Names derived from it changed too: the `refs/orch/` ref namespace, the `.orch-incoming` directory, the `ORCH_*` environment variables and the `orch-` temp prefixes now use `relay`. The role word "orchestrator" is unchanged. |
+| Older entries | Entries above keep the old names as they were then. |

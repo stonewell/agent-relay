@@ -1,4 +1,4 @@
-"""`orch` command line entry point (design section 14)."""
+"""`relay` command line entry point (design section 14)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from orch import __version__
+from relay import __version__
 
 from .commands import doctor
 from .exitcodes import Exit
@@ -16,7 +16,7 @@ from .phases import COMMAND_PHASE, IMPLEMENTED, availability_error
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="orch", description="Route programming tasks to agent CLIs."
+        prog="relay", description="Route programming tasks to agent CLIs."
     )
     parser.add_argument("--version", "-V", action="version", version=__version__)
     parser.add_argument(

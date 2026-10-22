@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from orch.core import store as store_module
-from orch.core.runrecord import RunRecord
-from orch.core.specs import ResultSpec
-from orch.core.store import (
+from relay.core import store as store_module
+from relay.core.runrecord import RunRecord
+from relay.core.specs import ResultSpec
+from relay.core.store import (
     RunStore,
     StoreError,
     atomic_write,
@@ -237,7 +237,7 @@ WRITER = textwrap.dedent(
     """
     import json, sys
     from pathlib import Path
-    from orch.core.store import atomic_write
+    from relay.core.store import atomic_write
 
     target = Path(sys.argv[1])
     i = 0

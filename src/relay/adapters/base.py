@@ -6,9 +6,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from orch.core.specs import ResultSpec, TaskSpec
-from orch.core.specs.common import PermissionLevel
-from orch.core.store import replace_file
+from relay.core.specs import ResultSpec, TaskSpec
+from relay.core.specs.common import PermissionLevel
+from relay.core.store import replace_file
 
 
 @dataclass(frozen=True)

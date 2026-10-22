@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from design_blocks import blocks_in, design_blocks
-from orch.core.events import (
+from relay.core.events import (
     CATALOG,
     EventError,
     EventLog,
@@ -88,7 +88,7 @@ KILLER = textwrap.dedent(
     """
     import os, sys
     from pathlib import Path
-    from orch.core.events import EventLog
+    from relay.core.events import EventLog
 
     log = EventLog(Path(sys.argv[1]))
     for i in range(5):

@@ -7,8 +7,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from orch.adapters.base import Invocation, ProcessResult, RunContext
-from orch.core.specs import TaskSpec
+from relay.adapters.base import Invocation, ProcessResult, RunContext
+from relay.core.specs import TaskSpec
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "test",

@@ -1,4 +1,4 @@
-"""`orch doctor` (design section 14)."""
+"""`relay doctor` (design section 14)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from orch.core.doctor import DoctorContext, default_registry, run_checks
+from relay.core.doctor import DoctorContext, default_registry, run_checks
 
 from ..exitcodes import Exit
 
@@ -31,7 +31,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         )
     except KeyError as exc:
         known = ", ".join(c.id for c in registry)
-        print(f"orch doctor: unknown check {exc.args[0]!r} (known: {known})")
+        print(f"relay doctor: unknown check {exc.args[0]!r} (known: {known})")
         return Exit.INVALID
     print(report.to_json() if args.json else report.render_text())
     return Exit.FAILURE if report.exit_code else Exit.OK

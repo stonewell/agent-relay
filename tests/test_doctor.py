@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from orch.cli.exitcodes import Exit, combine
-from orch.cli.main import main
-from orch.core import registry as registry_module
-from orch.core.doctor import (
+from relay.cli.exitcodes import Exit, combine
+from relay.cli.main import main
+from relay.core import registry as registry_module
+from relay.core.doctor import (
     Check,
     CheckRegistry,
     CheckResult,
@@ -240,7 +240,7 @@ def test_agent_cli_check_fails_when_version_command_fails(tmp_path: Path) -> Non
 
 def test_git_exclude_check_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from harness import init_repo
-    from orch.core.gitexclude import ensure_exclude_block
+    from relay.core.gitexclude import ensure_exclude_block
 
     isolated(monkeypatch, tmp_path)
 

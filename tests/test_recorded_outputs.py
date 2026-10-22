@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from orch.core.specs import ResultSpec
+from relay.core.specs import ResultSpec
 
 DIR = Path(__file__).parent / "fixtures" / "recorded"
 

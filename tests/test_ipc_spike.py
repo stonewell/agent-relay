@@ -165,7 +165,7 @@ if sys.platform == "win32":
             return pipe
 
     def pipe_name() -> str:
-        return "\\\\.\\pipe\\orch-spike-" + uuid.uuid4().hex
+        return "\\\\.\\pipe\\relay-spike-" + uuid.uuid4().hex
 
     async def serve_one(
         name: str, monkeypatch: pytest.MonkeyPatch, *, owner_only: bool

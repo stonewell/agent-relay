@@ -14,9 +14,9 @@ from typing import Literal
 from .specs.common import RESERVED_ROOTS
 from .store import atomic_write, read_text
 
-START = "# >>> orch runtime state"
-END = "# <<< orch runtime state"
-NOTE = "# Managed by orch. Edits between the markers are overwritten."
+START = "# >>> relay runtime state"
+END = "# <<< relay runtime state"
+NOTE = "# Managed by relay. Edits between the markers are overwritten."
 
 
 class ExcludeError(RuntimeError):
@@ -109,7 +109,7 @@ BlockState = Literal["current", "missing", "outdated", "malformed", "no-reposito
 
 
 def check_exclude_block(repo_root: Path) -> tuple[BlockState, str]:
-    """For `orch doctor`: the block's state and a one-line explanation."""
+    """For `relay doctor`: the block's state and a one-line explanation."""
     try:
         path = exclude_path(repo_root)
     except ExcludeError as exc:
@@ -122,5 +122,5 @@ def check_exclude_block(repo_root: Path) -> tuple[BlockState, str]:
     if wanted == existing:
         return "current", str(path)
     if START not in existing:
-        return "missing", f"no orch block in {path}"
-    return "outdated", f"orch block in {path} differs from this version"
+        return "missing", f"no relay block in {path}"
+    return "outdated", f"relay block in {path} differs from this version"

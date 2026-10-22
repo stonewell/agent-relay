@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from harness import context, git, init_repo, run_invocation, task
-from orch.adapters.base import (
+from relay.adapters.base import (
     RESULT_FILE,
     Invocation,
     ProcessResult,
@@ -15,9 +15,9 @@ from orch.adapters.base import (
     archive_previous_result,
     start_attempt,
 )
-from orch.adapters.fake import FakeAdapter, ResultInvalid
-from orch.adapters.fake_scenario import Scenario
-from orch.core.specs import TaskSpec
+from relay.adapters.fake import FakeAdapter, ResultInvalid
+from relay.adapters.fake_scenario import Scenario
+from relay.core.specs import TaskSpec
 
 
 def run(adapter: FakeAdapter, tmp: Path, *, attempt: int = 1, node: str = "n1", **kw: object):  # noqa: ANN201
@@ -53,7 +53,7 @@ def test_invocation_runs_the_stub_in_the_worktree(repo: Path) -> None:
     inv = adapter.build_invocation(task(goal="Add debounce"), ctx)
     assert inv.cwd == ctx.worktree
     assert inv.stdin == "Add debounce\n"
-    assert "orch.adapters.fake_cli" in inv.args
+    assert "relay.adapters.fake_cli" in inv.args
     assert json.loads((ctx.node_dir / "fake-scenario.json").read_text())["runtime"]["attempt"] == 1
     assert adapter.invocations == [inv]
 
@@ -82,11 +82,11 @@ def test_stub_can_commit_like_a_self_committing_agent(repo: Path) -> None:
 def test_stub_records_prompt_resume_session_and_selected_env(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("ORCH_TEST_VISIBLE", "yes")
-    scenario = Scenario(echo_env=["ORCH_TEST_VISIBLE", "ORCH_TEST_ABSENT"])
+    monkeypatch.setenv("RELAY_TEST_VISIBLE", "yes")
+    scenario = Scenario(echo_env=["RELAY_TEST_VISIBLE", "RELAY_TEST_ABSENT"])
     _, _, ctx = run(FakeAdapter(scenario), repo, resume_session="sess-9")
     observed = json.loads((ctx.node_dir / "fake-observed.json").read_text())
-    assert observed["env"] == {"ORCH_TEST_VISIBLE": "yes", "ORCH_TEST_ABSENT": None}
+    assert observed["env"] == {"RELAY_TEST_VISIBLE": "yes", "RELAY_TEST_ABSENT": None}
     assert observed["resume_session"] == "sess-9"
     assert (ctx.node_dir / "fake-stdin.txt").read_text() == "Do the thing\n"
 

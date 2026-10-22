@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from design_blocks import blocks_in
-from orch.core.registry import (
+from relay.core.registry import (
     Config,
     ConfigError,
     config_from_snapshot,

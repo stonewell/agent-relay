@@ -1,4 +1,4 @@
-"""`orch doctor` framework: check registry, runner and report (design section 14)."""
+"""`relay doctor` framework: check registry, runner and report (design section 14)."""
 
 from __future__ import annotations
 
@@ -246,7 +246,7 @@ async def check_git_exclude(ctx: DoctorContext) -> CheckResult:
         return CheckResult(
             "unsupported",
             "not a git repository",
-            remedy="run `git init`; orch needs a git repository in phases 1 to 3",
+            remedy="run `git init`; relay needs a git repository in phases 1 to 3",
         )
     if state == "malformed":
         return CheckResult(
@@ -255,7 +255,7 @@ async def check_git_exclude(ctx: DoctorContext) -> CheckResult:
     return CheckResult(
         "warn",
         f"exclude block is {state}: {detail}",
-        remedy="the next `orch run` adds it; until then `git status` may list .agents/runs",
+        remedy="the next `relay run` adds it; until then `git status` may list .agents/runs",
     )
 
 

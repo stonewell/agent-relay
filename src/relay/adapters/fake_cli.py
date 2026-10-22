@@ -1,4 +1,4 @@
-"""Stub agent process for tests: `python -m orch.adapters.fake_cli <scenario-file>`.
+"""Stub agent process for tests: `python -m relay.adapters.fake_cli <scenario-file>`.
 
 It plays the part of an agent CLI. Behaviour comes from the scenario file written by the
 `fake` adapter (design section 7.1); it never talks to a model or the network.

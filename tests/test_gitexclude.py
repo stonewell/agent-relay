@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from harness import git, init_repo
-from orch.core.gitexclude import (
+from relay.core.gitexclude import (
     END,
     START,
     ExcludeError,
@@ -147,7 +147,7 @@ def test_linked_worktrees_share_the_one_block(repo: Path, tmp_path: Path) -> Non
 def test_nested_worktrees_under_agents_are_not_offered_for_staging(repo: Path) -> None:
     ensure_exclude_block(repo)
     nested = repo / ".agents" / "worktrees" / "r1" / "n1"
-    git(repo, "worktree", "add", "-q", "-b", "orch-n1", str(nested))
+    git(repo, "worktree", "add", "-q", "-b", "relay-n1", str(nested))
     (nested / "change.txt").write_text("x\n")
     assert git(repo, "status", "--porcelain", "-uall") == ""
     git(repo, "add", "-A")

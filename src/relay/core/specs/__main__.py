@@ -1,4 +1,4 @@
-"""Build step: `python -m orch.core.specs [directory]` regenerates `schemas/*.json`."""
+"""Build step: `python -m relay.core.specs [directory]` regenerates `schemas/*.json`."""
 
 import sys
 from pathlib import Path

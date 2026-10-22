@@ -11,10 +11,10 @@ from typing import Any, cast
 import yaml
 from pydantic import ValidationError
 
-from orch.core.specs import ResultSpec, TaskSpec
-from orch.core.specs.common import PermissionLevel
-from orch.core.store import read_text
-from orch.core.yamlio import load_yaml
+from relay.core.specs import ResultSpec, TaskSpec
+from relay.core.specs.common import PermissionLevel
+from relay.core.store import read_text
+from relay.core.yamlio import load_yaml
 
 from .base import RESULT_FILE, Invocation, Probe, ProcessResult, RunContext, WorkerHandle
 from .fake_scenario import Scenario
@@ -105,7 +105,7 @@ class FakeAdapter:
         )
         invocation = Invocation(
             cmd=sys.executable,
-            args=("-I", "-m", "orch.adapters.fake_cli", str(scenario_file)),
+            args=("-I", "-m", "relay.adapters.fake_cli", str(scenario_file)),
             cwd=ctx.worktree,
             stdin=task.goal + "\n",
         )

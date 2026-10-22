@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from orch.core.specs.common import CURRENT_PHASE
+from relay.core.specs.common import CURRENT_PHASE
 
 COMMAND_PHASE: dict[str, int] = {
     "run": 1,
@@ -31,7 +31,9 @@ def availability_error(command: str) -> str | None:
     """A clear error if `command` is not available yet, else None."""
     phase = COMMAND_PHASE[command]
     if phase > CURRENT_PHASE:
-        return f"orch {command}: available from phase {phase}"
+        return f"relay {command}: available from phase {phase}"
     if command not in IMPLEMENTED:
-        return f"orch {command}: not implemented yet in this build (phase {phase} work in progress)"
+        return (
+            f"relay {command}: not implemented yet in this build (phase {phase} work in progress)"
+        )
     return None

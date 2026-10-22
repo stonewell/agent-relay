@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-from orch.core.predicates import parse_when
-from orch.core.specs import common
+from relay.core.predicates import parse_when
+from relay.core.specs import common
 
 
 def matches(when: dict[str, Any], **facts: Any) -> bool:

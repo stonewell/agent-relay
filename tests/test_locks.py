@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from orch.core.platform.locks import LifetimeLock, LockHeld, probe_lock_support
+from relay.core.platform.locks import LifetimeLock, LockHeld, probe_lock_support
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 WINDOWS = sys.platform == "win32"
@@ -96,7 +96,7 @@ def acquire_within(path: Path, seconds: float) -> float | None:
 HOLDER = """
     import os, subprocess, sys, time
     from pathlib import Path
-    from orch.core.platform.locks import LifetimeLock
+    from relay.core.platform.locks import LifetimeLock
 
     lock = LifetimeLock(Path(sys.argv[1]))
     lock.acquire()
@@ -164,7 +164,7 @@ def test_lock_file_stays_readable_while_held(tmp_path: Path) -> None:
 
 
 def test_held_lock_file_deletion_policy(tmp_path: Path) -> None:
-    """Windows refuses to delete a held lock file; Unix allows it, so `orch clean` must not."""
+    """Windows refuses to delete a held lock file; Unix allows it, so `relay clean` must not."""
     path = tmp_path / "a.lock"
     with LifetimeLock(path):
         if WINDOWS:
@@ -183,7 +183,7 @@ def test_another_process_cannot_take_a_held_lock(tmp_path: Path) -> None:
     probe = """
         import sys
         from pathlib import Path
-        from orch.core.platform.locks import LifetimeLock, LockHeld
+        from relay.core.platform.locks import LifetimeLock, LockHeld
         try:
             LifetimeLock(Path(sys.argv[1])).acquire()
             print("acquired")
@@ -261,7 +261,7 @@ def test_a_bare_fork_keeps_a_unix_lock_alive_after_the_owner_dies(tmp_path: Path
 RACER = """
     import sys, time
     from pathlib import Path
-    from orch.core.platform.locks import LifetimeLock, LockHeld
+    from relay.core.platform.locks import LifetimeLock, LockHeld
 
     start = float(sys.argv[2])
     while time.time() < start:

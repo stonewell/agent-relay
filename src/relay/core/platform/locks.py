@@ -82,12 +82,12 @@ class LockProbe:
 
 
 def probe_lock_support(directory: Path) -> LockProbe:
-    """Check that locking behaves on the filesystem holding `directory` (for `orch doctor`).
+    """Check that locking behaves on the filesystem holding `directory` (for `relay doctor`).
 
     Two independent handles in one process must conflict, and the lock must be reacquirable
     after release. Filesystems that silently ignore locks (some network mounts) fail the first.
     """
-    probe = directory / f".orch-lock-probe-{os.getpid()}-{secrets.token_hex(3)}"
+    probe = directory / f".relay-lock-probe-{os.getpid()}-{secrets.token_hex(3)}"
     first, second = LifetimeLock(probe), LifetimeLock(probe)
     try:
         directory.mkdir(parents=True, exist_ok=True)
