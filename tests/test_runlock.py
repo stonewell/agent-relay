@@ -247,6 +247,50 @@ def test_stale_lock_is_taken_over_with_retry_resume_intent(tmp_path: Path) -> No
         lock.release()
 
 
+def test_successful_takeover_replaces_identity_atomically(tmp_path: Path) -> None:
+    """Takeover writes the new owner via a temp file and leaves no temp file behind."""
+    make_run(tmp_path)
+    write_owner(tmp_path, "run1", dead_pid(), 1)
+    path = rl.lock_path(tmp_path, "run1")
+    lock = rl.RunLock.acquire(tmp_path, "run1", takeover=True)
+    try:
+        assert lock.held
+        # the lock file now names the new owner, and the directory holds only that file
+        assert json.loads(path.read_text(encoding="utf-8")) == {
+            "pid": lock.identity.pid,
+            "start": lock.identity.start,
+        }
+        assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
+    finally:
+        lock.release()
+
+
+def test_failed_takeover_write_leaves_original_lock_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed takeover must not tear the lock: the old owner stays readable and it raises."""
+    make_run(tmp_path)
+    pid = dead_pid()
+    write_owner(tmp_path, "run1", pid, 1)
+    path = rl.lock_path(tmp_path, "run1")
+    original = path.read_text(encoding="utf-8")
+
+    def fail_replace(_src: object, _dst: object) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(rl.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        rl.RunLock.acquire(tmp_path, "run1", takeover=True)
+
+    # the original record is untouched and still reports the old, stale owner
+    assert path.read_text(encoding="utf-8") == original
+    owner = rl.inspect_owner(tmp_path, "run1")
+    assert owner.state is rl.OwnerState.STALE
+    assert owner.identity == ProcessIdentity(pid=pid, start=1)
+    # and the failed write left no temp file behind
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
+
+
 # --- interrupted marking ----------------------------------------------------------------------
 
 

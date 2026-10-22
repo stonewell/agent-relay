@@ -27,6 +27,7 @@ import contextlib
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -194,11 +195,26 @@ def _create_lock(path: Path, identity: ProcessIdentity) -> None:
 
 
 def _overwrite_lock(path: Path, identity: ProcessIdentity) -> None:
-    """Rewrite an existing (stale) lock file in place with the new owner identity."""
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(_identity_payload(identity))
-        handle.flush()
-        os.fsync(handle.fileno())
+    """Replace an existing (stale) lock file with the new owner identity, atomically.
+
+    The new identity is written to a temp file in the same directory (same filesystem),
+    flushed and fsynced, then ``os.replace``d onto the lock path. A reader therefore sees
+    either the old owner or the new one, never a torn record. If the write or the replace
+    fails the temp file is removed and the original lock is left untouched, so it stays
+    readable and the error propagates.
+    """
+    payload = _identity_payload(identity)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 class RunLock:
