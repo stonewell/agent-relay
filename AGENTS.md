@@ -23,7 +23,7 @@ Phase 0 is being implemented: the Python package is in `src/orch/` and the tests
 
 Tooling (from the repository root):
 
-- Install dependencies: `uv sync --locked`
+- Install dependencies: `uv sync` (`uv.lock` is not committed; it is generated locally)
 - Build: `uv build`
 - Test: `uv run pytest -q`
 - Lint: `uv run ruff check .`
