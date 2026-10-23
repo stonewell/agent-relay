@@ -410,7 +410,7 @@ def _integration_task(graph: Graph | None) -> TaskCore | None:
         return None
     acceptance: list[Acceptance] = list(graph.integration_acceptance)
     commands: Commands | None = graph.commands
-    if not acceptance and commands is None:
+    if not acceptance and commands is None and graph.verify != "none":
         return None
     return TaskCore(
         category="implement",

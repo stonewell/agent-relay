@@ -1,14 +1,4 @@
-"""`relay run` (design sections 8.2 and 14, task 1.19 slice A).
-
-One node, one attempt, in the foreground. The CLI builds a single-node task spec from the
-request text, loads the merged configuration, and hands off to
-:func:`relay.core.run.run_foreground`, which owns routing, the attempt state machine, the
-durable run store and the interim run lock. Exit codes are the plain ints of design
-section 14, mapped here onto :class:`relay.cli.exitcodes.Exit`.
-
-Out of scope for slice A: `--concurrency`/`--dry-run` (graphs), `--non-interactive`/needs_input
-(task 1.21), retries/escalation/fallback (task 1.19b).
-"""
+"""Single-node request/spec intake (design sections 8.2, 10 and 14; task 1.31)."""
 
 from __future__ import annotations
 
@@ -18,11 +8,14 @@ import json
 import sys
 from pathlib import Path
 
+import yaml
+
 from relay.core.classifier import detect_category
 from relay.core.registry import ConfigError, load_config
 from relay.core.run import RunResult, run_foreground
+from relay.core.specs import load_spec
 from relay.core.specs.common import PermissionLevel
-from relay.core.specs.task import TaskSpec
+from relay.core.specs.task import Commands, RunCheck, ScopeCheck, TaskSpec
 
 from ..exitcodes import Exit
 
@@ -34,7 +27,8 @@ _LEVELS = ("full", "workspace", "readonly")
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:  # pyright: ignore[reportPrivateUsage]
     parser = subparsers.add_parser("run", help="run one task in the foreground")
-    parser.add_argument("request", metavar="REQUEST", help="the task to run")
+    parser.add_argument("request", nargs="?", metavar="REQUEST", help="the task to run")
+    parser.add_argument("--task", metavar="FILE", help="load a YAML or JSON task spec")
     parser.add_argument("--agent", metavar="A", help="pin the node to this agent")
     parser.add_argument(
         "--category", metavar="C", help="task category (default: classified from the request)"
@@ -68,15 +62,33 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         help="omit paths matching GLOB from the snapshot (repeatable)",
     )
     parser.add_argument("--json", action="store_true", help="print the run result as JSON")
+    parser.add_argument(
+        "--check",
+        action="append",
+        metavar="COMMAND",
+        help="executable acceptance check (repeatable)",
+    )
+    for name in ("build", "test", "lint"):
+        parser.add_argument(f"--{name}", metavar="COMMAND", help=f"default {name} command")
+    parser.add_argument("--verify", choices=("default", "none"), help="verification policy")
+    parser.add_argument(
+        "--verification-skip-reason", metavar="TEXT", help="reason for --verify none"
+    )
+    parser.add_argument(
+        "--max-attempts", type=_positive_int, metavar="N", help="total attempt limit"
+    )
+    parser.add_argument(
+        "--timeout", type=_positive_int, metavar="SECONDS", help="per-attempt timeout"
+    )
 
 
 def run(args: argparse.Namespace, repo_root: Path) -> int:
     try:
         config = load_config(project_root=repo_root).config
-        task = _task_spec(args)
+        task = _task_spec(args, repo_root)
         cli_permissions = _level(args.permissions)
         agent_permissions = _parse_agent_permissions(args.agent_permissions)
-    except (ConfigError, ValueError) as exc:
+    except (ConfigError, ValueError, OSError, yaml.YAMLError) as exc:
         return _fail(f"relay run: {exc}", Exit.INVALID, args.json)
 
     try:
@@ -90,6 +102,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
                 model_tier=args.model_tier,
                 allow_dirty=args.allow_dirty,
                 exclude=tuple(args.exclude),
+                out=sys.stderr if args.json else sys.stdout,
             )
         )
     except Exception as exc:  # noqa: BLE001 - the CLI never prints a traceback for a run
@@ -99,14 +112,65 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
     return int(Exit(result.exit_code))
 
 
-def _task_spec(args: argparse.Namespace) -> TaskSpec:
-    request: str = args.request
-    if not request.strip():
-        raise ValueError("request must not be empty")
-    category = args.category if args.category is not None else detect_category(request)
-    task = TaskSpec(run_id="run", id=_NODE_ID, category=category, goal=request)
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _task_spec(args: argparse.Namespace, repo_root: Path) -> TaskSpec:
+    request: str | None = args.request
+    if (request is None) == (args.task is None):
+        raise ValueError("provide exactly one REQUEST or --task FILE")
+    if args.task is not None:
+        task = load_spec(TaskSpec, repo_root / args.task)
+    else:
+        if request is None or not request.strip():
+            raise ValueError("request must not be empty")
+        task = TaskSpec(run_id="run", id=_NODE_ID, category=detect_category(request), goal=request)
+    if args.category is not None:
+        task.category = args.category
     if args.agent is not None:
         task.routing.agent = args.agent
+    if args.check is not None:
+        task.acceptance = [entry for entry in task.acceptance if isinstance(entry, ScopeCheck)]
+        task.acceptance.extend(RunCheck(run=command) for command in args.check)
+    if any(getattr(args, name) is not None for name in ("build", "test", "lint")):
+        commands = task.commands.model_copy() if task.commands is not None else Commands()
+        for name in ("build", "test", "lint"):
+            value: str | None = getattr(args, name)
+            if value is not None:
+                setattr(commands, name, value)
+        task.commands = commands
+    if args.verify is not None:
+        task.verify = args.verify
+    if args.verification_skip_reason is not None:
+        task.verification_skip_reason = args.verification_skip_reason
+    if args.max_attempts is not None:
+        task.budget.max_attempts = args.max_attempts
+    if args.timeout is not None:
+        task.budget.timeout_s = args.timeout
+
+    # Mutations above must pass the same validation as a newly loaded spec.
+    task = TaskSpec.model_validate(task.model_dump(mode="json", by_alias=True))
+    if task.depends_on or task.context.from_:
+        raise ValueError("task dependencies and context.from are available from phase 2")
+    if (
+        task.repo.root != "."
+        or task.repo.base_branch is not None
+        or task.repo.input_commit is not None
+    ):
+        raise ValueError(
+            "select the repository with -C; task.repo must use root '.' without base pins"
+        )
+    if task.budget.max_duration_s is not None:
+        raise ValueError("budget.max_duration_s is not supported by foreground runs yet")
+    if task.output.result != "result.spec.yaml" or task.output.artifacts_dir != "artifacts/":
+        raise ValueError("custom output channels are not supported by foreground runs yet")
     return task
 
 

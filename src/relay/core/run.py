@@ -1,10 +1,10 @@
 """Foreground ``relay run`` loop for a single node (design sections 6, 8.2, 9, 10, 14).
 
-Task 1.19 slice B1: one node, in the foreground, retried up to the node's ``max_attempts``.
+One node runs in the foreground, with same-agent retries up to ``max_attempts``.
 Every attempt is routed, started through ``start_attempt`` (so an earlier attempt's
 ``result.spec.yaml`` is archived under ``attempts/NN/``), and only a verified, published attempt
-ends the node ``done``. Model escalation, cross-agent fallback and timeout policy are slice B2;
-``needs_input`` is task 1.21. There is still no supervisor or graph. This module is the single
+ends the node ``done``. Escalation, fallback and timeout retry policy arrive in phase 2a;
+``needs_input`` is task 1.21. Execution has no supervisor or task graph. This module is the single
 writer of a run's durable state for the lifetime of the foreground process: it takes the
 interim run lock (section 6), records each routing decision, runs adapter invocations,
 captures/verifies/publishes the successful output, and releases the lock on every exit path.
@@ -15,7 +15,7 @@ The CLI maps them onto :class:`relay.cli.exitcodes.Exit`; ``relay doctor`` does 
 * ``0`` ok
 * ``1`` execution/store/lock failure
 * ``2`` invalid input or configuration (dirty tree, missing executable checks, unsupported
-  permission level, ``needs_input``/unsupported result status in slice A)
+  permission level, or the unsupported foreground input flow)
 * ``3`` no eligible agent
 * ``5`` verification failed
 
@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -58,14 +59,15 @@ from relay.core.gitbase import (
 from relay.core.gitexclude import ExcludeError, ensure_exclude_block
 from relay.core.model_router import NO_MODEL, select_model
 from relay.core.permissions import decide, format_banner, resolve_level
-from relay.core.publish import PublicationError, publish, publish_integration
+from relay.core.publish import PublicationError, node_ref, publish, publish_integration
 from relay.core.registry import Config, snapshot
 from relay.core.route_log import RouteLog
 from relay.core.router import route_agent
 from relay.core.runlock import RunLock, RunLockError
 from relay.core.specs.common import Access, NodeStatus, PermissionLevel
+from relay.core.specs.graph import Graph, GraphNode
 from relay.core.specs.result import Changes, ResultSpec, Verification, VerifyDetail
-from relay.core.specs.task import TaskSpec
+from relay.core.specs.task import TaskCore, TaskSpec
 from relay.core.store import RunStore, StoreError
 from relay.core.verify import (
     NoExecutableChecksError,
@@ -85,8 +87,7 @@ EXIT_VERIFICATION_FAILED = 5
 DEFAULT_MAX_ATTEMPTS = 1
 """Attempts per node when ``budget.max_attempts`` is unset.
 
-The design defines ``max_attempts`` as a total per-node limit but does not give a global
-default (section 8.2); an unset value keeps the pre-retry single-attempt behaviour.
+Section 8.2 defines this as a total per-node limit and defaults phase 1 to one attempt.
 """
 
 READ_CATEGORIES = frozenset({"review", "debug", "architecture", "codebase-research"})
@@ -198,6 +199,7 @@ class _AttemptFailure:
 
     reason: str
     exit_code: int
+    retryable: bool = True
 
 
 @dataclass
@@ -228,6 +230,7 @@ class _AttemptRunner:
 
     async def run(self, attempt: int, model: str | None) -> RunResult | _AttemptFailure:
         """Run the agent phase, then capture/verify/publish when the agent reported success."""
+        deadline = time.monotonic() + self.timeout_s if self.timeout_s is not None else None
         ctx = RunContext(
             run_id=self.store.run_id,
             node_id=self.node_id,
@@ -254,7 +257,11 @@ class _AttemptRunner:
         self.events.append(
             "attempt.phase", {"node_id": self.node_id, "attempt": attempt, "phase": "agent"}
         )
-        proc = run_invocation(invocation, timeout_s=self.timeout_s)
+        proc = run_invocation(invocation, timeout_s=_remaining_timeout(deadline))
+        if proc.timed_out:
+            return _AttemptFailure(
+                f"attempt {attempt}: the agent timed out", EXIT_FAILURE, retryable=False
+            )
         try:
             result = await self.adapter.parse_result(proc, self.task, ctx)
         except ResultInvalid as exc:
@@ -292,8 +299,6 @@ class _AttemptRunner:
                 error=f"agent reported status {result.status!r}",
             )
 
-        if proc.timed_out:
-            return _AttemptFailure(f"attempt {attempt}: the agent timed out", EXIT_FAILURE)
         if result.status != "done":
             return _AttemptFailure(
                 f"attempt {attempt}: agent reported status {result.status!r}", EXIT_FAILURE
@@ -303,10 +308,16 @@ class _AttemptRunner:
                 f"attempt {attempt}: the agent exited with code {proc.exit_code}", EXIT_FAILURE
             )
 
-        return self._capture_verify_publish(attempt, result, proc, model)
+        return self._capture_verify_publish(attempt, result, proc, model, deadline=deadline)
 
     def _capture_verify_publish(
-        self, attempt: int, result: ResultSpec, proc: ProcessResult, model: str | None
+        self,
+        attempt: int,
+        result: ResultSpec,
+        proc: ProcessResult,
+        model: str | None,
+        *,
+        deadline: float | None,
     ) -> RunResult | _AttemptFailure:
         node_id = self.node_id
         candidate_path: Path | None = None
@@ -326,7 +337,9 @@ class _AttemptRunner:
             verification: VerifyResult | None = None
             if self.access != "read":
                 try:
-                    verification = verify(capture, self.task, overall_timeout_s=self.timeout_s)
+                    verification = verify(
+                        capture, self.task, overall_timeout_s=_remaining_timeout(deadline)
+                    )
                 except NoExecutableChecksError as exc:
                     _set_node(self.store, node_id, "failed")
                     self.store.update_run(lambda record: setattr(record, "state", "failed"))
@@ -351,7 +364,15 @@ class _AttemptRunner:
                     return _AttemptFailure(
                         f"attempt {attempt}: verification failed ({verification.outcome})",
                         EXIT_VERIFICATION_FAILED,
+                        retryable=not verification.timed_out,
                     )
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return _AttemptFailure(
+                    f"attempt {attempt}: timed out before publication",
+                    EXIT_FAILURE,
+                    retryable=False,
+                )
 
             self.events.append(
                 "attempt.phase", {"node_id": node_id, "attempt": attempt, "phase": "publish"}
@@ -478,6 +499,10 @@ async def run_foreground(
     category = task.category
     access = _access(category, task.access)
     node_id = task.id
+    try:
+        node_ref("run", node_id)
+    except PublicationError as exc:
+        return fail(EXIT_INVALID, str(exc))
 
     # Classify (deterministic; the task's explicit category wins over text signals).
     raw_classification = classify(
@@ -501,7 +526,11 @@ async def run_foreground(
 
     # Pre-dispatch: a write node with no executable check and default verification is rejected
     # rather than reported as verified (design section 10 item 1). Read nodes are not rejected.
-    if access == "write" and task.verify == "default" and not executable_commands(task):
+    try:
+        commands = executable_commands(task) if task.verify == "default" else ()
+    except VerificationError as exc:
+        return fail(EXIT_INVALID, str(exc))
+    if access == "write" and task.verify == "default" and not commands:
         return fail(
             EXIT_INVALID,
             f"node {node_id} has no executable acceptance or build/test/lint command and "
@@ -573,6 +602,13 @@ async def run_foreground(
     task.routing.model_rule = model_decision.model_rule
 
     config_text, config_hash = snapshot(config)
+    effective_timeout = (
+        timeout_s
+        if timeout_s is not None
+        else task.budget.timeout_s
+        if task.budget.timeout_s is not None
+        else config.defaults.timeout_s
+    )
 
     try:
         store = RunStore.create(repo_root, config_hash=config_hash, run_id=run_id)
@@ -597,6 +633,7 @@ async def run_foreground(
         store.write_text("config.snapshot.json", config_text)
         task.run_id = store.run_id
         store.add_node(node_id)
+        store.update_run(lambda record: setattr(record, "graph", _single_node_graph(task)))
         node_dir = store.node_dir(node_id)
         store.write_spec(f"{node_dir.relative_to(store.run_dir).as_posix()}/task.spec.yaml", task)
 
@@ -652,7 +689,7 @@ async def run_foreground(
             input_key=input_key,
             access=access,
             permission=permission.effective,
-            timeout_s=timeout_s,
+            timeout_s=effective_timeout,
             adapter=registry[agent_name],
             agent_name=agent_name,
         )
@@ -739,7 +776,7 @@ async def run_foreground(
                     "exit": last_exit_code,
                 },
             )
-            if attempt >= max_attempts:
+            if attempt >= max_attempts or not outcome.retryable:
                 break
 
         _set_node(store, node_id, "failed", attempts=attempts_run)
@@ -790,6 +827,23 @@ async def run_foreground(
 
 def _set_final_commit(record: Any, *, commit: str) -> None:
     record.final_commit = commit
+
+
+def _remaining_timeout(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _single_node_graph(task: TaskSpec) -> Graph:
+    node = GraphNode.model_validate(
+        {"id": task.id, **{name: getattr(task, name) for name in TaskCore.model_fields}}
+    )
+    return Graph(
+        nodes=[node],
+        commands=task.commands,
+        integration_acceptance=list(task.acceptance),
+        verify=task.verify,
+        verification_skip_reason=task.verification_skip_reason,
+    )
 
 
 def _set_node(

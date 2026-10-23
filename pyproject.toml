@@ -23,6 +23,7 @@ packages = ["src/relay"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test_*.py", "test-*.py", "*_test.py"]
 
 [tool.ruff]
 line-length = 100
