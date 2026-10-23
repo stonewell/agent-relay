@@ -423,6 +423,44 @@ def test_baseline_state_is_not_treated_as_user_dirt(repo: Path, tmp_path: Path) 
 # --- target updates ----------------------------------------------------------------------------
 
 
+def test_working_baseline_does_not_excuse_separate_staged_edits(repo: Path, tmp_path: Path) -> None:
+    base = head(repo)
+    integration = commit_in_worktree(repo, tmp_path, base, {"README.md": "delivered\n"})
+    create_run(repo, base=base, integration=integration)
+    write(repo / "README.md", "staged user work\n")
+    git(repo, "add", "README.md")
+    write(repo / "README.md", "# fixture\n")
+
+    with pytest.raises(DirtyOverlapError):
+        prepare_apply(repo, RUN)
+    assert git(repo, "show", ":README.md") == "staged user work"
+
+
+def test_separate_branch_allows_overlapping_checkout_edits(repo: Path, tmp_path: Path) -> None:
+    base = head(repo)
+    integration = commit_in_worktree(repo, tmp_path, base, {"README.md": "delivered\n"})
+    create_run(repo, base=base, integration=integration)
+    write(repo / "README.md", "local work\n")
+    git(repo, "add", "README.md")
+    before = snapshot(repo)
+
+    plan = prepare_apply(repo, RUN, target="delivery")
+    commit_ref(repo, plan)
+
+    assert snapshot(repo) == before
+    assert git(repo, "show", "delivery:README.md") == "delivered"
+
+
+def test_staged_dirty_baseline_remains_applicable(repo: Path, tmp_path: Path) -> None:
+    write(repo / "README.md", "pre-existing\n")
+    git(repo, "add", "README.md")
+    synthetic = resolve_base(repo, RUN, allow_dirty=True).commit
+    integration = commit_in_worktree(repo, tmp_path, synthetic, {"README.md": "delivered\n"})
+    create_run(repo, base=synthetic, integration=integration)
+
+    assert prepare_apply(repo, RUN).clean
+
+
 def test_target_moved_after_prepare_is_refused(repo: Path, tmp_path: Path) -> None:
     base = head(repo)
     integration = commit_in_worktree(repo, tmp_path, base, {"feature.txt": "f\n"})

@@ -260,7 +260,8 @@ def prepare_apply(
         )
 
     prepared_tree = _commit_tree(repo_root, prepared_commit)
-    dirty = _dirty_paths(repo_root)
+    current = _run(repo_root, "symbolic-ref", "--quiet", "HEAD")
+    dirty: set[str] = _dirty_paths(repo_root) if current.stdout.strip() == target_ref else set()
     overlaps = _overlap_paths(changed, dirty)
     overlaps = [path for path in overlaps if not _matches_baseline(repo_root, base_commit, path)]
     if overlaps:
@@ -640,6 +641,14 @@ def _matches_baseline(repo_root: Path, base_commit: str, path: str) -> bool:
     That makes the path pre-existing ``--allow-dirty`` state rather than a concurrent edit. A
     missing working-tree file (a deletion) or a path absent from the baseline never matches.
     """
+    # A matching working file cannot excuse separately staged edits or mode changes.
+    index_delta = _run(repo_root, "diff", "--cached", "--quiet", "HEAD", "--", path)
+    if index_delta.returncode != 0:
+        baseline_index_delta = _run(
+            repo_root, "diff", "--cached", "--quiet", base_commit, "--", path
+        )
+        if baseline_index_delta.returncode != 0:
+            return False
     working = _run(repo_root, "hash-object", f"--path={path}", "--", path)
     if working.returncode != 0:
         return False
