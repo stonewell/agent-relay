@@ -8,8 +8,8 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.16 |
-| `development-plan.md` | v0.2 |
+| `design.md` | v0.19 |
+| `development-plan.md` | v0.4 |
 | `AGENTS.md` | v3 |
 
 ## Version summaries
@@ -275,3 +275,46 @@ Review finding R16-1 (low): two phase-4 features had no in-place phase tag, and 
 | Section 13.1 | Surface 1 is marked `phase 3` instead of `v1`. |
 | Section 13.2 | Surface 2 is marked `phase 5` instead of `v2`. |
 | Section 17 | The open planner risk row says user-supplied graphs arrive in `phase 2a` instead of `v1`. |
+
+## Antigravity CLI adapter (design v0.17)
+
+| What changed | Where |
+|---|---|
+| Research finding: `agy` is the Antigravity CLI (a Go single binary and Google's terminal surface of the Antigravity 2.0 agent harness), the successor to Gemini CLI for unpaid-tier and Google One users since 2026-06-18, with legacy Gemini CLI remaining for some paid and enterprise plans | design section 7.2 |
+| New prose block after the "Known caveats" paragraph maps the Antigravity CLI flags, JSON envelope, session resume, permissions and auth; the Gemini column of the 7.2 table is now described as legacy | design section 7.2 |
+| Antigravity added to the per-adapter model flags, the native structured-output flag, the session-id field, and the auth and config-home environment handling | design sections 4.3, 5.4, 7.3, 9.4 |
+| Antigravity/Gemini named in the roadmap, the risk register, and the references | design sections 16, 17, 18 |
+| Task 4.1 retargeted in place to the Antigravity CLI (`agy`) adapter with legacy Gemini CLI behind it; no new task id | development-plan.md task 4.1 |
+| Antigravity added to milestone M6, the critical-path sentence, the phase 4 intro and the compatibility-watch list | development-plan.md |
+| Consistency pass: the adapter enum in the architecture diagram, the session-continuity pointer, and the usage source list now name Antigravity, and the section 17 forum-risk wording was corrected to the Sep 2026 forum recommendation; no rules changed | design sections 2, 6, 11, 17 |
+
+Not yet verified and kept **[verify]** until a canary runs against a real install: the `--sandbox` containment scope and whether `--mode plan` prevents all repository mutation (so `workspace`/`readonly` stay unadvertised), a config-home environment override (none documented), thinking-token billing, and prompt delivery on argv (long-prompt canary). The unresolved third-party headless-launch question and the soft-deny-exits-0 behaviour are recorded as risks in section 17.
+
+## Routing and adapter review decisions (design v0.18)
+
+Wording and decision clarifications arising from implementing tasks 1.2, 1.3, 1.4, 1.9 and 1.10 and their review. No task ids were added or renumbered.
+
+| What changed | Where |
+|---|---|
+| Score formula specified with concrete weights (a category-match term, an inert `strengths` term, a cost penalty, and recent-failure and running-attempt deductions); availability is now a hard filter applied before scoring rather than an additive term | design section 4.2 |
+| A tier present in `models` but omitted from an explicit `escalate_on_failure` list is now outside the escalation path | design section 4.3 |
+| `model_rule` gains an `escalation` value for tier moves; `include_goal: false` now emits a structured reason code (fixed `agent_rule`/`model_rule` fields plus optional status tokens) instead of free text; a minimum secret-pattern redaction list is specified; disabled projections are never written or repaired and must not be treated as current | design section 4.4 |
+| Codex adapter does not pass `--ephemeral` (it breaks in-node resume), nor `--ignore-user-config`/`--ignore-rules` by default; `--skip-git-repo-check` is unnecessary in a git worktree | design section 7.2 |
+
+## Parsing trust boundary and task status (design v0.19)
+
+Review of the parsing and environment-building work in tasks 1.2, 1.3, 1.4, 1.8, 1.9, 1.10 and 1.11 exposed a trust boundary that the design now states explicitly, and the task-status table is updated to match. No task ids were added or renumbered.
+
+| Id | Severity | Finding | Resolution |
+|---|---|---|---|
+| R19-1 | High | `validate_result` preserved agent-supplied `id` and `agent`, allowing an agent to spoof node identity | `id`/`agent` forced to the true node id and adapter id, plus tests (section 7.3) |
+| R19-2 | Medium | A malformed agent-supplied `usage`, `model` or `session` could consume the single repair | Stripped before validation (section 7.3) |
+| R19-3 | Medium | `Invocation.full_env` defaulted to fail-open, so a forgotten flag merged the parent environment | Code only: `build_env` now returns a marked complete environment; plain dicts still merge |
+| R19-4 | Medium | Codex recorded the `default` tier sentinel as `result.model` | Null when the sentinel is unresolved (section 7.3) |
+| R19-5 | Low | An unavailable substituted default model was not re-checked | Recheck added (section 4.3, v0.18) |
+| R19-6 | Decision | A tier in `models` but omitted from an explicit `escalate_on_failure` list never escalates | Recorded in section 4.3 (v0.18) |
+| R19-7 | Decision | Codex `--ephemeral` conflicts with in-node resume; the ignore flags are not passed by default | Recorded in section 7.2 (v0.18) |
+
+| What changed | Where |
+|---|---|
+| Task-status rows added for 1.2, 1.3, 1.4, 1.8, 1.9, 1.10 and 1.11; 1.9 and 1.10 left `in progress` pending a live smoke run | development-plan.md |

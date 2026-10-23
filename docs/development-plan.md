@@ -30,10 +30,10 @@ This plan splits the phases in design section 16 into tasks, orders them by prio
 | **M3 Graphs** | Foreground task graphs with merge, fallback, resume | 2a |
 | **M4 Background** | Detached supervisor with native lock, IPC, crash recovery | 2b |
 | **M5 Plugin** | OpenCode plugin driving the supervisor | 3 |
-| **M6 Breadth** | Gemini, Cursor, cost accounting, shadow-git | 4 |
+| **M6 Breadth** | Antigravity/Gemini, Cursor, cost accounting, shadow-git | 4 |
 | **M7 Gateway** | Provider gateway, LLM planner | 5 |
 
-Critical path to M2: `0.1 -> 0.2 -> 0.3/0.4 -> 0.5 -> 1.x pipeline -> 1.24 -> 1.30`. Everything in phases 2 to 5 depends on M2; phases 3 to 5 depend on M4 (except Gemini/Cursor adapters, which need only M2).
+Critical path to M2: `0.1 -> 0.2 -> 0.3/0.4 -> 0.5 -> 1.x pipeline -> 1.24 -> 1.30`. Everything in phases 2 to 5 depends on M2; phases 3 to 5 depend on M4 (except Antigravity/Gemini and Cursor adapters, which need only M2).
 
 ---
 
@@ -196,11 +196,11 @@ Goal: OpenCode agents route and run work through the supervisor. Depends on M4.
 
 ## Phase 4: Breadth and delivery modes (milestone M6)
 
-Goal: more agents, spawning, cost control and non-git workspaces. Tasks are independent, so order by value. Gemini and Cursor adapters depend only on M2; the rest need M3 or M4 as noted.
+Goal: more agents, spawning, cost control and non-git workspaces. Tasks are independent, so order by value. Antigravity/Gemini and Cursor adapters depend only on M2; the rest need M3 or M4 as noted.
 
 | ID | Task | Pri | Size | Depends | Design | Done when |
 |---|---|---|---|---|---|---|
-| 4.1 | Gemini adapter and canaries (availability depends on plan) | P1 | M | M2 | 7.2 | Golden tests; skipped cleanly when unavailable |
+| 4.1 | Antigravity CLI (`agy`) adapter and canaries, with legacy Gemini CLI behind the same adapter where installed (availability depends on plan) | P1 | M | M2 | 7.2, 7.3, 5.4, 9.4, 16 | Golden tests on the `agy` JSON envelope and `stream-json` result, structured output, and `conversation_id` resume; `probe()` skips cleanly when absent; doctor canaries; legacy Gemini checked only when installed |
 | 4.2 | Cursor adapter (`.cmd` shim handling, `--mode plan`, `--force`, sandbox canary) | P1 | M | M2 | 7.2 | Golden tests; `workspace` advertised only if the canary proves it |
 | 4.3 | `spawn_requests`: validation, depth and node limits, no recursion, fresh-nodes-only mutation, events | P1 | M | M3 | 8.4 | Spawn test area green |
 | 4.4 | Pricing catalog and token normalization, settlement formula, `estimated`/`unknown` labels, doctor warnings | P0 | M | M3 | 8.5, 3 | Pricing tests green |
@@ -236,7 +236,7 @@ Goal: more agents, spawning, cost control and non-git workspaces. Tasks are inde
 | Testing | Test areas in design section 16 map to phases; add the area's tests inside the task that introduces the behaviour, not later | Continuous |
 | Security review | Threat-model review of IPC and apply (phase 2b), environment handling and logs (phase 1), plugin approvals (phase 3) | Before M2, M4, M5 |
 | Release | Versioning; PyPI (or `uv tool` install from git) for `relay`, npm publish for the plugin; optional PyInstaller binary | M2, M4, M5 |
-| Compatibility watch | Track CLI flag changes (Claude, Codex, Gemini, Cursor) and OpenCode plugin API; adapters are snapshot-tested so drift shows up in CI | Ongoing |
+| Compatibility watch | Track CLI flag changes (Claude, Codex, Antigravity, Gemini, Cursor) and OpenCode plugin API; adapters are snapshot-tested so drift shows up in CI | Ongoing |
 
 ## Risks that change the plan
 
@@ -268,7 +268,14 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 0.10 | done | 2026-10-22 | Spike A: `relay.core.platform.locks` (stdlib and `ctypes`), tests on Windows and on Linux (ext4, tmpfs, 9p via WSL); matrix in design section 15. macOS unverified |
 | 0.11 | done | 2026-10-22 | Spike B on Claude 2.1.308 and Codex 0.163.0: `needs_input` approach is go; findings in `revision-changes.md`; recorded outputs in `tests/fixtures/recorded/`. Cursor addendum run on account login; Gemini not run |
 | 1.1 | done | 2026-10-22 | `relay.core.classifier`: deterministic category, complexity, risk (default globs + keywords) and language resolution; 50 fixture tests; risk keywords are module defaults because no config key exists yet |
+| 1.2 | done | 2026-10-22 | Agent router; review fixes (pinned/busy/exhausted, mixed prefer list); 1.2+1.3 tests 44 |
+| 1.3 | done | 2026-10-22 | Model router; escalation path and unavailable-default recheck; 44 tests across 1.2/1.3 |
+| 1.4 | done | 2026-10-22 | Route log, both projections, rebuild, redaction, `include_goal`; 31 tests |
 | 1.7 | in progress | 2026-10-22 | Adapter interface, `resolve_command`/`resolveCommand` (PATH/PATHEXT/`.cmd` shims) and `relay.core.platform.proc` supervision with tree kill; Linux canary and tree-kill tests green, Windows canary still unrun (3 Windows-only tests skip) |
+| 1.8 | done | 2026-10-22 | Environment allowlist plus fail-closed `CompleteEnv`; 27 tests |
+| 1.9 | in progress | 2026-10-22 | Claude adapter, golden parsing/flags/session tests green; live smoke unrun because `RELAY_LIVE` was unset |
+| 1.10 | in progress | 2026-10-22 | Codex adapter, strict schema/JSONL/usage tests green; live smoke unrun because `RELAY_LIVE` was unset |
+| 1.11 | done | 2026-10-22 | Shared parsing, one repair per attempt, identity/operational-field trust enforced; full suite 690 passed / 6 skipped |
 | 1.13 | done | 2026-10-22 | `relay.core.gitbase`: clean-tree pinning, synthetic `--allow-dirty` base with sensitive/`--exclude` filtering, `refs/relay/<run>/...`; 30 tests; `run.started` can consume `sensitive_paths`; exclude globs are per-segment, refs validated, dirty submodules reported for 1.14 |
 | 1.18 | in progress | 2026-10-22 | `relay.core.runlock` + `platform.procid`: phase-1 exclusive-create lock (create-new semantics, `O_EXCL`) with PID and process-start identity, stale detection and retry/resume takeover; 17 tests green on Linux, Windows unverified; takeover writes atomically via temp file and replace |
 
