@@ -560,12 +560,19 @@ def permission_canary_check(profile: PermissionProfile, cmd: str) -> Check:
 
 AdapterCanaryOutcome = Literal["passed", "failed", "inconclusive", "unavailable", "error"]
 
-CANARY_KINDS: tuple[str, ...] = ("version", "auth", "structured", "session", "quoting")
+CANARY_KINDS: tuple[str, ...] = (
+    "version",
+    "auth",
+    "structured",
+    "session",
+    "quoting",
+    "needs_input",
+)
 
 # Kinds that launch a paid agent (they call a model), so the check is `paid` and runs only
 # with `--paid` or an explicit `--check` (design section 14). `version` and `auth` never call
 # a model, so they run in the default doctor at no cost.
-_PAID_KINDS: frozenset[str] = frozenset({"structured", "session", "quoting"})
+_PAID_KINDS: frozenset[str] = frozenset({"structured", "session", "quoting", "needs_input"})
 
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
 
@@ -615,6 +622,7 @@ _TIMEOUT_FOR: dict[str, float] = {
     "version": 30.0,
     "auth": 10.0,
     "structured": CANARY_TIMEOUT_S + 15.0,
+    "needs_input": CANARY_TIMEOUT_S + 15.0,
     "session": 2 * CANARY_TIMEOUT_S + 30.0,  # two model calls
     "quoting": CANARY_TIMEOUT_S + 15.0,
 }
@@ -1212,6 +1220,8 @@ def _dispatch_canary(
         return run_auth_canary(spec, parent_env=parent_env, agent_env=agent_env)
     if kind == "structured":
         return run_structured_canary(spec)
+    if kind == "needs_input":
+        return run_input_canary(spec)
     if kind == "session":
         return run_session_canary(spec)
     if kind == "quoting":
@@ -1292,3 +1302,63 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
                     adapter_canary_check(resolved, kind, parent_env=parent_env, agent_env=agent_env)
                 )
     return registry
+
+
+def run_input_canary(
+    spec: AdapterCanarySpec, *, parent: Path | None = None, timeout_s: float = CANARY_TIMEOUT_S
+) -> AdapterCanaryResult:
+    """Observe typed clarification for a deliberately unspecified operator decision (8.2)."""
+    from relay.adapters.parsing import claude_schema, drop_nulls, strict_schema
+    from relay.core.specs import ResultSpec, schema_for
+
+    base = Path(tempfile.mkdtemp(prefix="relay-input-canary-", dir=parent))
+    try:
+        work = base / "work"
+        work.mkdir()
+        subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
+        schema = claude_schema() if spec.adapter == "claude" else schema_for(ResultSpec)
+        schema.pop("$schema", None)
+        if spec.adapter == "codex":
+            schema = strict_schema(schema)
+        prompt = (
+            "Task id n1: Set the default behavior to the operator's preferred choice. "
+            "The operator has not specified that choice; the repository cannot resolve it. "
+            "Do not use tools or modify files. If a decision cannot be resolved from the "
+            "repository, stop and return status needs_input with typed open_questions "
+            "instead of guessing. Return a result spec matching the supplied schema."
+        )
+        args, stdin, output_file = _canary_invocation(spec, work, prompt=prompt, schema=schema)
+        proc, failure = _run_canary_process(
+            spec,
+            "needs_input",
+            args,
+            cwd=work,
+            env=dict(os.environ),
+            stdin=stdin,
+            timeout_s=timeout_s,
+        )
+        if failure is not None:
+            return failure
+        assert proc is not None
+        payload = _extract_canary_payload(spec, proc, output_file)
+        candidate = payload.native
+        if candidate is None and payload.text is not None:
+            candidate = _try_json(payload.text)
+        try:
+            result = ResultSpec.model_validate(drop_nulls(candidate))
+        except ValueError:
+            return AdapterCanaryResult(
+                spec.adapter, "needs_input", "failed", "no valid typed clarification result", {}
+            )
+        passed = (
+            proc.exit_code == 0 and result.status == "needs_input" and bool(result.open_questions)
+        )
+        return AdapterCanaryResult(
+            spec.adapter,
+            "needs_input",
+            "passed" if passed else "failed",
+            "typed clarification observed" if passed else "agent did not request clarification",
+            {"status": result.status, "question_count": len(result.open_questions)},
+        )
+    finally:
+        shutil.rmtree(base, ignore_errors=True)

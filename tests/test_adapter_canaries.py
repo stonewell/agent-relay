@@ -39,6 +39,7 @@ from relay.core.doctor import (
     adapter_canary_check,
     default_registry,
     run_auth_canary,
+    run_input_canary,
     run_quote_canary,
     run_session_canary,
     run_structured_canary,
@@ -370,7 +371,7 @@ def test_adapter_canaries_register_with_expected_ids_and_paid_flags(
     for candidate in ADAPTER_CANARY_SPECS:
         for kind in CANARY_KINDS:
             check = by_id[f"adapter.{candidate.adapter}.{kind}"]
-            assert check.paid is (kind in {"structured", "session", "quoting"})
+            assert check.paid is (kind in {"structured", "session", "quoting", "needs_input"})
             assert check.requires == ()
 
 
@@ -413,7 +414,7 @@ def test_paid_flag_runs_paid_adapter_canaries(
 
     report = asyncio.run(run_checks(default_registry(ctx), ctx, include_paid=True))
     ids = [c.id for c in report.checks]
-    for kind in ("structured", "session", "quoting"):
+    for kind in ("structured", "session", "quoting", "needs_input"):
         assert f"adapter.claude.{kind}" in ids
 
 
@@ -510,3 +511,26 @@ def test_adapter_canary_check_direct(tmp_path: Path, monkeypatch: pytest.MonkeyP
     result = asyncio.run(check.run(DoctorContext(repo_root=tmp_path)))
     assert result.status == "pass"
     assert result.data["outcome"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "status,questions,expected",
+    [
+        ("needs_input", [{"id": "q1", "text": "Which choice?"}], "passed"),
+        ("done", [], "failed"),
+        ("needs_input", [], "failed"),
+    ],
+)
+def test_input_canary_validates_typed_questions(
+    tmp_path: Path, status: str, questions: list[dict[str, str]], expected: str
+) -> None:
+    payload = {"spec_version": 1, "id": "n1", "status": status, "open_questions": questions}
+    script = (
+        "import json,sys\nsys.stdin.read()\nprint(json.dumps("
+        + repr({"type": "result", "structured_output": payload})
+        + "))\n"
+    )
+    fake = py_cli(tmp_path, "claude", script)
+    result = run_input_canary(_with_cmd("claude", str(fake)), parent=tmp_path)
+    assert result.outcome == expected
+    assert not any(p.name.startswith("relay-input-canary-") for p in tmp_path.iterdir())
