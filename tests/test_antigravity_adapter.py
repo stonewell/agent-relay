@@ -436,7 +436,7 @@ def test_invocation_env_contains_no_parent_only_secret(tmp_path: Path) -> None:
     assert "GITHUB_TOKEN" not in inv.env
     assert "AWS_SECRET_ACCESS_KEY" not in inv.env
     assert inv.env["PATH"] == "/bin"
-    assert inv.env["HOME"] == home
+    assert inv.env.get("HOME") == (home if os.name != "nt" else None)
 
 
 def test_env_forwards_gemini_api_key_only_when_set(tmp_path: Path) -> None:

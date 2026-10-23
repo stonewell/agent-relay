@@ -7,14 +7,13 @@ one integration test runs the real ``capture_changes`` + ``verify`` + ``publish`
 
 from __future__ import annotations
 
-import shlex
 import sys
 from pathlib import Path
 
 import pytest
 
 import relay.core.publish as publish_mod
-from harness import git, init_repo
+from harness import command_line, git, init_repo
 from relay.core.capture import CaptureResult, capture_changes
 from relay.core.gitbase import read_ref, write_ref
 from relay.core.publish import (
@@ -246,7 +245,7 @@ def test_capture_verify_publish_chain(repo: Path, tmp_path: Path) -> None:
         run_id=RUN,
         category="implement",
         goal="add feature",
-        acceptance=[RunCheck(run=shlex.join([sys.executable, str(ok)]))],
+        acceptance=[RunCheck(run=command_line([sys.executable, str(ok)]))],
     )
     result = verify(capture, task)
 

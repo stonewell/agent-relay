@@ -67,7 +67,7 @@ def py_cli(directory: Path, name: str, source: str) -> Path:
         script = directory / f"{name}.py"
         script.write_text(source, encoding="utf-8")
         shim = directory / f"{name}.cmd"
-        shim.write_text(f"@echo off\r\n{sys.executable} {script} %*\r\n", encoding="utf-8")
+        shim.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
         return shim
     script = directory / name
     script.write_text(f"#!/usr/bin/env python3\n{source}", encoding="utf-8")

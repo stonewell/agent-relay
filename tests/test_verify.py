@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from harness import git, init_repo
+from harness import command_line, git, init_repo
 from relay.core.capture import Change, capture_changes
 from relay.core.specs.task import Commands, RunCheck, ScopeCheck, TaskSpec
 from relay.core.verify import (
@@ -37,7 +37,7 @@ def repo(tmp_path: Path) -> Path:
 
 def py_cmd(script: Path, *args: str) -> str:
     """A command string running `script` with the current interpreter (no shell)."""
-    return shlex.join([sys.executable, str(script), *args])
+    return command_line([sys.executable, str(script), *args])
 
 
 def script(tmp_path: Path, name: str, body: str) -> Path:
@@ -509,11 +509,10 @@ def test_split_windows_double_quote_escape_and_single_quote_is_ordinary() -> Non
 
 
 def test_split_posix_matches_shlex() -> None:
-    assert split_command("echo 'a b' \"c d\"") == ["echo", "a b", "c d"]
+    assert split_command("echo 'a b' \"c d\"", windows=False) == ["echo", "a b", "c d"]
 
 
 def test_split_posix_treats_backslash_as_escape() -> None:
-    assert split_command(r"echo a\ b") == ["echo", "a b"]
     assert split_command(r"echo a\ b", windows=False) == ["echo", "a b"]
 
 

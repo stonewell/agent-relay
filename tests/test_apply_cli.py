@@ -14,7 +14,6 @@ moving the current checkout, the no-op case, exit codes, the ``apply.*`` events 
 from __future__ import annotations
 
 import json
-import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -22,7 +21,7 @@ from typing import Literal
 
 import pytest
 
-from harness import git, init_repo
+from harness import command_line, git, init_repo
 from relay.cli.commands import apply as apply_cli
 from relay.cli.exitcodes import Exit
 from relay.cli.main import main
@@ -79,11 +78,11 @@ def commit_in_worktree(
 def py_check(path: str) -> str:
     """A passing acceptance command that proves the prepared tree contains ``path``."""
     code = f"import pathlib, sys; sys.exit(0 if pathlib.Path({path!r}).is_file() else 1)"
-    return shlex.join([sys.executable, "-c", code])
+    return command_line([sys.executable, "-c", code])
 
 
 def py_command(exit_code: int) -> str:
-    return shlex.join([sys.executable, "-c", f"raise SystemExit({exit_code})"])
+    return command_line([sys.executable, "-c", f"raise SystemExit({exit_code})"])
 
 
 def make_graph(

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -174,7 +175,7 @@ def test_status_lists_recent_runs_newest_first(
     repo = tmp_path / "repo"
     repo.mkdir()
     make_run(repo, run_id=RUN, created_at="2026-10-22T09:00:00.000Z")
-    make_run(repo, run_id=OTHER, created_at="2026-10-22T10:00:00.000Z", state="failed")
+    make_run(repo, run_id=OTHER, created_at=datetime.now(UTC).isoformat(), state="failed")
 
     assert call(repo, "status", "--json") == Exit.OK
     data = payload(capsys)
@@ -460,7 +461,7 @@ def test_clean_removes_only_relay_owned_worktrees_and_scratch(
     assert other_store.run_dir.is_dir()
     assert main_readme.is_file()
     worktrees = git(repo, "worktree", "list", "--porcelain")
-    assert f"worktree {repo}" in worktrees
+    assert f"worktree {repo.as_posix()}" in worktrees
 
 
 def test_clean_dry_run_changes_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -541,7 +542,7 @@ def test_clean_without_run_id_skips_live_runs_and_honours_older_than(
 ) -> None:
     repo = init_repo(tmp_path / "repo")
     make_run(repo, run_id=RUN, created_at="2020-01-01T00:00:00.000Z")
-    make_run(repo, run_id=OTHER, created_at="2026-10-22T10:00:00.000Z")
+    make_run(repo, run_id=OTHER, created_at=datetime.now(UTC).isoformat())
     make_run(repo, run_id=LIVE, created_at="2020-01-01T00:00:00.000Z")
     live = RunLock.acquire(repo, LIVE)
     try:

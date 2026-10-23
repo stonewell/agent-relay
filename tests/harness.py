@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -16,6 +17,11 @@ GIT_ENV = {
     "GIT_COMMITTER_NAME": "test",
     "GIT_COMMITTER_EMAIL": "test@example.invalid",
 }
+
+
+def command_line(args: list[str]) -> str:
+    """Quote an authorized command for the host platform's argument parser."""
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
 
 
 def git(cwd: Path, *args: str) -> str:
