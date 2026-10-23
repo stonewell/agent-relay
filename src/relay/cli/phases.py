@@ -23,7 +23,7 @@ COMMAND_PHASE: dict[str, int] = {
     "replay": 4,
 }
 
-IMPLEMENTED = {"doctor"}
+IMPLEMENTED = {"agents", "apply", "clean", "doctor", "explain", "result", "routes", "run", "status"}
 """Commands whose handler exists in this build; grows with the phase 1 tasks."""
 
 

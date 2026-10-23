@@ -298,7 +298,7 @@ def test_later_phase_commands_are_rejected_with_the_phase(
 
 
 def test_unfinished_phase_one_commands_say_so(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["run", "do something"]) == Exit.INVALID
+    assert main(["reply", "2026-10-22-a1b2"]) == Exit.INVALID
     assert "not implemented yet" in capsys.readouterr().err
 
 
