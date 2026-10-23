@@ -386,3 +386,17 @@ Reconciles the implemented foreground run loop (task 1.19 slices A and B1), git-
 | Inspection commands documented as implemented: `status`, `result`, `agents` and `clean` flags, JSON shapes and exit behaviour, including `--purge-runs` confirmation on a non-TTY (exit 7), skipping live runs, and never creating, replacing or unlinking lock objects | design sections 11, 14 |
 | Observability corrected: status renders the run record, event history and node table as implemented; cost reporting is tagged phase 4 | design section 11 |
 | Task status updated for 1.19 (slices A and B1), 1.22 and 1.24 | development-plan.md |
+
+## Implementation review corrections
+
+Updated task status after implementation review and Windows/Linux validation against the existing design; no design rules changed.
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| CR1: staged edits lost during apply | P1 | Corrected baseline overlap handling against section 8.3; refreshed task 1.24 status. |
+| CR2: Windows batch argument injection | P1 | Corrected shim escaping against section 7.2; refreshed task 1.7 status. |
+| CR3: Windows worktree cleanup and retry failure | P1 | Corrected registration and long-path removal against sections 6 and 8.3; refreshed tasks 1.14 and 1.19 status. |
+| CR4: surviving POSIX descendants after timeout | P1 | Corrected process-group escalation against sections 7.1 and 15; refreshed task 1.7 status. |
+| CR5: inspection selected unfinalized file results | P2 | Aligned finalized spec placement with section 6; refreshed task 1.19 status. |
+| CR6: separate-branch delivery rejected checkout edits | P2 | Corrected apply preparation against section 8.3; refreshed task 1.24 status. |
+| CR7: platform-dependent checks failed | P2 | Corrected fixtures, canary argv and Windows process liveness against sections 6, 7.2, 9.4, 15 and 16; refreshed tasks 1.12, 1.16, 1.18 and 1.20 status. |
