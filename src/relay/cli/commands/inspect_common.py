@@ -120,9 +120,8 @@ def node_ids(view: RunView) -> list[str]:
 def node_result_path(view: RunView, node_id: str) -> Path | None:
     """The current attempt's ``result.spec.yaml`` for a node, if any.
 
-    The phase 1 writer stores node specs both under the recorded ``NN-<node>`` directory and
-    under ``<node>/`` (the run store's ``write_spec`` path); reading accepts either so a
-    historical layout never hides a result.
+    The writer finalizes into the recorded ``NN-<node>`` directory. Reading also accepts the
+    older ``<node>/`` layout when no current result exists.
     """
     candidates: list[Path] = []
     node = view.record.nodes.get(node_id)

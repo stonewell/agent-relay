@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from harness import git, init_repo
+from harness import command_line, git, init_repo
 from relay.adapters.fake import FakeAdapter
 from relay.adapters.fake_scenario import Scenario
 from relay.cli.exitcodes import Exit
@@ -126,7 +127,9 @@ def test_success_end_to_end(tmp_path: Path) -> None:
     assert node.output_commit == result.output_commit
 
     # The orchestrator owns `result.spec.yaml`: ids, changes and verification are authoritative.
-    result_spec = store.read_spec(f"{NODE}/result.spec.yaml", ResultSpec)
+    result_spec = store.read_spec(
+        f"{store.read_run().nodes[NODE].dir}/result.spec.yaml", ResultSpec
+    )
     assert result_spec.status == "done"
     assert result_spec.agent == "fake"
     assert result_spec.model == "fake-model"
@@ -139,7 +142,7 @@ def test_success_end_to_end(tmp_path: Path) -> None:
     assert [detail.run for detail in result_spec.verification.details] == ["echo ok"]
 
     # The task spec and the merged-config snapshot are durable alongside the result.
-    assert store.path(f"{NODE}/task.spec.yaml").is_file()
+    assert store.path(f"{store.read_run().nodes[NODE].dir}/task.spec.yaml").is_file()
     assert store.path("config.snapshot.json").is_file()
 
     # Canonical event order: routing, the four attempt phases, verify, publish, integration,
@@ -197,7 +200,7 @@ def test_failed_agent_publishes_nothing_and_exits_1(tmp_path: Path) -> None:
     # Nothing was published: no output ref, no integration branch, no result spec.
     assert read_ref(repo, node_ref(RUN, NODE)) is None
     assert read_ref(repo, integration_branch(RUN)) is None
-    assert not store.path(f"{NODE}/result.spec.yaml").exists()
+    assert not store.path(f"{store.read_run().nodes[NODE].dir}/result.spec.yaml").exists()
 
     # The lock is released, but the failed node's worktree is kept for debugging (section 6).
     assert not rl.lock_path(repo, RUN).exists()
@@ -220,7 +223,7 @@ def test_failed_verification_publishes_nothing_and_exits_5(tmp_path: Path) -> No
     # Failed verification publishes nothing (design section 10 item 5).
     assert read_ref(repo, node_ref(RUN, NODE)) is None
     assert read_ref(repo, integration_branch(RUN)) is None
-    assert not store.path(f"{NODE}/result.spec.yaml").exists()
+    assert not store.path(f"{store.read_run().nodes[NODE].dir}/result.spec.yaml").exists()
 
     # The lock is released; the failed node's worktree is kept for debugging.
     assert not rl.lock_path(repo, RUN).exists()
@@ -293,7 +296,21 @@ def test_retry_after_agent_failure_then_success(tmp_path: Path) -> None:
 
 def test_retry_after_verification_failure_then_success(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
-    task = spec(acceptance=[RunCheck(run="test ! -e src/bad.txt", expect_exit=0)], max_attempts=2)
+    task = spec(
+        acceptance=[
+            RunCheck(
+                run=command_line(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; raise SystemExit(Path('src/bad.txt').exists())",
+                    ]
+                ),
+                expect_exit=0,
+            )
+        ],
+        max_attempts=2,
+    )
     adapter = FakeAdapter(
         [
             Scenario(write={"src/bad.txt": "bad\n"}, summary="bad attempt"),
@@ -327,7 +344,9 @@ def test_retry_after_verification_failure_then_success(tmp_path: Path) -> None:
     assert result.output_commit is not None
     assert read_ref(repo, attempt_ref(RUN, NODE, 2)) == result.output_commit
     assert read_ref(repo, attempt_ref(RUN, NODE, 1)) is None
-    result_spec = store.read_spec(f"{NODE}/result.spec.yaml", ResultSpec)
+    result_spec = store.read_spec(
+        f"{store.read_run().nodes[NODE].dir}/result.spec.yaml", ResultSpec
+    )
     assert result_spec.verification is not None
     assert result_spec.verification.acceptance == "passed"
 
@@ -372,7 +391,7 @@ def test_max_attempts_exhausted_agent_failure_exits_1(tmp_path: Path) -> None:
     # No published output from any failed attempt.
     assert read_ref(repo, node_ref(RUN, NODE)) is None
     assert read_ref(repo, integration_branch(RUN)) is None
-    assert not store.path(f"{NODE}/result.spec.yaml").exists()
+    assert not store.path(f"{store.read_run().nodes[NODE].dir}/result.spec.yaml").exists()
     assert len([event for event in read_events(store.events_path) if event.type == "warning"]) == 2
 
     # The lock is released and the failed worktree is retained for debugging.
@@ -397,7 +416,7 @@ def test_max_attempts_exhausted_verification_failure_exits_5(tmp_path: Path) -> 
 
     assert read_ref(repo, node_ref(RUN, NODE)) is None
     assert read_ref(repo, integration_branch(RUN)) is None
-    assert not store.path(f"{NODE}/result.spec.yaml").exists()
+    assert not store.path(f"{store.read_run().nodes[NODE].dir}/result.spec.yaml").exists()
     assert not store.path(f"{NODE}/candidate").exists()
 
     assert not rl.lock_path(repo, RUN).exists()
@@ -427,6 +446,13 @@ def test_earlier_attempt_results_are_archived_and_never_overwritten(tmp_path: Pa
     ]
     assert [entry.summary for entry in archived] == ["attempt one", "attempt two"]
     assert store.read_spec(f"{node_dir}/result.spec.yaml", ResultSpec).summary == "attempt three"
+    from relay.cli.commands.inspect_common import load_result, load_run
+
+    loaded = load_result(load_run(repo, RUN), NODE)
+    assert loaded is not None
+    assert loaded[0].verification is not None
+    assert loaded[0].changes is not None
+    assert loaded[0].changes.output_commit == result.output_commit
     assert not store.path(f"{node_dir}/attempts/01/result-2.spec.yaml").exists()
     assert not store.path(f"{node_dir}/attempts/02/result-2.spec.yaml").exists()
     assert not worktree_path(repo).exists()

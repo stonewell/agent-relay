@@ -394,7 +394,10 @@ class _AttemptRunner:
                 verification=verification,
                 read_only=self.access == "read",
             )
-            self.store.write_spec(f"{node_id}/result.spec.yaml", result_spec)
+            self.store.write_spec(
+                f"{self.node_dir.relative_to(self.store.run_dir).as_posix()}/result.spec.yaml",
+                result_spec,
+            )
 
             _set_node(
                 self.store,
@@ -593,9 +596,9 @@ async def run_foreground(
         lock = RunLock.acquire(repo_root, store.run_id)
         store.write_text("config.snapshot.json", config_text)
         task.run_id = store.run_id
-        store.write_spec(f"{node_id}/task.spec.yaml", task)
         store.add_node(node_id)
         node_dir = store.node_dir(node_id)
+        store.write_spec(f"{node_dir.relative_to(store.run_dir).as_posix()}/task.spec.yaml", task)
 
         # Keep the user's git view clean before pinning the base (section 6): the first run
         # idempotently adds the marked runtime-state block to `info/exclude`, so `git status`
