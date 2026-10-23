@@ -55,12 +55,11 @@ def _finalize(candidate: object) -> ResultSpec:
 # --- schema generation (section 5.4) -----------------------------------------------------------
 
 
-def test_claude_schema_strips_the_dollar_schema_key() -> None:
+def test_claude_schema_strips_unsupported_metadata() -> None:
     schema = claude_schema()
     assert "$schema" not in schema
-    assert schema == {
-        key: value for key, value in schema_for(ResultSpec).items() if key != "$schema"
-    }
+    assert "title" not in schema
+    assert schema["properties"].keys() == schema_for(ResultSpec)["properties"].keys()
     assert schema["type"] == "object"
 
 

@@ -13,7 +13,7 @@ import secrets
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -137,14 +137,26 @@ def test_schema_has_no_schema_key_but_the_generated_file_does(tmp_path: Path) ->
     generated = json.loads(
         (Path(__file__).parents[1] / "schemas" / "result-spec.json").read_text(encoding="utf-8")
     )
-    assert "$schema" in generated  # the adapter strips exactly this key (section 5.4)
+    assert "$schema" in generated  # published schemas retain their metadata (section 5.4)
 
 
-def test_the_inline_schema_is_exactly_the_generated_result_schema(tmp_path: Path) -> None:
+def test_inline_schema_preserves_generated_validation_constraints(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(agent(), parent_env={})
     schema = schema_arg(adapter.build_invocation(spec(), ctx(tmp_path)))
     expected = {key: value for key, value in schema_for(ResultSpec).items() if key != "$schema"}
-    assert schema == expected
+
+    def constraints(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: constraints(item)
+                for key, item in cast(dict[str, Any], value).items()
+                if key != "title"
+            }
+        if isinstance(value, list):
+            return [constraints(item) for item in cast(list[Any], value)]
+        return value
+
+    assert schema == constraints(expected)
 
 
 # --- permission mapping (section 7.2 / 9.3) ------------------------------------------------

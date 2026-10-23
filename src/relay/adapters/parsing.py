@@ -70,7 +70,20 @@ def claude_schema() -> dict[str, Any]:
     """
     schema = schema_for(ResultSpec)
     schema.pop("$schema", None)
-    return schema
+
+    # Titles are annotations, and escaping them can exceed cmd.exe's launch limit.
+    def compact(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {
+                key: compact(value)
+                for key, value in cast(dict[str, Any], node).items()
+                if key != "title"
+            }
+        if isinstance(node, list):
+            return [compact(value) for value in cast(list[Any], node)]
+        return node
+
+    return compact(schema)
 
 
 def _accepts_null(node: Any) -> bool:
