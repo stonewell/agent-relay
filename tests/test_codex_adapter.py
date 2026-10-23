@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import pytest
 
-from harness import context
+from harness import context, git
 from relay.adapters.base import ProcessResult, RunContext
 from relay.adapters.codex import CodexAdapter, ResultInvalid, drop_nulls, strict_schema
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
@@ -509,7 +509,13 @@ def test_live_smoke(tmp_path: Path) -> None:
 
     adapter = CodexAdapter()
     ctx = context(tmp_path)
+    git(ctx.worktree, "init", "-q")
     spec = _spec(model="default")
+    spec.goal = (
+        "Do not run tools or modify files. Return a result spec with id n1, "
+        "status done and summary adapter smoke passed."
+    )
     proc = run_invocation(adapter.build_invocation(spec, ctx), timeout_s=60)
+    assert proc.exit_code == 0
     result = _parse(adapter, proc, spec, ctx)
     assert result.status == "done"

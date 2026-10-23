@@ -1,7 +1,7 @@
 """Claude adapter: invocation, permission mapping, parsing order and environment (task 1.9).
 
-Deterministic: no network. The golden outputs under ``tests/fixtures/recorded/`` are real
-Claude Code 2.1.308 envelopes; the assertions mirror the facts recorded for spike 0.11.
+Offline checks use the recorded Claude envelopes. The explicitly enabled live smoke also
+checks a real structured reply and session continuation in a disposable directory.
 """
 
 from __future__ import annotations
@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -468,9 +470,11 @@ def test_usage_uses_the_model_that_actually_ran(tmp_path: Path) -> None:
 # --- live smoke (optional; skipped without RELAY_LIVE=1) ----------------------------------
 
 
-@pytest.mark.skipif(not os.environ.get("RELAY_LIVE"), reason="live smoke needs RELAY_LIVE=1")
+@pytest.mark.skipif(os.environ.get("RELAY_LIVE") != "1", reason="live smoke needs RELAY_LIVE=1")
 def test_live_smoke_probe_and_parse(tmp_path: Path) -> None:
     import shutil
+
+    from relay.adapters.base import run_invocation
 
     if shutil.which("claude") is None:
         pytest.skip("claude is not installed")
@@ -478,3 +482,26 @@ def test_live_smoke_probe_and_parse(tmp_path: Path) -> None:
     probe = asyncio.run(adapter.probe())
     assert probe.available is True
     assert probe.levels == ("full",)
+    token = "smoke-" + secrets.token_hex(6)
+    task = spec()
+    task.goal = (
+        f"Do not run tools or modify files. Remember the token {token}. "
+        "Return a result spec with id n1, status done and summary smoke ready."
+    )
+    context = ctx(tmp_path)
+    proc = run_invocation(adapter.build_invocation(task, context), timeout_s=75)
+    assert proc.exit_code == 0
+    result = asyncio.run(adapter.parse_result(proc, task, context))
+    assert result.status == "done"
+    assert result.session is not None
+
+    task.goal = (
+        "Do not run tools or modify files. Return a result spec with status done and summary "
+        "exactly equal to the token you were asked to remember in the previous request."
+    )
+    resumed = replace(context, attempt=2, resume_session=result.session.cli_session_id)
+    proc = run_invocation(adapter.build_invocation(task, resumed), timeout_s=75)
+    assert proc.exit_code == 0
+    result = asyncio.run(adapter.parse_result(proc, task, resumed))
+    assert result.status == "done"
+    assert result.summary == token
