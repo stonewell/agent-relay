@@ -34,7 +34,7 @@ from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle
+from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle, task_prompt
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -182,7 +182,7 @@ class ClaudeAdapter:
             cwd=ctx.worktree,
             env=env,
             full_env=True,
-            stdin=task.goal + "\n",
+            stdin=task_prompt(task) + "\n",
         )
 
     @staticmethod

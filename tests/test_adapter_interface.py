@@ -115,6 +115,28 @@ def test_cmd_shim_honors_mixed_case_comspec() -> None:
     assert resolved.argv[0] == "custom-cmd.exe"
 
 
+@pytest.mark.parametrize("kind", ["claude", "codex"])
+def test_native_invocation_includes_supplied_task_requirements(tmp_path: Path, kind: str) -> None:
+    from harness import context, task
+    from relay.adapters.claude import ClaudeAdapter
+    from relay.adapters.codex import CodexAdapter
+    from relay.core.registry import Agent
+    from relay.core.specs.task import Commands, Context
+
+    spec = task(goal="Add a regression test")
+    spec.constraints = ["Keep public APIs stable"]
+    spec.context = Context(files=["src/example.py"], symbols=["Example"])
+    spec.commands = Commands(test="python -m unittest")
+    adapter = ClaudeAdapter(Agent(cmd="claude")) if kind == "claude" else CodexAdapter()
+    invocation = adapter.build_invocation(spec, context(tmp_path))
+    assert invocation.stdin is not None
+    assert spec.goal in invocation.stdin
+    assert "Keep public APIs stable" in invocation.stdin
+    assert "src/example.py" in invocation.stdin
+    assert "Example" in invocation.stdin
+    assert "python -m unittest" in invocation.stdin
+
+
 @pytest.mark.skipif(not WINDOWS, reason=".cmd shims are Windows-only")
 def test_resolve_command_wraps_a_cmd_shim(tmp_path: Path) -> None:
     shim = tmp_path / "agent.cmd"

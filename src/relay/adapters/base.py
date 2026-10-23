@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import secrets
 from collections.abc import Mapping, Sequence
@@ -34,6 +35,7 @@ __all__ = [
     "resolveCommand",
     "run_invocation",
     "start_attempt",
+    "task_prompt",
 ]
 
 
@@ -77,6 +79,33 @@ class Invocation:
 
 
 RESULT_FILE = "result.spec.yaml"
+
+
+def task_prompt(task: TaskSpec) -> str:
+    """Render supplied task requirements without inventing verification commands (5.2)."""
+    requirements: dict[str, object] = {}
+    if task.constraints:
+        requirements["constraints"] = task.constraints
+    if task.context.files:
+        requirements["context_files"] = task.context.files
+    if task.context.symbols:
+        requirements["context_symbols"] = task.context.symbols
+    if task.owns:
+        requirements["owns"] = task.owns
+    if task.acceptance:
+        requirements["acceptance"] = [entry.model_dump(mode="json") for entry in task.acceptance]
+    if task.commands is not None:
+        requirements["commands"] = task.commands.model_dump(mode="json", exclude_none=True)
+    if task.verify == "none":
+        requirements["verify"] = task.verify
+        requirements["verification_skip_reason"] = task.verification_skip_reason
+    if not requirements:
+        return task.goal
+    return (
+        task.goal
+        + "\n\nTask requirements and verification policy:\n"
+        + json.dumps(requirements, ensure_ascii=False, indent=2)
+    )
 
 
 def archive_previous_result(ctx: RunContext) -> Path | None:

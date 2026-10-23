@@ -10,7 +10,7 @@ from typing import Any, cast
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle
+from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle, task_prompt
 from .fake_scenario import Scenario
 from .parsing import (
     ABSENT,
@@ -102,7 +102,7 @@ class FakeAdapter:
             cmd=sys.executable,
             args=("-I", "-m", "relay.adapters.fake_cli", str(scenario_file)),
             cwd=ctx.worktree,
-            stdin=task.goal + "\n",
+            stdin=task_prompt(task) + "\n",
         )
         self.invocations.append(invocation)
         return invocation

@@ -39,7 +39,7 @@ from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 from relay.core.store import read_text
 
-from .base import Invocation, Probe, RunContext, WorkerHandle
+from .base import Invocation, Probe, RunContext, WorkerHandle, task_prompt
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -154,7 +154,7 @@ class CodexAdapter:
             cwd=ctx.worktree,
             env=env,
             full_env=True,
-            stdin=task.goal,
+            stdin=task_prompt(task),
         )
 
     async def parse_result(

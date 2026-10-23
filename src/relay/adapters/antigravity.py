@@ -49,7 +49,7 @@ from relay.core.specs import ResultSpec, TaskSpec, schema_for
 from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle
+from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle, task_prompt
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -207,7 +207,7 @@ class AntigravityAdapter:
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
         parent = self._parent_env
-        args = ["-p", task.goal, "--output-format", "json"]
+        args = ["-p", task_prompt(task), "--output-format", "json"]
         args += ["--json-schema", json.dumps(self._result_schema(), separators=(",", ":"))]
         model = task.routing.model
         if model and model != _DEFAULT_MODEL:
