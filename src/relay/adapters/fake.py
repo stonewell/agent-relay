@@ -3,38 +3,33 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
-import yaml
-from pydantic import ValidationError
-
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
-from relay.core.store import read_text
-from relay.core.yamlio import load_yaml
 
-from .base import RESULT_FILE, Invocation, Probe, ProcessResult, RunContext, WorkerHandle
+from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle
 from .fake_scenario import Scenario
+from .parsing import (
+    ABSENT,
+    ResultInvalid,
+    node_file_source,
+    parse_sources,
+    stdout_block_source,
+    validate_result,
+)
+
+__all__ = ["FakeAdapter", "ResultInvalid"]
 
 ScenarioFn = Callable[[TaskSpec, RunContext], Scenario]
 Scripted = Scenario | Sequence[Scenario]
 ScenarioSource = Scripted | Mapping[str, Scripted] | ScenarioFn
 
-_ABSENT = object()
-"""A parsing source that produced nothing (unlike one that produced `null`)."""
-
-_BLOCK = re.compile(r"```(?:json|yaml)\s*\n(.*?)\n```", re.DOTALL)
-
 
 def _as_list(scripted: Scripted) -> list[Scenario]:
     return [scripted] if isinstance(scripted, Scenario) else list(scripted)
-
-
-class ResultInvalid(ValueError):
-    """The agent produced a result that does not validate against the spec schema."""
 
 
 class FakeAdapter:
@@ -116,18 +111,17 @@ class FakeAdapter:
         self, proc: ProcessResult, task: TaskSpec, ctx: RunContext
     ) -> ResultSpec:
         """Parsing order of design section 7.3: native, node-dir file, stdout block, synthesized."""
-        for parser in (
-            lambda: self._native(proc),
-            lambda: self._node_file(ctx),
-            lambda: self._stdout_block(proc),
-        ):
-            try:
-                candidate = parser()
-                if candidate is not _ABSENT:
-                    return ResultSpec.model_validate(candidate)
-            except (ValidationError, yaml.YAMLError, UnicodeDecodeError, OSError) as exc:
-                raise ResultInvalid(str(exc)) from exc
-        return self._synthesized(proc, ctx)
+        return parse_sources(
+            (
+                lambda: self._native(proc),
+                lambda: node_file_source(ctx),
+                lambda: stdout_block_source(proc.stdout),
+                lambda: self._synthesized(proc, ctx),
+            ),
+            finalize=lambda candidate: validate_result(
+                candidate, node_id=ctx.node_id, agent="fake"
+            ),
+        )
 
     async def cancel(self, handle: WorkerHandle) -> None:
         self.cancelled.append(handle)
@@ -142,34 +136,20 @@ class FakeAdapter:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
-                    return _ABSENT
+                    return ABSENT
                 if not isinstance(payload, dict):
-                    return _ABSENT
+                    return ABSENT
                 result: Any = cast("dict[str, Any]", payload).get("result")
-                return cast("dict[str, Any]", result) if isinstance(result, dict) else _ABSENT
-        return _ABSENT
+                return cast("dict[str, Any]", result) if isinstance(result, dict) else ABSENT
+        return ABSENT
 
     @staticmethod
-    def _node_file(ctx: RunContext) -> object:
-        path = ctx.node_dir / RESULT_FILE
-        if not path.is_file():
-            return _ABSENT
-        return load_yaml(read_text(path))
-
-    @staticmethod
-    def _stdout_block(proc: ProcessResult) -> object:
-        match = _BLOCK.search(proc.stdout)
-        if match is None:
-            return _ABSENT
-        return load_yaml(match.group(1))
-
-    @staticmethod
-    def _synthesized(proc: ProcessResult, ctx: RunContext) -> ResultSpec:
+    def _synthesized(proc: ProcessResult, ctx: RunContext) -> dict[str, Any]:
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         ok = proc.exit_code == 0 and not proc.timed_out
-        return ResultSpec(
-            id=ctx.node_id,
-            status="done" if ok else "failed",
-            agent="fake",
-            summary=lines[-1] if lines else "",
-        )
+        return {
+            "id": ctx.node_id,
+            "status": "done" if ok else "failed",
+            "agent": "fake",
+            "summary": lines[-1] if lines else "",
+        }
