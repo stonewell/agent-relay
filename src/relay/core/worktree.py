@@ -520,7 +520,9 @@ class WorktreeManager:
             )
         if not self._registered(path):
             return False
-        proc = _try(self.repo_root, "worktree", "remove", "--force", str(path))
+        proc = _try(
+            self.repo_root, "-c", "core.longpaths=true", "worktree", "remove", "--force", str(path)
+        )
         if proc.returncode == 0:
             return True
         if not path.exists():
@@ -550,16 +552,28 @@ class WorktreeManager:
         never touched.
         """
         if self._registered(path):
-            _try(self.repo_root, "worktree", "remove", "--force", str(path))
+            _try(
+                self.repo_root,
+                "-c",
+                "core.longpaths=true",
+                "worktree",
+                "remove",
+                "--force",
+                str(path),
+            )
             if branch is not None:
                 _try(self.repo_root, "branch", "-D", branch)
         self._prune()
 
     def _registered(self, path: Path) -> bool:
-        listed = _try(self.repo_root, "worktree", "list", "--porcelain")
+        listed = _try(self.repo_root, "worktree", "list", "--porcelain", "-z")
         if listed.returncode != 0:
             return False
-        return any(line == f"worktree {path}" for line in listed.stdout.splitlines())
+        return any(
+            Path(entry.removeprefix("worktree ")).resolve() == path.resolve()
+            for entry in listed.stdout.split("\0")
+            if entry.startswith("worktree ")
+        )
 
     def _prune(self) -> bool:
         proc = _try(self.repo_root, "worktree", "prune")

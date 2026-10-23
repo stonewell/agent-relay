@@ -187,7 +187,7 @@ def test_creation_failure_cleans_up_worktree_and_branch(
     # The just-created worktree, its admin metadata and the branch are all rolled back.
     assert not path.exists()
     listed = git(repo, "worktree", "list", "--porcelain").splitlines()
-    assert f"worktree {path}" not in listed
+    assert f"worktree {path.as_posix()}" not in listed
     assert git(repo, "branch", "--list", "relay/x/n1") == ""
 
 
@@ -301,7 +301,7 @@ def test_decommission_leaves_no_git_worktrees_entry(repo: Path) -> None:
     m.decommission("n1")
     assert not (repo / ".git" / "worktrees" / name).exists()
     listed = git(repo, "worktree", "list", "--porcelain")
-    assert f"worktree {created.path}" not in listed.splitlines()
+    assert f"worktree {created.path.as_posix()}" not in listed.splitlines()
 
 
 def test_decommission_forces_removal_of_a_dirty_worktree(repo: Path) -> None:
@@ -393,8 +393,8 @@ def test_decommission_candidate_removes_only_its_registered_candidate(
     assert not candidate.exists()
     assert owned.path.is_dir()  # only the candidate was removed
     listed = git(repo, "worktree", "list", "--porcelain").splitlines()
-    assert f"worktree {candidate}" not in listed
-    assert f"worktree {owned.path}" in listed
+    assert f"worktree {candidate.as_posix()}" not in listed
+    assert f"worktree {owned.path.as_posix()}" in listed
     assert not m.decommission_candidate(candidate).removed  # idempotent
 
 
@@ -489,5 +489,5 @@ def test_windows_300_char_path_round_trips(repo: Path, tmp_path: Path) -> None:
         deep = deep / ("a" * 40)
     deep.mkdir(parents=True)
     (deep / "payload.txt").write_text("ok\n", encoding="utf-8", newline="\n")
-    assert (deep / "payload.txt").read_text(encoding="utf-8") == "ok"
+    assert (deep / "payload.txt").read_text(encoding="utf-8") == "ok\n"
     m.decommission("n1")
