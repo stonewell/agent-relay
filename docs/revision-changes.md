@@ -8,8 +8,8 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.26 |
-| `development-plan.md` | v0.5 |
+| `design.md` | v0.27 |
+| `development-plan.md` | v0.6 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
@@ -431,3 +431,15 @@ This revision records local validation already performed; it does not claim a ne
 | P0V2 / P2 | The IPC spike inspected a socket path after Python could remove it on server shutdown. | Moved permission observation into the listening lifetime and awaited shutdown; design section 15 remains unchanged. |
 | P0V3 / P2 | A fake-worker timeout test could expire during cold interpreter startup. | Allowed startup time in the fixture budget while retaining timeout and partial-edit assertions; design section 16 remains unchanged. |
 | P0V4 / P2 | The Claude opt-in smoke checked availability without exercising result parsing. | Extended it to a real structured reply and resumed-context assertion; recorded validation evidence in task 1.9. |
+
+## Foreground clarification and reply intake (design v0.27)
+
+| What changed | Where |
+|---|---|
+| Replaced the unsupported-input CLI boundary with foreground reply/resume intake, validation and confirmation, and specified the single-node resume boundary. | Design section 14 |
+| Added cumulative active-duration storage and connected the existing input protocol to executable command and canary coverage. | Design sections 6, 8.2 and 14 |
+| Recorded operator-requested deferral of CI/live Codex validation and continued the remaining P0 work. | Development-plan task status |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| IN1 / P1 | Escaping the full native result schema could exceed the Windows batch command-line limit. | Removed nonfunctional schema titles for Claude and added a complete-schema shim canary; design section 5.4. |
