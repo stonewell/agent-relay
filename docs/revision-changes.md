@@ -8,7 +8,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.25 |
+| `design.md` | v0.26 |
 | `development-plan.md` | v0.5 |
 | `AGENTS.md` | v4 |
 
@@ -413,3 +413,21 @@ This revision records local validation already performed; it does not claim a ne
 | D3 / P2 | Phase-1 lifecycle and acceptance tasks still included deferred execution extensions. | Aligned plan tasks 1.18, 1.19, 1.25, 1.30 and 2.8 with design sections 6, 8.2 and 16; refreshed task status evidence. |
 | D4 / P2 | Corrected storage, process and delivery behaviour lacked precise canonical wording. | Updated design sections 6, 7.1, 7.2 and 8.3, with regression references in section 16. |
 | D5 / P2 | The layout sketch and evidence guide could imply modules or live coverage beyond what the code provided. | Reconciled design section 15, the plugin guide and recorded-fixture README; separated capture provenance from the live-smoke procedure in section 16. |
+
+## Single-node CLI verification intake (design v0.26)
+
+| What changed | Where |
+|---|---|
+| Replaced the request-only boundary with task-file and explicit verification/limit intake, override validation, unsupported-input rejection and JSON output handling. | Design section 14 |
+| Connected the intake's authorized verification policy to prepared-tree delivery and clarified prompt rendering for supplied task requirements. | Design sections 5.2, 14 and 8.3 |
+| Added CI interpreter-resolution and cache policy, and refreshed remote validation evidence. | Design section 16; development-plan task 0.2 status |
+| Recorded implementation work on CLI intake and hyphenated test-file discovery. | Development-plan task 1.31 status; design section 15 |
+
+## Live-adapter and Python-matrix validation corrections
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| P0V1 / P1 | Native Windows CLI execution lost essential variables after environment names were copied into a plain mapping. | Clarified Windows environment-name handling in design section 9.4 and added regression coverage. |
+| P0V2 / P2 | The IPC spike inspected a socket path after Python could remove it on server shutdown. | Moved permission observation into the listening lifetime and awaited shutdown; design section 15 remains unchanged. |
+| P0V3 / P2 | A fake-worker timeout test could expire during cold interpreter startup. | Allowed startup time in the fixture budget while retaining timeout and partial-edit assertions; design section 16 remains unchanged. |
+| P0V4 / P2 | The Claude opt-in smoke checked availability without exercising result parsing. | Extended it to a real structured reply and resumed-context assertion; recorded validation evidence in task 1.9. |

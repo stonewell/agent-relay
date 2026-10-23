@@ -257,8 +257,8 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 
 | ID | Status | Date | Note |
 |---|---|---|---|
-| 0.1 | done | 2026-10-23 | Local validation: Windows/Python 3.11, 1,106 passed and 10 skipped; Linux via WSL/Python 3.12, 1,103 passed and 11 skipped; build and local static checks pass |
-| 0.2 | in progress | 2026-10-22 | Workflow written in `.github/workflows/ci.yml`; not yet run (no remote configured) |
+| 0.1 | done | 2026-10-23 | Local validation: Windows/Python 3.11, 1,143 passed and 10 skipped; Linux via WSL/Python 3.13, 1,140 passed and 11 skipped; build and local static checks pass |
+| 0.2 | in progress | 2026-10-23 | Minimum/latest Python matrix and cache updates prepared; local matrix checks pass; a green remote run is still required and failed-log downloads require additional repository access |
 | 0.3 | done | 2026-10-22 | `relay.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; reserved-scope check is host-independent and conservative (case, globs, Windows aliases) with regression tests |
 | 0.4 | done | 2026-10-22 | `relay.core.registry` and `relay.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
 | 0.5 | done | 2026-10-22 | `relay.core.store` and `runrecord`; atomic writes with a process-kill test; Windows reader and writer retry on `PermissionError` |
@@ -274,22 +274,23 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.4 | done | 2026-10-22 | Route log, both projections, rebuild, redaction, `include_goal`; 31 tests |
 | 1.5 | done | 2026-10-22 | Events-first reads, cross-run filters, deterministic order, `--json`; 25 tests |
 | 1.7 | done | 2026-10-23 | Adapter interface and command resolution complete; Windows shim canaries and Windows/Linux tree-kill regressions pass |
-| 1.8 | done | 2026-10-22 | Environment allowlist plus fail-closed `CompleteEnv`; 27 tests |
-| 1.9 | in progress | 2026-10-22 | Claude adapter, golden parsing/flags/session tests green; live smoke unrun because `RELAY_LIVE` was unset |
-| 1.10 | in progress | 2026-10-22 | Codex adapter, strict schema/JSONL/usage tests green; live smoke unrun because `RELAY_LIVE` was unset |
+| 1.8 | done | 2026-10-23 | Environment allowlist and case-insensitive Windows regression checks pass; essential variables retained during live adapter execution |
+| 1.9 | done | 2026-10-23 | Golden checks and live Claude Code 2.1.309 structured-result/session-resume smoke pass |
+| 1.10 | in progress | 2026-10-23 | Golden checks pass; live Codex 0.164.0 returned a model-capacity error, leaving successful structured/resume validation outstanding |
 | 1.11 | done | 2026-10-23 | Shared parsing, one repair per attempt and identity/operational-field trust tests pass |
-| 1.12 | done | 2026-10-23 | Adapter canary fixtures pass on Windows and Linux; real-CLI canaries remain unrun |
+| 1.12 | done | 2026-10-23 | Doctor canary fixtures pass on Windows and Linux; live doctor-specific canaries remain unrun |
 | 1.13 | done | 2026-10-22 | `relay.core.gitbase`: clean-tree pinning, synthetic `--allow-dirty` base with sensitive/`--exclude` filtering, `refs/relay/<run>/...`; 30 tests; `run.started` can consume `sensitive_paths`; exclude globs are per-segment, refs validated, dirty submodules reported for 1.14 |
 | 1.14 | done | 2026-10-23 | Input pinning, auxiliary setup and cache environment complete; Windows registration, cleanup and 300-character path regressions pass |
 | 1.15 | done | 2026-10-22 | Full delta, reserved-path exclusion, detached candidate worktree; 20 tests |
 | 1.16 | done | 2026-10-23 | Verifier checks pass on Windows and Linux with platform-correct command fixtures |
 | 1.17 | done | 2026-10-22 | Output commit, node refs, diff artifact and integration branch; F1-F6 review fixes applied; exercised end-to-end by 1.19a |
 | 1.18 | done | 2026-10-23 | Interim lock and process-start identity tests pass on Windows and Linux; exited Windows owners are detected |
-| 1.19 | done | 2026-10-23 | Core single-node pipeline and same-agent retries pass; remaining CLI intake is tracked in 1.31 and phase-2 execution extensions in 2.8 |
+| 1.19 | done | 2026-10-23 | Core single-node pipeline and same-agent retries pass; CLI intake is covered by 1.31 and phase-2 execution extensions by 2.8 |
 | 1.20 | done | 2026-10-23 | Permission policy and disposable canary tests pass on Windows and Linux; live canaries remain opt-in |
 | 1.22 | done | 2026-10-22 | `status`/`result`/`agents`/`clean` read `run.json` and events directly; purge refuses live runs, needs `--yes` (exit 7) and never touches lock objects |
 | 1.24 | done | 2026-10-23 | Git-mode apply complete; staged-edit preservation, dirty-baseline and separate-branch delivery regressions pass |
 | 1.27 | in progress | 2026-10-23 | Implemented checks pass locally on Windows, including long paths and tree kill; repeat the complete phase-1 acceptance suite after remaining inputs and resume work |
-| 1.28 | in progress | 2026-10-23 | Repository guides and command-boundary documentation reconciled; complete the write-run quickstart after 1.31 |
+| 1.28 | in progress | 2026-10-23 | Repository guides and command-boundary documentation reconciled; CLI verification intake is available, with the write-run quickstart and walkthrough still pending |
+| 1.31 | done | 2026-10-23 | Validated request/spec intake, verification policy persistence, limits, worker requirements and end-to-end apply regressions pass |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 
