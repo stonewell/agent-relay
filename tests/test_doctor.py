@@ -297,9 +297,11 @@ def test_later_phase_commands_are_rejected_with_the_phase(
     assert f"available from phase {phase}" in capsys.readouterr().err
 
 
-def test_unfinished_phase_one_commands_say_so(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["reply", "2026-10-22-a1b2"]) == Exit.INVALID
-    assert "not implemented yet" in capsys.readouterr().err
+def test_reply_requires_node_argument(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["reply", "2026-10-22-a1b2"])
+    assert exc.value.code == Exit.INVALID
+    assert "node_id" in capsys.readouterr().err
 
 
 def test_doctor_command_text_and_json(

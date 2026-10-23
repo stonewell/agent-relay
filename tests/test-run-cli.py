@@ -169,7 +169,6 @@ def test_task_file_drives_same_agent_retry(
         {"context": {"from": [{"node": "upstream", "field": "summary"}]}},
         {"repo": {"root": "another-repo"}},
         {"repo": {"input_commit": "a" * 40}},
-        {"budget": {"max_duration_s": 5}},
         {"budget": {"max_cost_usd": 1}},
         {"output": {"result": "custom.yaml"}},
         {"output": {"artifacts_dir": "custom/"}},

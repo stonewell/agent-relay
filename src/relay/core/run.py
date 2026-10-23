@@ -4,7 +4,8 @@ One node runs in the foreground, with same-agent retries up to ``max_attempts``.
 Every attempt is routed, started through ``start_attempt`` (so an earlier attempt's
 ``result.spec.yaml`` is archived under ``attempts/NN/``), and only a verified, published attempt
 ends the node ``done``. Escalation, fallback and timeout retry policy arrive in phase 2a;
-``needs_input`` is task 1.21. Execution has no supervisor or task graph. This module is the single
+Foreground input uses durable question sets and operator replies (task 1.21).
+Execution has no supervisor or task graph. This module is the single
 writer of a run's durable state for the lifetime of the foreground process: it takes the
 interim run lock (section 6), records each routing decision, runs adapter invocations,
 captures/verifies/publishes the successful output, and releases the lock on every exit path.
@@ -15,9 +16,10 @@ The CLI maps them onto :class:`relay.cli.exitcodes.Exit`; ``relay doctor`` does 
 * ``0`` ok
 * ``1`` execution/store/lock failure
 * ``2`` invalid input or configuration (dirty tree, missing executable checks, unsupported
-  permission level, or the unsupported foreground input flow)
+  permission level)
 * ``3`` no eligible agent
 * ``5`` verification failed
+* ``6`` blocked for input or an exhausted limit
 
 Read nodes (access ``read``: review, debug, architecture, codebase-research; section 8.1) are
 not rejected for missing executable checks, but their verification is recorded as
@@ -28,10 +30,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
@@ -45,6 +49,7 @@ from relay.adapters.base import (
     start_attempt,
 )
 from relay.adapters.parsing import ResultInvalid
+from relay.core.answers import answer_context, current_questions, read_answers, record_answers
 from relay.core.capture import CaptureError, capture_changes
 from relay.core.classifier import Classification, classify
 from relay.core.events import EventLog, EventLogCorrupt
@@ -64,11 +69,13 @@ from relay.core.registry import Config, snapshot
 from relay.core.route_log import RouteLog
 from relay.core.router import route_agent
 from relay.core.runlock import RunLock, RunLockError
+from relay.core.specs import load_spec
+from relay.core.specs.answers import AnswerValue, Submission
 from relay.core.specs.common import Access, NodeStatus, PermissionLevel
 from relay.core.specs.graph import Graph, GraphNode
 from relay.core.specs.result import Changes, ResultSpec, Verification, VerifyDetail
 from relay.core.specs.task import TaskCore, TaskSpec
-from relay.core.store import RunStore, StoreError
+from relay.core.store import RunStore, StoreError, iso
 from relay.core.verify import (
     NoExecutableChecksError,
     VerificationError,
@@ -83,6 +90,7 @@ EXIT_FAILURE = 1
 EXIT_INVALID = 2
 EXIT_NO_AGENT = 3
 EXIT_VERIFICATION_FAILED = 5
+EXIT_BLOCKED = 6
 
 DEFAULT_MAX_ATTEMPTS = 1
 """Attempts per node when ``budget.max_attempts`` is unset.
@@ -227,8 +235,21 @@ class _AttemptRunner:
     adapter: AgentAdapter
     agent_name: str
     resume_session: str | None = None
+    question_revision: int = 0
 
     async def run(self, attempt: int, model: str | None) -> RunResult | _AttemptFailure:
+        started = time.monotonic()
+        try:
+            return await self._run(attempt, model)
+        finally:
+            duration = time.monotonic() - started
+
+            def update(record: Any) -> None:
+                record.nodes[self.node_id].active_duration_s += duration
+
+            self.store.update_run(update)
+
+    async def _run(self, attempt: int, model: str | None) -> RunResult | _AttemptFailure:
         """Run the agent phase, then capture/verify/publish when the agent reported success."""
         deadline = time.monotonic() + self.timeout_s if self.timeout_s is not None else None
         ctx = RunContext(
@@ -242,7 +263,13 @@ class _AttemptRunner:
         )
         # `start_attempt` archives the previous attempt's node-dir result before building this
         # attempt's invocation (section 8.2), so parsing sees only the current attempt.
-        invocation = start_attempt(self.adapter, self.task, ctx)
+        effective_task = self.task.model_copy(deep=True)
+        effective_task.goal += (
+            "\n\nIf a decision cannot be resolved from the repository, stop and return "
+            "status needs_input with typed open_questions instead of guessing."
+            + answer_context(self.node_dir, self.node_id)
+        )
+        invocation = start_attempt(self.adapter, effective_task, ctx)
         self.events.append(
             "node.started",
             {
@@ -273,16 +300,29 @@ class _AttemptRunner:
             self.resume_session = result.session.cli_session_id
 
         if result.status == "needs_input":
+            self.question_revision += 1
+            result.question_revision = self.question_revision
+            result.id = self.node_id
+            result.agent = self.agent_name
+            result.changes = Changes(input_commit=self.base_commit)
+            result.verification = None
+            relative = self.node_dir.relative_to(self.store.run_dir).as_posix()
+            self.store.write_spec(f"{relative}/result.spec.yaml", result)
             _set_node(self.store, self.node_id, "blocked", blocked_reason="needs_input")
             self.store.update_run(lambda record: setattr(record, "state", "blocked"))
-            self.events.append("run.finished", {"state": "blocked"})
+            self.events.append(
+                "input.requested",
+                {
+                    "node_id": self.node_id,
+                    "question_revision": self.question_revision,
+                },
+            )
             return RunResult(
-                exit_code=EXIT_INVALID,
+                exit_code=EXIT_BLOCKED,
                 run_id=self.store.run_id,
                 node_id=self.node_id,
                 node_status="needs_input",
-                reasons=("needs_input is not supported in this build (task 1.21)",),
-                error="the agent asked for input; answering questions is not implemented yet",
+                reasons=("needs_input",),
             )
 
         if result.status in ("blocked", "cancelled"):
@@ -472,6 +512,8 @@ async def run_foreground(
     timeout_s: float | None = None,
     out: TextIO | None = None,
     err: TextIO | None = None,
+    non_interactive: bool = False,
+    resume_run: str | None = None,
 ) -> RunResult:
     """Run one node in the foreground and return a :class:`RunResult`.
 
@@ -601,6 +643,7 @@ async def run_foreground(
     task.routing.agent_rule = decision.agent_rule
     task.routing.model_rule = model_decision.model_rule
 
+    task.permissions = permission.effective
     config_text, config_hash = snapshot(config)
     effective_timeout = (
         timeout_s
@@ -611,7 +654,11 @@ async def run_foreground(
     )
 
     try:
-        store = RunStore.create(repo_root, config_hash=config_hash, run_id=run_id)
+        store = (
+            RunStore.open(repo_root, resume_run)
+            if resume_run is not None
+            else RunStore.create(repo_root, config_hash=config_hash, run_id=run_id)
+        )
     except Exception as exc:  # noqa: BLE001 - store creation failures are all run failures
         return fail(EXIT_FAILURE, f"could not create run: {exc}")
 
@@ -630,38 +677,52 @@ async def run_foreground(
     )
     try:
         lock = RunLock.acquire(repo_root, store.run_id)
-        store.write_text("config.snapshot.json", config_text)
-        task.run_id = store.run_id
-        store.add_node(node_id)
-        store.update_run(lambda record: setattr(record, "graph", _single_node_graph(task)))
+        start_attempt_number = 1
+        prior_revision = 0
+        if resume_run is not None:
+            resume_state = _prepare_resume(store, task, max_attempts)
+            if isinstance(resume_state, RunResult):
+                return resume_state
+            start_attempt_number, prior_revision = resume_state
+        sensitive_paths: list[str] = []
+        if resume_run is None:
+            store.write_text("config.snapshot.json", config_text)
+            task.run_id = store.run_id
+            store.add_node(node_id)
+            ensure_exclude_block(repo_root)
+            base = resolve_base(repo_root, store.run_id, allow_dirty=allow_dirty, exclude=exclude)
+            task.repo.input_commit = base.commit
+            sensitive_paths = list(base.sensitive_paths)
+        base_commit = task.repo.input_commit
+        if base_commit is None:
+            raise ValueError("run is missing its pinned input commit")
         node_dir = store.node_dir(node_id)
+        context = answer_context(node_dir, node_id)
+        input_key = _input_key(task, base_commit, config_hash)
+        if context:
+            input_key = hashlib.sha256((input_key + context).encode()).hexdigest()
+        store.update_run(lambda record: setattr(record, "graph", _single_node_graph(task)))
         store.write_spec(f"{node_dir.relative_to(store.run_dir).as_posix()}/task.spec.yaml", task)
-
-        # Keep the user's git view clean before pinning the base (section 6): the first run
-        # idempotently adds the marked runtime-state block to `info/exclude`, so `git status`
-        # and the dirty check in `resolve_base` never see `.agents/...` runtime state.
-        ensure_exclude_block(repo_root)
-
-        base = resolve_base(repo_root, store.run_id, allow_dirty=allow_dirty, exclude=exclude)
-        input_key = _input_key(task, base.commit, config_hash)
 
         events = EventLog(store.events_path)
         route_log = RouteLog(
             events, store.routes_path, store.route_log_path, config.route_log, run_id=store.run_id
         )
-        events.append(
-            "run.started",
-            {
-                "config_hash": config_hash,
-                "base_commit": base.commit,
-                "allow_dirty": allow_dirty,
-                "run_id": store.run_id,
-                "sensitive_paths": list(base.sensitive_paths),
-            },
-        )
+        if resume_run is None:
+            events.append(
+                "run.started",
+                {
+                    "config_hash": config_hash,
+                    "base_commit": base_commit,
+                    "allow_dirty": allow_dirty,
+                    "run_id": store.run_id,
+                    "sensitive_paths": sensitive_paths,
+                },
+            )
         route_log.route(
             node_id=node_id,
-            attempt=1,
+            attempt=start_attempt_number,
+            resumed=resume_run is not None,
             event="routed",
             category=category,
             complexity=classification.complexity,
@@ -675,7 +736,7 @@ async def run_foreground(
 
         _set_node(store, node_id, "running", input_key=input_key)
 
-        worktree = worktree_manager.create(node_id, base.commit)
+        worktree = worktree_manager.create(node_id, base_commit)
         runner = _AttemptRunner(
             repo_root=repo_root,
             store=store,
@@ -685,23 +746,24 @@ async def run_foreground(
             node_dir=node_dir,
             worktree_manager=worktree_manager,
             worktree_path=worktree.path,
-            base_commit=base.commit,
+            base_commit=base_commit,
             input_key=input_key,
             access=access,
             permission=permission.effective,
             timeout_s=effective_timeout,
             adapter=registry[agent_name],
             agent_name=agent_name,
+            question_revision=prior_revision,
         )
 
         last_reason = f"node {node_id} did not complete an attempt"
         last_exit_code = EXIT_FAILURE
         attempts_run = 0
 
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(start_attempt_number, max_attempts + 1):
             # Every retry goes back through the Router before it starts (section 8.2); with no
             # escalation or cross-agent fallback in this slice it stays on the same agent.
-            if attempt > 1:
+            if attempt > start_attempt_number:
                 retry_decision = route_agent(
                     config,
                     classification,
@@ -755,16 +817,37 @@ async def run_foreground(
                     goal=task.goal,
                 )
 
+            if not _set_attempt_timeout(runner, effective_timeout):
+                return RunResult(
+                    EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("duration_exhausted",)
+                )
+            store.update_run(lambda record: setattr(record, "state", "running"))
             attempts_run = attempt
             _set_node(store, node_id, "running", attempts=attempt)
             outcome = await runner.run(
                 attempt, None if resolved_model == NO_MODEL else resolved_model
             )
             if isinstance(outcome, RunResult):
+                if outcome.exit_code == EXIT_BLOCKED:
+                    outcome = _handle_input(
+                        runner, outcome, non_interactive, stdout, stderr, attempt, max_attempts
+                    )
+                    if outcome is None:
+                        continue
                 return outcome
 
             # The attempt failed. Record it durably; the next iteration re-routes and starts a
             # new attempt, whose `start_attempt` archives this attempt's result file.
+            if (
+                task.budget.max_duration_s is not None
+                and store.read_run().nodes[node_id].active_duration_s >= task.budget.max_duration_s
+            ):
+                _set_node(store, node_id, "blocked", blocked_reason="duration_exhausted")
+                store.update_run(lambda record: setattr(record, "state", "blocked"))
+                events.append("run.finished", {"state": "blocked"})
+                return RunResult(
+                    EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("duration_exhausted",)
+                )
             last_reason = outcome.reason
             last_exit_code = outcome.exit_code
             events.append(
@@ -865,8 +948,7 @@ def _set_node(
             node.input_key = input_key
         if output_commit is not None:
             node.output_commit = output_commit
-        if blocked_reason is not None:
-            node.blocked_reason = blocked_reason
+        node.blocked_reason = blocked_reason
 
     store.update_run(change)
 
@@ -933,3 +1015,118 @@ def result_node_ok(store: RunStore, node_id: str) -> bool:
     except Exception:  # noqa: BLE001 - the record is best-effort during cleanup
         return False
     return record.nodes.get(node_id) is not None and record.nodes[node_id].state == "done"
+
+
+def _prompt_answers(result: ResultSpec, out: TextIO) -> dict[str, AnswerValue] | str | None:
+    answers: dict[str, AnswerValue] = {}
+    for question in result.open_questions:
+        while True:
+            print(f"{question.id}: {question.text}", file=out)
+            if question.options:
+                print("Options: " + ", ".join(question.options), file=out)
+            print(f"Default: {question.default or '(none)'}; :abort cancels", file=out)
+            out.flush()
+            try:
+                answer = input().strip()
+            except EOFError:
+                return None
+            if answer == ":abort":
+                return answer
+            answer = answer or question.default or ""
+            if not answer and question.required:
+                print("An answer is required.", file=out)
+                continue
+            if answer and question.kind == "choice" and answer not in (question.options or []):
+                print("Choose one of the listed options.", file=out)
+                continue
+            if answer:
+                answers[question.id] = answer
+            break
+    return answers
+
+
+def _handle_input(
+    runner: _AttemptRunner,
+    outcome: RunResult,
+    non_interactive: bool,
+    out: TextIO,
+    err: TextIO,
+    attempt: int,
+    max_attempts: int,
+) -> RunResult | None:
+    store, node_id = runner.store, runner.node_id
+    if not non_interactive and sys.stdin.isatty() and out.isatty():
+        answers = _prompt_answers(current_questions(store, node_id), out)
+        if answers == ":abort":
+            _set_node(store, node_id, "cancelled")
+            store.update_run(lambda record: setattr(record, "state", "cancelled"))
+            runner.events.append("run.finished", {"state": "cancelled"})
+            return RunResult(4, store.run_id, node_id, "cancelled")
+        if isinstance(answers, dict):
+            record_answers(
+                store,
+                node_id,
+                Submission(
+                    submission_id=secrets.token_hex(8),
+                    question_revision=runner.question_revision,
+                    provenance="operator-tty",
+                    submitted_at=iso(datetime.now(UTC)),
+                    answers=answers,
+                ),
+            )
+            if attempt < max_attempts:
+                runner.resume_session = None
+                context = answer_context(runner.node_dir, node_id)
+                runner.input_key = hashlib.sha256((runner.input_key + context).encode()).hexdigest()
+                _set_node(store, node_id, "running", input_key=runner.input_key)
+                store.update_run(lambda record: setattr(record, "state", "running"))
+                return None
+            _set_node(store, node_id, "blocked", blocked_reason="attempts_exhausted")
+            outcome = RunResult(
+                EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("attempts_exhausted",)
+            )
+    print(
+        f"relay reply {store.run_id} {node_id} --answers-file <answers.json> "
+        f"--revision {runner.question_revision} --resume --yes",
+        file=err,
+    )
+    runner.events.append("run.finished", {"state": "blocked"})
+    return outcome
+
+
+def _prepare_resume(
+    store: RunStore, task: TaskSpec, max_attempts: int
+) -> tuple[int, int] | RunResult:
+    record = store.read_run()
+    node_id = task.id
+    if record.state != "blocked" or len(record.nodes) != 1 or node_id not in record.nodes:
+        raise ValueError("resume requires a blocked single-node input run")
+    pending = current_questions(store, node_id)
+    revision = pending.question_revision or 1
+    submissions = read_answers(store.node_dir(node_id), node_id).submissions
+    if not any(entry.question_revision == revision for entry in submissions):
+        raise ValueError("record answers with relay reply before resuming")
+    next_attempt = record.nodes[node_id].attempts + 1
+    if next_attempt > max_attempts:
+        _set_node(store, node_id, "blocked", blocked_reason="attempts_exhausted")
+        return RunResult(
+            EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("attempts_exhausted",)
+        )
+    original = load_spec(TaskSpec, store.node_dir(node_id) / "task.spec.yaml")
+    task.repo.input_commit = original.repo.input_commit
+    return next_attempt, revision
+
+
+def _set_attempt_timeout(runner: _AttemptRunner, timeout: float) -> bool:
+    limit = runner.task.budget.max_duration_s
+    if limit is None:
+        return True
+    used = runner.store.read_run().nodes[runner.node_id].active_duration_s
+    remaining = limit - used
+    if remaining <= 0:
+        _set_node(runner.store, runner.node_id, "blocked", blocked_reason="duration_exhausted")
+        runner.store.update_run(lambda record: setattr(record, "state", "blocked"))
+        runner.events.append("run.finished", {"state": "blocked"})
+        return False
+    runner.timeout_s = min(timeout, remaining)
+    return True

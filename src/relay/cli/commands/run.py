@@ -61,6 +61,9 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         metavar="GLOB",
         help="omit paths matching GLOB from the snapshot (repeatable)",
     )
+    parser.add_argument(
+        "--non-interactive", action="store_true", help="persist questions without prompting"
+    )
     parser.add_argument("--json", action="store_true", help="print the run result as JSON")
     parser.add_argument(
         "--check",
@@ -97,6 +100,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
                 repo_root,
                 task,
                 config=config,
+                non_interactive=args.non_interactive or args.json,
                 cli_permissions=cli_permissions,
                 agent_permissions=agent_permissions,
                 model_tier=args.model_tier,
@@ -167,8 +171,6 @@ def _task_spec(args: argparse.Namespace, repo_root: Path) -> TaskSpec:
         raise ValueError(
             "select the repository with -C; task.repo must use root '.' without base pins"
         )
-    if task.budget.max_duration_s is not None:
-        raise ValueError("budget.max_duration_s is not supported by foreground runs yet")
     if task.output.result != "result.spec.yaml" or task.output.artifacts_dir != "artifacts/":
         raise ValueError("custom output channels are not supported by foreground runs yet")
     return task

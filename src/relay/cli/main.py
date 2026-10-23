@@ -13,6 +13,7 @@ from .commands import agents as agents_command
 from .commands import apply as apply_command
 from .commands import clean as clean_command
 from .commands import doctor, result, routes, run, status
+from .commands import input as input_command
 from .exitcodes import Exit
 from .phases import COMMAND_PHASE, IMPLEMENTED, availability_error
 
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_parser(commands)
     routes.add_parsers(commands)
     run.add_parser(commands)
+    input_command.add_parsers(commands)
     status.add_parser(commands)
     for name in COMMAND_PHASE:
         if name not in IMPLEMENTED:
@@ -52,6 +54,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(problem, file=sys.stderr)
         return Exit.INVALID
     repo_root = Path(args.repo).resolve()
+    if args.command in ("reply", "resume"):
+        return input_command.run(args, repo_root)
     if args.command == "agents":
         return agents_command.run(args, repo_root)
     if args.command == "apply":

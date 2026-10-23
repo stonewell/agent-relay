@@ -18,6 +18,7 @@ class NodeRecord(SpecModel):
     state: NodeState = "pending"
     blocked_reason: str | None = None
     attempts: int = Field(default=0, ge=0)
+    active_duration_s: float = Field(default=0.0, ge=0)
     input_key: str | None = None
     output_commit: Sha | None = None
 
