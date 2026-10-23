@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from relay.core.env import CompleteEnv
 from relay.core.platform.proc import (
     CommandNotFound,
     ProcessResult,
@@ -63,6 +64,12 @@ class Invocation:
     args: tuple[str, ...]
     cwd: Path
     env: dict[str, str] = field(default_factory=lambda: {})
+    full_env: bool = False
+    """When True, `env` is the complete child environment and the parent environment is not
+    merged in. Adapters normally do not need to set this: an `env` built with
+    ``relay.core.env.build_env`` is a ``CompleteEnv``, which ``run_invocation`` always treats
+    as complete (fail-closed against a forgotten flag). A plain ``dict`` with
+    ``full_env=False`` keeps the legacy merge-with-parent behaviour."""
     stdin: str | None = None
     prompt_file: Path | None = None
     """When set, the prompt text in `stdin` is written to this file instead of being piped to
@@ -174,9 +181,12 @@ def run_invocation(invocation: Invocation, *, timeout_s: float | None = None) ->
     The command is resolved with :func:`resolve_command` against the invocation's environment,
     and the prompt text (``invocation.stdin``) is either piped to the child or, when
     ``invocation.prompt_file`` is set, written atomically to that file for the child to read
-    from `args`.
+    from `args`. The child environment is ``invocation.env`` verbatim when ``full_env`` is
+    True *or* ``env`` is a :class:`~relay.core.env.CompleteEnv` (a ``build_env`` result);
+    otherwise the parent environment is the base and `env` adds to it.
     """
-    env = {**os.environ, **invocation.env}
+    complete = invocation.full_env or isinstance(invocation.env, CompleteEnv)
+    env = dict(invocation.env) if complete else {**os.environ, **invocation.env}
     resolved = resolve_command(invocation.cmd, invocation.args, env=env, cwd=invocation.cwd)
     stdin: str | None = invocation.stdin
     if invocation.prompt_file is not None:
