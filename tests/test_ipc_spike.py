@@ -260,10 +260,12 @@ if sys.platform != "win32":
 
         server = await asyncio.start_unix_server(handle, path=str(path))
         os.chmod(path, 0o600)
+        seen["socket_mode"] = path.stat().st_mode & 0o777
         client = run_client(str(path))
         await asyncio.wait_for(finished, 20)
         out, err = await asyncio.to_thread(client.communicate, None, 20)
         server.close()
+        await server.wait_closed()
         assert client.returncode == 0, err
         pid_text, reply = out.split()
         seen.update(client_pid=int(pid_text), reply=reply)
@@ -282,7 +284,7 @@ if sys.platform != "win32":
         assert seen["reply"] == "echo:hello"
         assert seen["peer_pid"] == seen["client_pid"]
         assert seen["peer_uid"] == os.getuid()
-        assert (tmp_path / "s.sock").stat().st_mode & 0o777 == 0o600
+        assert seen["socket_mode"] == 0o600
 
     def test_unix_socket_path_length_limit(tmp_path: Path) -> None:
         """Finding: `sun_path` is about 108 bytes (104 on macOS), so deep run directories need

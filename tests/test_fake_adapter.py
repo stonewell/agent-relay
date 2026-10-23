@@ -228,7 +228,8 @@ def test_usage_and_stderr_are_passed_through(repo: Path) -> None:
 def test_a_hanging_agent_times_out_and_is_killed(repo: Path) -> None:
     adapter = FakeAdapter(Scenario(hang=True, write={"partial.txt": "p\n"}))
     ctx = context(repo)
-    proc = run_invocation(adapter.build_invocation(task(), ctx), timeout_s=1.5)
+    # Include cold interpreter/schema startup on slower hosts before the deliberate hang.
+    proc = run_invocation(adapter.build_invocation(task(), ctx), timeout_s=5)
     assert proc.timed_out
     assert proc.exit_code is None
     assert (repo / "worktree" / "partial.txt").exists()  # edits made before hanging remain
