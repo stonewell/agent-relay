@@ -1,6 +1,6 @@
 # Development plan
 
-Status: Draft · Tracks the current `design.md`
+Status: Working plan · Tracks the current `design.md`
 
 This plan splits the phases in design section 16 into tasks, orders them by priority, and defines exit criteria per phase. It does not restate design rules; each task points to the design section that defines its behaviour. Where a task conflicts with the design, the design wins and this plan is corrected.
 
@@ -33,7 +33,7 @@ This plan splits the phases in design section 16 into tasks, orders them by prio
 | **M6 Breadth** | Antigravity/Gemini, Cursor, cost accounting, shadow-git | 4 |
 | **M7 Gateway** | Provider gateway, LLM planner | 5 |
 
-Critical path to M2: `0.1 -> 0.2 -> 0.3/0.4 -> 0.5 -> 1.x pipeline -> 1.24 -> 1.30`. Everything in phases 2 to 5 depends on M2; phases 3 to 5 depend on M4 (except Antigravity/Gemini and Cursor adapters, which need only M2).
+Critical path to M2: `0.1 -> 0.2 -> 0.3/0.4 -> 0.5 -> 1.x pipeline -> 1.24/1.31 -> 1.30`. Everything in phases 2 to 5 depends on M2; phases 3 to 5 depend on M4 (except Antigravity/Gemini and Cursor adapters, which need only M2).
 
 ---
 
@@ -104,8 +104,8 @@ Goal: `relay run "<request>"` routes a task, runs Claude or Codex in an isolated
 
 | ID | Task | Pri | Size | Depends | Design | Done when |
 |---|---|---|---|---|---|---|
-| 1.18 | Interim run lock: exclusive-create, PID plus process-start identity, stale detection, `interrupted` marking, takeover only on `--retry`/`resume` | P0 | M | 0.5 | 6 | Ownership test area (phase 1 part) green on Windows and Linux |
-| 1.19 | Foreground `relay run`: intake, routing, attempt state machine (phases `agent`, `capture`, `verify`, `publish`), every attempt started through `start_attempt` so earlier results are moved aside, `max_attempts` across escalation and fallback, timeouts, events, run result and exit codes | P0 | L | 1.4, 1.11, 1.17, 1.18 | 8.2, 14 | Single-node end-to-end passes with the fake adapter (**M1**) |
+| 1.18 | Interim run-ownership primitives and stale-owner detection; foreground retry/resume command integration is tracked in 1.23 | P0 | M | 0.5 | 6 | Ownership test area (phase 1 part) green on Windows and Linux |
+| 1.19 | Foreground single-node core loop, request/routing intake, attempt state machine, same-agent retries, archival, events and result/exit handling; verification-input CLI work is tracked in 1.31 | P0 | L | 1.4, 1.11, 1.17, 1.18 | 8.2, 14 | Single-node end-to-end passes with the fake adapter (**M1**) |
 | 1.20 | Permission levels: precedence resolution, mapping per adapter, `probe().levels`, fail-closed behaviour, run-start banner; doctor canaries for the profiles that exist (Codex native sandbox, Claude/Cursor read-only modes) | P0 | L | 1.9, 1.10, 0.8 | 9 | Permission test area green; unsupported levels fail closed |
 | 1.21 | `needs_input` foreground: adapter prompt and typed questions, TTY prompt, answer recording and provenance, `--non-interactive` blocked exit 6, `relay reply`, `relay resume` for one node, limits and idempotency | P0 | L | 1.19, 0.11 | 8.2, 5.3 | `needs_input` foreground test area green; doctor canary on real agents |
 | 1.22 | `relay status`, `relay result`, `relay agents`, `relay clean` (worktrees, scratch; `--purge-runs` with lock) | P1 | M | 1.19 | 14 | Commands read run directory directly; clean never touches lock objects |
@@ -121,16 +121,17 @@ Goal: `relay run "<request>"` routes a task, runs Claude or Codex in an isolated
 
 | ID | Task | Pri | Size | Depends | Design | Done when |
 |---|---|---|---|---|---|---|
-| 1.25 | Integration suite on a temp git repo with the stub CLI: full run, retry, escalation, fallback, verification failure, `needs_input` paths | P0 | L | 1.19, 1.21 | 16 | Suite runs in CI on both OSes |
+| 1.25 | Integration suite on a temp git repo with the stub CLI: full run, same-agent retry, verification failure and foreground input paths; phase-2 routing extensions belong to 2.8 | P0 | L | 1.19, 1.21, 1.31 | 16 | Suite runs in CI on both OSes |
 | 1.26 | Live smoke tests (`RELAY_LIVE=1`) for Claude and Codex, run manually and nightly where credentials exist | P1 | S | 1.9, 1.10 | 16 | Documented procedure; passes on the reference machine |
 | 1.27 | Windows hardening pass: spawn, paths, env, tree kill, locks, line endings | P0 | M | 1.14, 1.18 | 7.2, 9.4 | Whole phase 1 suite green on Windows |
 | 1.28 | User docs: quickstart, `agents.yaml` reference, command reference, troubleshooting, known limits (Windows `full` only, no graphs) | P1 | M | 1.24 | all | A new user completes a run and an apply from the docs alone |
 | 1.29 | Error handling and UX polish: actionable messages, `--json` output for all commands, `available from phase N` errors for later commands | P1 | M | 1.19, 1.22 | 14, 16 | Later commands print the phase error |
-| 1.30 | MVP acceptance run: scripted scenarios on the reference machine (simple feature, bugfix with escalation, ambiguous task with `needs_input`, failed verification, apply with dirty tree) | P0 | M | 1.24, 1.25, 1.27 | 16 | All scenarios pass (**M2**) |
+| 1.30 | MVP acceptance run: scripted scenarios on the reference machine (simple feature, bugfix with same-agent retry, ambiguous task with `needs_input`, failed verification, apply with dirty tree) | P0 | M | 1.24, 1.25, 1.27, 1.31 | 16 | All scenarios pass (**M2**) |
+| 1.31 | CLI intake for authorized verification and attempt limits | P0 | M | 1.16, 1.19 | 14, 10, 8.2 | A command-line write request can receive authorized verification and limit inputs, complete through apply without a Python caller, and still rejects missing checks |
 
 **Exit criteria (M2):** all tasks P0 and P1 done; the five acceptance scenarios in 1.30 pass on Windows and Linux; the phase 1 test areas in design section 16 are green; known limits are documented.
 
-**Priority order inside the phase** (suggested sequence): 1.7, 1.18, 1.13 and 1.1 start immediately (they do not depend on each other) -> 1.2/1.3/1.8 -> 1.14, 1.15 -> 1.4, 1.16 -> 1.17 -> 1.19 (M1) -> 1.9, 1.10, 1.11 -> 1.21, 1.20 -> 1.24 -> 1.25, 1.27 -> 1.30.
+**Priority order inside the phase** (suggested sequence): 1.7, 1.18, 1.13 and 1.1 start immediately (they do not depend on each other) -> 1.2/1.3/1.8 -> 1.14, 1.15 -> 1.4, 1.16 -> 1.17 -> 1.19 (M1) -> 1.9, 1.10, 1.11 -> 1.21, 1.20 -> 1.24, 1.31 -> 1.25, 1.27 -> 1.30.
 
 **Cut order if schedule slips:** 1.6, 1.23 (resume after interruption can re-run the node by hand), 1.26 nightly automation, parts of 1.29, then `--branch` in 1.24. Never cut 1.20 fail-closed behaviour, 1.21, or 1.27.
 
@@ -149,7 +150,7 @@ Goal: a task graph runs in the foreground with isolation, merging, fallback and 
 | 2.5 | Merge nodes: merge commits with original parents, integration acceptance on every merged snapshot, per-attempt and merge refs retained until purge | P0 | L | 2.4 | 8.3 | Merge-ancestry tests green |
 | 2.6 | Conflict-resolution node: exact inputs, bounded to one attempt, scope rules, verified resolution published with original parents | P0 | M | 2.5 | 8.3 | Conflict scenarios resolve or fail per policy |
 | 2.7 | Final integration branch across all terminal outputs and verification; run states (`blocked` run, partial outputs) and exit code precedence | P0 | M | 2.5 | 8.3, 14 | Disconnected terminal writers appear in integration |
-| 2.8 | Fallback and escalation across nodes with route log entries; `max_attempts` totals across agents and resume | P1 | M | 2.2 | 8.2, 4.4 | Retry-limit tests green |
+| 2.8 | Model escalation, cross-agent fallback and timeout retry policy for foreground execution, with routing regressions across nodes and resume | P1 | M | 2.2 | 8.2, 4.4 | Retry-limit tests green |
 | 2.9 | `input_key` computation, completed-node reuse and descendant invalidation, `node.reused/invalidated` events | P1 | L | 2.4 | 6, 8.2 | Snapshot/resume test area green |
 | 2.10 | Planner: template pipelines (bugfix, feature, refactor, upgrade) and user graph files; `relay plan`, `relay graph run` | P1 | M | 2.1 | 14, 17 | Templates produce valid graphs |
 | 2.11 | Foreground `relay resume` for graphs, `relay cancel` (Ctrl-C handling), `blocked` nodes reporting | P1 | M | 2.2, 2.9 | 8.2, 14 | Interrupted graph resumes reusing valid nodes |
@@ -256,7 +257,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 
 | ID | Status | Date | Note |
 |---|---|---|---|
-| 0.1 | done | 2026-10-22 | `uv` project; full suite passes on Windows (Python 3.11) and on Linux (WSL2, Python 3.12) |
+| 0.1 | done | 2026-10-23 | Local validation: Windows/Python 3.11, 1,106 passed and 10 skipped; Linux via WSL/Python 3.12, 1,103 passed and 11 skipped; build and local static checks pass |
 | 0.2 | in progress | 2026-10-22 | Workflow written in `.github/workflows/ci.yml`; not yet run (no remote configured) |
 | 0.3 | done | 2026-10-22 | `relay.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; reserved-scope check is host-independent and conservative (case, globs, Windows aliases) with regression tests |
 | 0.4 | done | 2026-10-22 | `relay.core.registry` and `relay.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
@@ -276,7 +277,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.8 | done | 2026-10-22 | Environment allowlist plus fail-closed `CompleteEnv`; 27 tests |
 | 1.9 | in progress | 2026-10-22 | Claude adapter, golden parsing/flags/session tests green; live smoke unrun because `RELAY_LIVE` was unset |
 | 1.10 | in progress | 2026-10-22 | Codex adapter, strict schema/JSONL/usage tests green; live smoke unrun because `RELAY_LIVE` was unset |
-| 1.11 | done | 2026-10-22 | Shared parsing, one repair per attempt, identity/operational-field trust enforced; full suite 690 passed / 6 skipped |
+| 1.11 | done | 2026-10-23 | Shared parsing, one repair per attempt and identity/operational-field trust tests pass |
 | 1.12 | done | 2026-10-23 | Adapter canary fixtures pass on Windows and Linux; real-CLI canaries remain unrun |
 | 1.13 | done | 2026-10-22 | `relay.core.gitbase`: clean-tree pinning, synthetic `--allow-dirty` base with sensitive/`--exclude` filtering, `refs/relay/<run>/...`; 30 tests; `run.started` can consume `sensitive_paths`; exclude globs are per-segment, refs validated, dirty submodules reported for 1.14 |
 | 1.14 | done | 2026-10-23 | Input pinning, auxiliary setup and cache environment complete; Windows registration, cleanup and 300-character path regressions pass |
@@ -284,9 +285,11 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.16 | done | 2026-10-23 | Verifier checks pass on Windows and Linux with platform-correct command fixtures |
 | 1.17 | done | 2026-10-22 | Output commit, node refs, diff artifact and integration branch; F1-F6 review fixes applied; exercised end-to-end by 1.19a |
 | 1.18 | done | 2026-10-23 | Interim lock and process-start identity tests pass on Windows and Linux; exited Windows owners are detected |
-| 1.19 | in progress | 2026-10-23 | Slices A and B1 complete with canonical node specs and cleanup regressions; B2 remains pending |
+| 1.19 | done | 2026-10-23 | Core single-node pipeline and same-agent retries pass; remaining CLI intake is tracked in 1.31 and phase-2 execution extensions in 2.8 |
 | 1.20 | done | 2026-10-23 | Permission policy and disposable canary tests pass on Windows and Linux; live canaries remain opt-in |
 | 1.22 | done | 2026-10-22 | `status`/`result`/`agents`/`clean` read `run.json` and events directly; purge refuses live runs, needs `--yes` (exit 7) and never touches lock objects |
 | 1.24 | done | 2026-10-23 | Git-mode apply complete; staged-edit preservation, dirty-baseline and separate-branch delivery regressions pass |
+| 1.27 | in progress | 2026-10-23 | Implemented checks pass locally on Windows, including long paths and tree kill; repeat the complete phase-1 acceptance suite after remaining inputs and resume work |
+| 1.28 | in progress | 2026-10-23 | Repository guides and command-boundary documentation reconciled; complete the write-run quickstart after 1.31 |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 

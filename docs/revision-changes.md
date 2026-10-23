@@ -8,9 +8,9 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.24 |
-| `development-plan.md` | v0.4 |
-| `AGENTS.md` | v3 |
+| `design.md` | v0.25 |
+| `development-plan.md` | v0.5 |
+| `AGENTS.md` | v4 |
 
 ## Version summaries
 
@@ -400,3 +400,16 @@ Updated task status after implementation review and Windows/Linux validation aga
 | CR5: inspection selected unfinalized file results | P2 | Aligned finalized spec placement with section 6; refreshed task 1.19 status. |
 | CR6: separate-branch delivery rejected checkout edits | P2 | Corrected apply preparation against section 8.3; refreshed task 1.24 status. |
 | CR7: platform-dependent checks failed | P2 | Corrected fixtures, canary argv and Windows process liveness against sections 6, 7.2, 9.4, 15 and 16; refreshed tasks 1.12, 1.16, 1.18 and 1.20 status. |
+
+## Documentation reconciliation (design v0.25, plan v0.5)
+
+Reviewed all repository Markdown guides against the CLI handlers, run pipeline and platform fixes.
+This revision records local validation already performed; it does not claim a new live-agent or CI run.
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| D1 / P2 | Entry guides implied concurrency or a completed phase-0-only implementation. | Reworked the README and AGENTS entry points to use the design phase map and canonical task status; linked the plugin guide to its owning sections. |
+| D2 / P1 | The request-only CLI could not supply the verification needed for a write run, while the reference implied the full surface was available. | Defined the intake boundary and intermediate input-result handling in design section 14; added plan task 1.31. |
+| D3 / P2 | Phase-1 lifecycle and acceptance tasks still included deferred execution extensions. | Aligned plan tasks 1.18, 1.19, 1.25, 1.30 and 2.8 with design sections 6, 8.2 and 16; refreshed task status evidence. |
+| D4 / P2 | Corrected storage, process and delivery behaviour lacked precise canonical wording. | Updated design sections 6, 7.1, 7.2 and 8.3, with regression references in section 16. |
+| D5 / P2 | The layout sketch and evidence guide could imply modules or live coverage beyond what the code provided. | Reconciled design section 15, the plugin guide and recorded-fixture README; separated capture provenance from the live-smoke procedure in section 16. |

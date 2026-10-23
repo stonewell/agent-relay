@@ -8,7 +8,7 @@ A router that sends programming tasks to different agent CLIs and passes context
 
 ## Current state
 
-Phase 0 is being implemented: the Python package is in `src/relay/` and the tests in `tests/`. Which tasks are done is recorded only in the task status section of `docs/development-plan.md`.
+The Python package is in `src/relay/` and its tests are in `tests/`. Read the [Task status](docs/development-plan.md#task-status) section for completed work, remaining work and validation evidence. Read [design section 14](docs/design.md#14-relay-cli) for the command surface and intake limits; phase scope is defined in section 16. Do not infer release readiness from the presence of a module or a passing offline test.
 
 ## Where things are
 
@@ -17,6 +17,7 @@ Phase 0 is being implemented: the Python package is in `src/relay/` and the test
 | `docs/design.md` | The specification (current design only) |
 | `docs/development-plan.md` | Tasks, priorities, milestones and task status |
 | `docs/revision-changes.md` | History of changes to the documents above |
+| `README.md` | Getting started and development commands |
 | `src/relay/`, `tests/` | Code and tests; layout defined in design section 15 |
 
 ## Working here
