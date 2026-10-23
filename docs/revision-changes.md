@@ -9,7 +9,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 | Document | Version |
 |---|---|
 | `design.md` | v0.27 |
-| `development-plan.md` | v0.6 |
+| `development-plan.md` | v0.7 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
@@ -443,3 +443,12 @@ This revision records local validation already performed; it does not claim a ne
 | ID / severity | Finding | Resolution |
 |---|---|---|
 | IN1 / P1 | Escaping the full native result schema could exceed the Windows batch command-line limit. | Removed nonfunctional schema titles for Claude and added a complete-schema shim canary; design section 5.4. |
+
+## User walkthrough and remaining-work reconciliation (plan v0.7)
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| UG1 / P2 | The entry guide ended before a user could run a verified write task and deliver it. | Added the sibling-project walkthrough and inspection/apply commands to the root README. |
+| UG2 / P2 | Foreground questions lacked user-facing examples for replies, answer files and explicit limit increases. | Added a reply/resume walkthrough and links to the canonical contracts. |
+| UG3 / P2 | The source-layout sketch omitted the foreground answer module and the command overview omitted existing doctor options. | Reconciled wording in design sections 14 and 15; no behavior changed. |
+| UG4 / P2 | Remaining work was spread across individual statuses without an order reflecting the requested deferrals. | Updated task 1.28 and added the remaining-work order inside the development plan's Task status section. |

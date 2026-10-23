@@ -770,7 +770,8 @@ relay routes [run] [--tail N] [--node ID] [--agent A] [--model M] [--event E] [-
                       [--rule ID] [--order oldest|newest] [--json]
                                   # route log (section 4.4); without <run>, reads all runs under .agents/runs
 relay agents [--json]             # list agents, availability, versions, enforceable levels
-relay doctor                       # probes CLIs, canary runs (incl. session-id extraction), config validation, git exclude block,
+relay doctor [--paid] [--check ID]... [--json]
+                                  # probes CLIs, canary runs (incl. session-id extraction), config validation, git exclude block,
                                   # Windows long-path/worktree-root check, pricing-rate warnings, opencode compat
 relay clean [RUN] [--older-than <dur>] [--purge-runs] [--yes] [--dry-run] [--json]
                                   # prune inactive worktrees/scratch; purge explicitly removes run records and refs
@@ -827,7 +828,7 @@ src/relay/
   core/     registry.py classifier.py router.py model_router.py route_log.py
             store.py runrecord.py events.py run.py runlock.py permissions.py env.py
             gitbase.py gitexclude.py worktree.py capture.py verify.py publish.py apply.py
-            doctor.py yamlio.py
+            doctor.py answers.py yamlio.py
             specs/{common,task,result,graph,answers,route}.py
             platform/{locks,proc,procid}.py
   adapters/ base.py parsing.py fake.py fake_cli.py fake_scenario.py

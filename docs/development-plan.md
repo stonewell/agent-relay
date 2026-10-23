@@ -258,7 +258,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | ID | Status | Date | Note |
 |---|---|---|---|
 | 0.1 | done | 2026-10-23 | Latest full suites: Windows/Python 3.11, 1,164 passed and 10 skipped; Linux via WSL/Python 3.12, 1,161 passed and 11 skipped; follow-up input tests, build and local static checks pass |
-| 0.2 | in progress | 2026-10-23 | Deferred at operator request; Minimum/latest Python matrix and cache updates prepared; local matrix checks pass; a green remote run is still required and failed-log downloads require additional repository access |
+| 0.2 | in progress | 2026-10-23 | Deferred at operator request; minimum/latest Python matrix and cache updates prepared; local matrix checks pass; a green remote run is still required and failed-log downloads require additional repository access |
 | 0.3 | done | 2026-10-22 | `relay.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; reserved-scope check is host-independent and conservative (case, globs, Windows aliases) with regression tests |
 | 0.4 | done | 2026-10-22 | `relay.core.registry` and `relay.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
 | 0.5 | done | 2026-10-22 | `relay.core.store` and `runrecord`; atomic writes with a process-kill test; Windows reader and writer retry on `PermissionError` |
@@ -276,7 +276,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.7 | done | 2026-10-23 | Adapter interface and command resolution complete; Windows shim canaries and Windows/Linux tree-kill regressions pass |
 | 1.8 | done | 2026-10-23 | Environment allowlist and case-insensitive Windows regression checks pass; essential variables retained during live adapter execution |
 | 1.9 | done | 2026-10-23 | Golden checks and live Claude Code 2.1.309 structured-result/session-resume smoke pass |
-| 1.10 | in progress | 2026-10-23 | Deferred at operator request; Golden checks pass; live Codex 0.164.0 returned a model-capacity error, leaving successful structured/resume validation outstanding |
+| 1.10 | in progress | 2026-10-23 | Deferred at operator request; golden checks pass; live Codex 0.164.0 returned a model-capacity error, leaving successful structured/resume validation outstanding |
 | 1.11 | done | 2026-10-23 | Shared parsing, one repair per attempt and identity/operational-field trust tests pass |
 | 1.12 | done | 2026-10-23 | Doctor fixtures pass on Windows and Linux; live coverage is tracked by the adapter and input tasks |
 | 1.13 | done | 2026-10-22 | `relay.core.gitbase`: clean-tree pinning, synthetic `--allow-dirty` base with sensitive/`--exclude` filtering, `refs/relay/<run>/...`; 30 tests; `run.started` can consume `sensitive_paths`; exclude globs are per-segment, refs validated, dirty submodules reported for 1.14 |
@@ -292,8 +292,19 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.24 | done | 2026-10-23 | Git-mode apply complete; staged-edit preservation, dirty-baseline and separate-branch delivery regressions pass |
 | 1.25 | in progress | 2026-10-23 | Integration and five-scenario acceptance suites pass locally on Windows and Linux; remote CI confirmation remains deferred under 0.2 |
 | 1.27 | done | 2026-10-23 | Full Windows suite, foreground acceptance scenarios, long paths, process trees, locks and schema-through-batch regression checks pass |
-| 1.28 | in progress | 2026-10-23 | Repository guides and command-boundary documentation reconciled; CLI verification intake is available, with the write-run quickstart and walkthrough still pending |
+| 1.28 | in progress | 2026-10-23 | README walkthrough, input examples, reference links and troubleshooting complete; direct and input paths rehearse successfully with fake workers; authenticated new-user walkthrough remains |
 | 1.30 | in progress | 2026-10-23 | All five stub-CLI scenarios pass on Windows and Linux; M2 sign-off still awaits the deferred CI/Codex checks and remaining P1 release work |
 | 1.31 | done | 2026-10-23 | Validated request/spec intake, verification policy persistence, limits, worker requirements and end-to-end apply regressions pass |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 
+
+### Remaining work in order
+
+The current order preserves the requested deferrals. Task status and validation evidence are
+recorded in the table above; phase dependencies still gate later milestones.
+
+1. **1.28:** review the documented walkthrough with an authenticated CLI and a new user.
+2. **1.29:** complete CLI error and JSON-output consistency checks.
+3. **1.23:** implement and exercise interrupted single-node recovery; this is separate from the answered-input resume already covered by 1.21.
+4. **1.26:** complete the live-smoke procedure and automation where credentials are available, after 1.10 is resumed.
+5. **0.2 and 1.10:** resume only when requested; then close the remaining validation for 1.21 and 1.25 and finalize 1.30/M2.
