@@ -321,7 +321,9 @@ def _dirty_paths(repo_root: Path) -> list[str]:
         if not line:
             continue
         path = line[3:].split(" -> ", 1)[-1]
-        if path:
+        # Runtime state is never user input (section 6): reserved paths must not make the
+        # tree "dirty", even before the repository-local exclude block is in place.
+        if path and not is_reserved_path(path):
             paths.append(path)
     return paths
 
