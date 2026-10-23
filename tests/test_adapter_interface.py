@@ -86,27 +86,28 @@ def test_cmd_shim_raw_command_line_has_no_double_quote_escaping() -> None:
     `cmd.exe /s` cannot strip. `_wrap_cmd_shim` runs on every OS because it only builds a
     string, so the risky construction is unit-tested here without needing Windows.
     """
-    shim = r"C:\tools\agent.cmd"
+    shim = r"tools\agent.cmd"
     resolved = _wrap_cmd_shim(shim, ["-p", "hello world"], {"COMSPEC": "cmd.exe"})
     raw = resolved.windows_command_line
     assert raw is not None
     assert '\\"' not in raw
-    assert raw == 'cmd.exe /d /s /c "C:\\tools\\agent.cmd -p "hello world""'
+    assert raw == 'cmd.exe /d /s /v:off /c "tools\\agent.cmd ^^^"-p^^^" ^^^"hello^^^ world^^^""'
     assert resolved.argv == (
         "cmd.exe",
         "/d",
         "/s",
+        "/v:off",
         "/c",
-        '"C:\\tools\\agent.cmd -p "hello world""',
+        '"tools\\agent.cmd ^^^"-p^^^" ^^^"hello^^^ world^^^""',
     )
 
 
 def test_cmd_shim_raw_command_line_preserves_embedded_quotes() -> None:
-    shim = r"C:\tools\agent.cmd"
+    shim = r"tools\agent.cmd"
     resolved = _wrap_cmd_shim(shim, ["-p", 'hello "world"'], {"COMSPEC": "cmd.exe"})
     raw = resolved.windows_command_line
     assert raw is not None
-    assert raw == 'cmd.exe /d /s /c "C:\\tools\\agent.cmd -p "hello \\"world\\"""'
+    assert r'\^^^"world\^^^"' in raw
 
 
 @pytest.mark.skipif(not WINDOWS, reason=".cmd shims are Windows-only")
@@ -116,16 +117,16 @@ def test_resolve_command_wraps_a_cmd_shim(tmp_path: Path) -> None:
     env = {**os.environ, "PATH": str(tmp_path), "PATHEXT": ".CMD"}
     argv = resolveCommand("agent", ["-p", "hello world"], env=env)
     assert argv[0] == env.get("COMSPEC", "cmd.exe")
-    assert argv[1:4] == ["/d", "/s", "/c"]
-    wrapped = argv[3]
-    assert str(shim) in wrapped
-    assert "hello world" in wrapped
+    assert argv[1:5] == ["/d", "/s", "/v:off", "/c"]
+    wrapped = argv[5]
+    assert "agent.cmd" in wrapped.lower()
+    assert "hello^" in wrapped
     resolved = resolve_command("agent", ["-p", "hello world"], env=env)
     assert resolved.windows_command_line is not None
-    # `argv[3]` is the inner line wrapped in one extra quote pair; the raw command line is
+    # `argv[5]` is the inner line wrapped in one extra quote pair; the raw command line is
     # that pair around the inner line only, unescaped by any second quoting pass.
     assert resolved.windows_command_line == (
-        f'{env.get("COMSPEC", "cmd.exe")} /d /s /c "{wrapped[1:-1]}"'
+        f'{env.get("COMSPEC", "cmd.exe")} /d /s /v:off /c "{wrapped[1:-1]}"'
     )
 
 
@@ -136,20 +137,36 @@ def test_resolve_command_wraps_a_bat_shim(tmp_path: Path) -> None:
     env = {**os.environ, "PATH": str(tmp_path), "PATHEXT": ".BAT"}
     argv = resolveCommand("runme", env=env)
     assert argv[0] == env.get("COMSPEC", "cmd.exe")
-    assert argv[1:4] == ["/d", "/s", "/c"]
-    assert str(shim) in argv[3]
+    assert argv[1:5] == ["/d", "/s", "/v:off", "/c"]
+    assert "runme.bat" in argv[5].lower()
 
 
 @pytest.mark.skipif(not WINDOWS, reason="the canary runs a real .cmd shim on Windows only")
 def test_cmd_shim_canary_round_trips_quotes_and_newlines(tmp_path: Path) -> None:
+    import json
+
+    script = tmp_path / "echo.py"
+    script.write_text(
+        "import json, sys; print(json.dumps([sys.argv[1:], sys.stdin.read()]))",
+        encoding="utf-8",
+    )
     shim = tmp_path / "echo.cmd"
-    shim.write_text("@echo off\r\n@echo(%*\r\n", encoding="utf-8")
+    shim.write_text(f'@echo off\r\n"{PY}" "{script}" %*\r\n', encoding="utf-8")
     env = {**os.environ, "PATH": str(tmp_path), "PATHEXT": ".CMD"}
-    arg = 'a"b\nc d'
-    resolved = resolve_command("echo", [arg], env=env)
-    result = run_process(resolved, cwd=tmp_path, env=env)
+    args = ['a"b', "c d", "safe&echo.INJECTED", "%COMSPEC%", "!COMSPEC!", "a^b", "", "end\\"]
+    prompt = 'a"b\nc d'
+    resolved = resolve_command("echo", args, env=env)
+    result = run_process(resolved, cwd=tmp_path, env=env, stdin=prompt)
     assert result.exit_code == 0
-    assert result.stdout == arg + "\r\n"
+    assert json.loads(result.stdout) == [args, prompt]
+
+
+@pytest.mark.skipif(not WINDOWS, reason="batch argument validation is Windows-only")
+def test_cmd_shim_rejects_newline_arguments(tmp_path: Path) -> None:
+    shim = tmp_path / "echo.cmd"
+    shim.write_text("@echo off\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="use stdin or a file"):
+        resolve_command(str(shim), ["safe\necho INJECTED"])
 
 
 # --- the invocation path: prompt on stdin or a file -------------------------------------------

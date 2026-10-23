@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -107,14 +108,33 @@ def _iter_candidates(
 def _cmd_shim_command_line(shim: str, args: Sequence[str], comspec: str) -> str:
     """Build the raw command line for a ``.cmd``/``.bat`` shim (Windows only).
 
-    ``subprocess.list2cmdline`` quotes each argument for the Windows command line; wrapping
-    the result in one extra pair of quotes makes ``cmd.exe /d /s /c`` strip exactly that
-    outer pair (its ``/s`` rule) and execute the inner, correctly-quoted command line. The
-    returned string must be passed to ``subprocess.Popen`` as a single string so it is *not*
-    re-quoted by a second ``list2cmdline`` pass.
+    Escape the shell command and both parsing passes of arguments forwarded with ``%*``.
+    Delayed expansion is disabled so exclamation marks stay literal. The outer quote pair
+    belongs to CMD's ``/s`` rule. Pass the result to ``Popen`` as a raw string to avoid
+    another Windows argument-quoting pass.
     """
-    inner = subprocess.list2cmdline([shim, *args])
-    return f'{comspec} /d /s /c "{inner}"'
+    inner = _cmd_shim_inner(shim, args)
+    return f'{subprocess.list2cmdline([comspec])} /d /s /v:off /c "{inner}"'
+
+
+_CMD_META = re.compile(r'([()\[\]%!^"`<>&|;, *?])')
+
+
+def _cmd_escape(value: str) -> str:
+    if any(ch in value for ch in "\r\n\0"):
+        raise ValueError("batch arguments cannot contain newlines or NUL; use stdin or a file")
+    return _CMD_META.sub(r"^\1", value)
+
+
+def _cmd_shim_inner(shim: str, args: Sequence[str]) -> str:
+    quoted: list[str] = []
+    for arg in args:
+        # Quote for the eventual native executable, then escape both CMD parsing passes:
+        # the outer /c invocation and the batch shim's %* expansion.
+        value = re.sub(r'(\\*)"', lambda match: match[1] * 2 + '\\"', arg)
+        value = re.sub(r"(\\+)$", lambda match: match[1] * 2, value)
+        quoted.append(_cmd_escape(_cmd_escape(f'"{value}"')))
+    return " ".join([_cmd_escape(shim), *quoted])
 
 
 def _wrap_cmd_shim(shim: str, args: Sequence[str], env: Mapping[str, str]) -> ResolvedCommand:
@@ -128,7 +148,7 @@ def _wrap_cmd_shim(shim: str, args: Sequence[str], env: Mapping[str, str]) -> Re
     comspec = env.get("COMSPEC", "cmd.exe")
     command_line = _cmd_shim_command_line(shim, args, comspec)
     return ResolvedCommand(
-        argv=(comspec, "/d", "/s", "/c", f'"{subprocess.list2cmdline([shim, *args])}"'),
+        argv=(comspec, "/d", "/s", "/v:off", "/c", f'"{_cmd_shim_inner(shim, args)}"'),
         windows_command_line=command_line,
     )
 
@@ -161,7 +181,7 @@ def resolve_command(
     extensions: tuple[str, ...] = ()
     if IS_WINDOWS:
         extensions = tuple(_split_pathext(effective.get("PATHEXT", _DEFAULT_PATHEXT)))
-    explicit = os.sep in cmd or (os.altsep is not None and os.altsep in cmd)
+    explicit = os.sep in cmd or bool(os.altsep and os.altsep in cmd)
 
     tried: list[str] = []
     for candidate in _iter_candidates(cmd, path_value, extensions, explicit):
@@ -371,8 +391,6 @@ def _wait_exit(popen: subprocess.Popen[str], grace: float) -> None:
 
 def _posix_killer(popen: subprocess.Popen[str]) -> Callable[[], None]:
     def kill_tree() -> None:
-        if popen.returncode is not None:
-            return
         if _killpg is None:
             with contextlib.suppress(OSError):
                 popen.kill()
@@ -380,9 +398,9 @@ def _posix_killer(popen: subprocess.Popen[str]) -> Callable[[], None]:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _killpg(popen.pid, signal.SIGTERM)
         _wait_exit(popen, _TERM_GRACE)
-        if popen.returncode is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                _killpg(popen.pid, signal.SIGKILL)
+        # The leader may exit while descendants keep running and hold the pipes open.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            _killpg(popen.pid, getattr(signal, "SIGKILL", 9))
 
     return kill_tree
 

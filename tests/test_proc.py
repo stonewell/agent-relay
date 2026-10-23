@@ -122,3 +122,21 @@ def test_timeout_kills_the_whole_process_tree() -> None:
     assert result.exit_code is None
     grandchild = int(result.stdout.strip().splitlines()[-1])
     assert wait_dead(grandchild), "the grandchild survived the timeout"
+
+
+@pytest.mark.skipif(WINDOWS, reason="POSIX process-group signal escalation")
+def test_timeout_kills_stubborn_descendant_after_parent_exits() -> None:
+    child_code = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('ready', flush=True); time.sleep(600)"
+    )
+    code = (
+        "import subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(600)\n"
+    )
+    result = run(code, timeout_s=1)
+    assert result.timed_out
+    grandchild = int(next(line for line in result.stdout.splitlines() if line.isdigit()))
+    assert wait_dead(grandchild)

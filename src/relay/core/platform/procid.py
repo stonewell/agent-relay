@@ -95,6 +95,8 @@ if sys.platform == "win32":
         _ct.POINTER(_FILETIME),
     ]
     _kernel32.GetProcessTimes.restype = _w.BOOL
+    _kernel32.GetExitCodeProcess.argtypes = [_w.HANDLE, _ct.POINTER(_w.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = _w.BOOL
     _kernel32.CloseHandle.argtypes = [_w.HANDLE]
     _kernel32.CloseHandle.restype = _w.BOOL
 
@@ -108,6 +110,11 @@ if sys.platform == "win32":
                 return IdentityState.DEAD, None
             return IdentityState.UNKNOWN, None  # access denied: exists, but marker unreadable
         try:
+            exit_code = _w.DWORD()
+            if not _kernel32.GetExitCodeProcess(handle, _ct.byref(exit_code)):
+                return IdentityState.UNKNOWN, None
+            if exit_code.value != 259:  # STILL_ACTIVE
+                return IdentityState.DEAD, None
             created = _FILETIME()
             exited = _FILETIME()
             kernel = _FILETIME()

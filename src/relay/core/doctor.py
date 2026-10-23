@@ -388,7 +388,8 @@ def _canary_args(
     if profile.adapter == "codex":
         return (("exec", *flags, "-C", str(work), "-"), prompt + "\n")
     if profile.adapter == "agy":
-        return (("-p", prompt, *flags), None)
+        # This probe is plain prose; keep its argv form safe for Windows batch shims.
+        return (("-p", prompt.replace("\n", " "), *flags), None)
     raise AssertionError(f"unknown canary adapter {profile.adapter!r}")
 
 
