@@ -8,7 +8,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.19 |
+| `design.md` | v0.24 |
 | `development-plan.md` | v0.4 |
 | `AGENTS.md` | v3 |
 
@@ -318,3 +318,71 @@ Review of the parsing and environment-building work in tasks 1.2, 1.3, 1.4, 1.8,
 | What changed | Where |
 |---|---|
 | Task-status rows added for 1.2, 1.3, 1.4, 1.8, 1.9, 1.10 and 1.11; 1.9 and 1.10 left `in progress` pending a live smoke run | development-plan.md |
+
+## Worktree and capture reconciliation (design v0.20)
+
+Reconciles the settled worktree-manager and change-capture decisions from the implemented code (tasks 1.14 and 1.15) into the design. No task ids were added or renumbered.
+
+| What changed | Where |
+|---|---|
+| Windows `auto` worktree root uses `<repo-hash>/<run-short>/<node-short>`, where `<run-short>` and `<node-short>` are deterministic truncate-and-hash shortenings, not a literal first-8-character run id (which can collide) | design section 8.3 |
+| Windows long-path handling enables the repo-local `extensions.worktreeConfig` switch and sets `core.longpaths` per worktree, so the main worktree is untouched beyond that one switch | design section 8.3 |
+| Submodule init is scoped with `-c protocol.file.allow=always` and is a hard error on failure; Git LFS is best-effort only when `git-lfs` exists and `.gitattributes` declares `filter=lfs`, with absence or failure recorded | design section 8.3 |
+| Cache isolation points `CARGO_TARGET_DIR` at `.agents/scratch/<run>/<node>/target`; credential-bearing homes (`CARGO_HOME`, `RUSTUP_HOME`, …) are passed through, never isolated | design section 8.3 |
+| Decommission contract: `decommission` vs `decommission_candidate` entry points, refusal of the main worktree and unregistered/unrelated paths, caller-policy retention, and creation-failure cleanup | design section 6 |
+| Change capture resolves `input_commit` to a canonical sha; the candidate is a detached worktree at a floating commit, and `candidate_tree` (not the floating commit) is the publication source | design section 8.3 |
+
+## Verifier and permission reconciliation (design v0.21)
+
+Reconciles the settled verifier and permission/doctor decisions from the implemented code (tasks 1.16, 1.20, 1.12) into the design. No task ids were added or renumbered.
+
+| What changed | Where |
+|---|---|
+| Default verifier mode: explicit executable `RunCheck` acceptance entries win, otherwise the configured `build`/`test`/`lint` commands run in that order, skipping unset entries; a `diff_scope` entry never counts as executable; a write node with no executable check is rejected before dispatch (`NoExecutableChecksError`) | design section 10 |
+| `verify: none` with a `verification_skip_reason` skips only command checks: the scope check is still enforced and a scope violation still fails; the outcome is `skipped` (recorded with its reason, never `passed`) and does not block publication | design section 10 |
+| Effective scope is the union of all `ScopeCheck.diff_scope` entries, else `owns`, else the whole repository; rename/copy sources and destinations, deletions, binary files, and literal directory prefixes or globs are all checked | design section 10 |
+| Command execution mechanics: platform-correct argv splitting (POSIX `shlex`, Windows `CommandLineToArgvW`), no shell, per-command `timeout_s` plus an optional overall timeout, `expect_output` as a stdout substring, candidate working directory, captured stdout/stderr/exit code | design section 10 |
+| Candidate-unchanged: the candidate HEAD must not move and tracked files must not change (`git status --porcelain`, untracked artifacts ignored); a mutation fails verification and verification never edits the published tree | design section 10 |
+| Permission precedence rejects unknown level values outright, so a misspelling cannot fall back to a default or wider level | design section 9.2 |
+| Claude, Codex and Antigravity currently advertise `full` only; a passing canary never auto-promotes a profile into `probe().levels` (promotion is a manual adapter change after `enforced`) | design section 9.3 |
+| Permission canaries classify `enforced|bypassed|inconclusive|unavailable|error` from filesystem evidence, never the exit code; a `readonly` canary ignores CLI-state writes outside the repository fixture; the result reports mapped flags and advertised status without changing `probe().levels` | design section 9.3 |
+| Session-resume canary confirms resume only on exact token equality; a mismatched follow-up is `inconclusive`, not proof (the unverified-session risks stay in section 17) | design section 7.3 |
+| Adapter canaries split by cost: `version` and `auth` are free, `structured`/`session`/`quoting` are paid and opt-in | design section 14 |
+
+## Output publication reconciliation (design v0.22)
+
+Reconciles the settled output-publication decisions from the implemented code (task 1.17, `src/relay/core/publish.py`) into the design. No task ids were added or renumbered.
+
+| What changed | Where |
+|---|---|
+| Output commit authored/committed by the orchestrator identity with a deterministic message and pinned timestamps; the node's output is pointed to by the `refs/relay/<run>/<node>` ref (replacing "advances the node branch"); no-change nodes reuse the input commit; the diff artifact is written at the fixed path `artifacts/diff.patch` with a deterministic pinned diff configuration | design section 8.3 |
+| Node refs: immutable per-attempt refs `refs/relay/<run>/<node>@<attempt>`, sibling (not descendant) retry outputs, idempotent same-attempt republish, refusal of same-attempt-different-content, compare-and-swap updates with rollback, and no backward movement of the current ref | design section 8.3 |
+| Integration branch named `refs/heads/relay/<run>/integration`; successful outputs only, deterministic ascending node-id order, fast-forward/no-op/real-merge ancestry, conflict raises before any write, never moved backward, compare-and-swap, duplicate node ids rejected, phase 1 refuses a rebuild | design section 8.3 |
+| Publication guards: refused unless verification allowed it, candidate-tree reserved runtime paths refused rather than stripped, ids validated before any ref write, `base`/`integration` reserved ref components, user's HEAD/branches never touched | design section 8.3 |
+| Worktree branch discrepancy reconciled: write-node worktrees are detached in phase 1; a branch-backed node worktree is tagged phase 2 | design section 8.3 |
+| Graph validation notes node ids may not be a reserved ref component | design section 8.1 |
+| Durable-snapshots summary names the integration branch by its full ref | design section 6 |
+
+## Route log reader reconciliation (design v0.23)
+
+Reconciles the settled `relay routes` and `relay explain` behaviour from the implemented code (task 1.5, `src/relay/cli/commands/routes.py`) into the design. No task ids were added or renumbered.
+
+| What changed | Where |
+|---|---|
+| Route-log readers documented as reading canonical `node.routed` events directly from each run's `events.jsonl`, never the projection, rather than only when a projection is missing | design section 4.4 |
+| Documented the phase-1 limitation that the entry persists `alternatives` but not `busy`/`exhausted` candidate lists, which surface only through the structured reason code (`include_goal: false`); phase 2 may add structured fields | design section 4.4 |
+| Observability pointer updated to state the direct-event read and defer to section 14 | design section 11 |
+| Command surface expanded with the full `relay routes` flag set (`--model`, `--category`, `--order`) and `relay explain --json`, plus prose for conjunctive filters, deterministic `(ts, run_id, seq, attempt)` ordering, `--tail`, the JSON output shapes, error behaviour, and `include_goal: false` printing | design section 14 |
+
+## Run loop, apply and inspection reconciliation (design v0.24)
+
+Reconciles the implemented foreground run loop (task 1.19 slices A and B1), git-mode `relay apply` (task 1.24) and the inspection and clean commands (task 1.22) into the design. No task ids were added or renumbered.
+
+| What changed | Where |
+|---|---|
+| `budget.max_attempts` stated as a total per-node limit with a phase-1 default of one attempt when unset; phase-1 retries pinned to the originally routed agent; every attempt emits the normal `routed` entry with its attempt number and there is no `retried` event; model escalation, cross-agent fallback and timeout policy tagged phase 2a | design section 8.2 |
+| Git-mode apply reconciled with the implementation: prepared-tree verification uses the run's recorded integration acceptance (or graph defaults) and reports not run when none are recorded and skipped when the graph opted out with a reason; `--force` is rejected; `--branch` updates an existing branch or creates a missing one without switching the checkout; confirmation and non-TTY exit 7; the delta is installed into the current branch's index and working tree; phase 1 has no journal or durable operation id, relying on re-preparation and the expected-ref compare-and-swap | design section 8.3 |
+| `apply.*` event names, fields, statuses and progress steps documented once in the catalog | design section 11 |
+| Inspection commands documented as implemented: `status`, `result`, `agents` and `clean` flags, JSON shapes and exit behaviour, including `--purge-runs` confirmation on a non-TTY (exit 7), skipping live runs, and never creating, replacing or unlinking lock objects | design sections 11, 14 |
+| Observability corrected: status renders the run record, event history and node table as implemented; cost reporting is tagged phase 4 | design section 11 |
+| Task status updated for 1.19 (slices A and B1), 1.22 and 1.24 | development-plan.md |

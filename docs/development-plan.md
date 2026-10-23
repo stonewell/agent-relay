@@ -271,11 +271,22 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.2 | done | 2026-10-22 | Agent router; review fixes (pinned/busy/exhausted, mixed prefer list); 1.2+1.3 tests 44 |
 | 1.3 | done | 2026-10-22 | Model router; escalation path and unavailable-default recheck; 44 tests across 1.2/1.3 |
 | 1.4 | done | 2026-10-22 | Route log, both projections, rebuild, redaction, `include_goal`; 31 tests |
+| 1.5 | done | 2026-10-22 | Events-first reads, cross-run filters, deterministic order, `--json`; 25 tests |
 | 1.7 | in progress | 2026-10-22 | Adapter interface, `resolve_command`/`resolveCommand` (PATH/PATHEXT/`.cmd` shims) and `relay.core.platform.proc` supervision with tree kill; Linux canary and tree-kill tests green, Windows canary still unrun (3 Windows-only tests skip) |
 | 1.8 | done | 2026-10-22 | Environment allowlist plus fail-closed `CompleteEnv`; 27 tests |
 | 1.9 | in progress | 2026-10-22 | Claude adapter, golden parsing/flags/session tests green; live smoke unrun because `RELAY_LIVE` was unset |
 | 1.10 | in progress | 2026-10-22 | Codex adapter, strict schema/JSONL/usage tests green; live smoke unrun because `RELAY_LIVE` was unset |
 | 1.11 | done | 2026-10-22 | Shared parsing, one repair per attempt, identity/operational-field trust enforced; full suite 690 passed / 6 skipped |
+| 1.12 | done | 2026-10-22 | Version/auth free; structured/session/quoting paid and opt-in; fake-CLI tests; real-CLI canaries still unrun |
 | 1.13 | done | 2026-10-22 | `relay.core.gitbase`: clean-tree pinning, synthetic `--allow-dirty` base with sensitive/`--exclude` filtering, `refs/relay/<run>/...`; 30 tests; `run.started` can consume `sensitive_paths`; exclude globs are per-segment, refs validated, dirty submodules reported for 1.14 |
+| 1.14 | done | 2026-10-22 | Input-commit pinning, short/long-path layout, submodule/LFS, cache env, decommission; Windows 300-char test skipped |
+| 1.15 | done | 2026-10-22 | Full delta, reserved-path exclusion, detached candidate worktree; 20 tests |
+| 1.16 | done | 2026-10-22 | Default build/test/lint, executable acceptance, scope, candidate-unchanged; 29 tests; Windows command splitting fixed, real Windows host unverified |
+| 1.17 | done | 2026-10-22 | Output commit, node refs, diff artifact and integration branch; F1-F6 review fixes applied; exercised end-to-end by 1.19a |
 | 1.18 | in progress | 2026-10-22 | `relay.core.runlock` + `platform.procid`: phase-1 exclusive-create lock (create-new semantics, `O_EXCL`) with PID and process-start identity, stale detection and retry/resume takeover; 17 tests green on Linux, Windows unverified; takeover writes atomically via temp file and replace |
+| 1.19 | in progress | 2026-10-22 | Slice A (single-node happy path, 7 tests) and slice B1 (same-agent retries with per-attempt archiving and `routed` events) done; B2 (fallback/escalation/timeout policy) pending |
+| 1.20 | done | 2026-10-22 | Cumulative precedence, fail-closed decisions, honest probe levels, banner; permission canaries opt-in |
+| 1.22 | done | 2026-10-22 | `status`/`result`/`agents`/`clean` read `run.json` and events directly; purge refuses live runs, needs `--yes` (exit 7) and never touches lock objects |
+| 1.24 | done | 2026-10-22 | Git-mode apply: prepared-tree verification, dirty overlap, expected-ref CAS, confirmation/`--yes` (exit 7), changed-path install and `apply.*` events |
+| 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 
