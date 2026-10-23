@@ -145,7 +145,7 @@ def _wrap_cmd_shim(shim: str, args: Sequence[str], env: Mapping[str, str]) -> Re
     inspection. ``run_process`` uses the raw string on Windows, never the list, so the inner
     quoting is preserved.
     """
-    comspec = env.get("COMSPEC", "cmd.exe")
+    comspec = next((value for name, value in env.items() if name.upper() == "COMSPEC"), "cmd.exe")
     command_line = _cmd_shim_command_line(shim, args, comspec)
     return ResolvedCommand(
         argv=(comspec, "/d", "/s", "/v:off", "/c", f'"{_cmd_shim_inner(shim, args)}"'),

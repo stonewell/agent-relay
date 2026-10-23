@@ -110,6 +110,11 @@ def test_cmd_shim_raw_command_line_preserves_embedded_quotes() -> None:
     assert r'\^^^"world\^^^"' in raw
 
 
+def test_cmd_shim_honors_mixed_case_comspec() -> None:
+    resolved = _wrap_cmd_shim("agent.cmd", [], {"ComSpec": "custom-cmd.exe"})
+    assert resolved.argv[0] == "custom-cmd.exe"
+
+
 @pytest.mark.skipif(not WINDOWS, reason=".cmd shims are Windows-only")
 def test_resolve_command_wraps_a_cmd_shim(tmp_path: Path) -> None:
     shim = tmp_path / "agent.cmd"

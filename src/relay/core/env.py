@@ -153,26 +153,35 @@ def build_env(
     """
     platform = sys.platform if platform is None else platform
     parent = dict(os.environ if parent_env is None else parent_env)
+    windows = _is_windows(platform)
+    lookup = {name.upper(): value for name, value in parent.items()} if windows else parent
 
     base: dict[str, str] = {}
-    base_vars = WINDOWS_BASE_VARS if _is_windows(platform) else POSIX_BASE_VARS
-    for name in base_vars:
-        if name in parent:
-            base[name] = parent[name]
-    for name in TOOLCHAIN_VARS:
-        if name in parent:
-            base[name] = parent[name]
+    base_vars = WINDOWS_BASE_VARS if windows else POSIX_BASE_VARS
+    named_vars = base_vars | TOOLCHAIN_VARS | CA_VARS | CONFIG_HOME_VARS
+    for name in named_vars:
+        key = name.upper() if windows else name
+        if key in lookup:
+            base[name] = lookup[key]
     for name in parent:
-        if name in CA_VARS or name.upper() in PROXY_VARS:
-            base[name] = parent[name]
-    for name in CONFIG_HOME_VARS:
-        if name in parent:
+        if name.upper() in PROXY_VARS:
             base[name] = parent[name]
 
+    layers = [base]
     if agent_config is not None:
-        base.update(agent_config.env)
+        layers.append(dict(agent_config.env))
     if extra_env:
-        base.update(extra_env)
+        layers.append(dict(extra_env))
+    if windows:
+        canonical = {name.upper(): name for name in named_vars}
+        folded: dict[str, tuple[str, str]] = {}
+        for layer in layers:
+            for name, value in layer.items():
+                folded[name.upper()] = (canonical.get(name.upper(), name), value)
+        base = dict(folded.values())
+    else:
+        for layer in layers[1:]:
+            base.update(layer)
 
     return CompleteEnv({name: value for name, value in base.items() if not is_supervisor_var(name)})
 

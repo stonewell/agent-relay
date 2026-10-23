@@ -139,6 +139,28 @@ def test_windows_variable_absent_from_parent_is_not_invented() -> None:
     assert "WinDir" not in built
 
 
+def test_windows_names_are_case_insensitive_and_use_canonical_spellings() -> None:
+    built = build_env(
+        parent_env={"SYSTEMROOT": "system-root", "Path": "tool-path", "codex_home": "config-home"},
+        platform="win32",
+    )
+    assert built == {
+        "SystemRoot": "system-root",
+        "PATH": "tool-path",
+        "CODEX_HOME": "config-home",
+    }
+
+
+def test_windows_overrides_replace_keys_without_case_duplicates() -> None:
+    built = build_env(
+        parent_env={"SYSTEMROOT": "original", "PATH": "original"},
+        agent_config=_Agent(env={"systemroot": "configured", "Path": "configured"}),
+        extra_env={"pAtH": "invocation", "relay_token": "must-not-leak"},
+        platform="win32",
+    )
+    assert built == {"SystemRoot": "configured", "PATH": "invocation"}
+
+
 def test_no_wholesale_parent_forwarding() -> None:
     parent = _full_parent()
     built = build_env(parent_env=parent, platform="linux")
