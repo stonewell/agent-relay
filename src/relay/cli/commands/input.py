@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import secrets
 import shlex
@@ -25,6 +26,7 @@ from relay.core.specs.task import TaskSpec
 from relay.core.store import RunStore, iso, read_text
 from relay.core.yamlio import load_yaml
 
+from .inspect_common import InspectError, check_run_id, load_run
 from .run import _positive_int, _print_result  # pyright: ignore[reportPrivateUsage]
 
 
@@ -48,7 +50,17 @@ def add_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser])
 
 def run(args: argparse.Namespace, repo_root: Path) -> int:
     try:
-        store = RunStore.open(repo_root, args.run_id)
+        try:
+            check_run_id(args.run_id)
+        except InspectError as exc:
+            raise ValueError(str(exc)) from exc
+        store = RunStore(repo_root, args.run_id)
+        if not store.run_dir.is_dir():
+            raise ValueError(
+                f"run {args.run_id!r} not found; run relay status to list available runs"
+            )
+        load_run(repo_root, args.run_id)
+
         if args.command == "reply":
             result = current_questions(store, args.node_id)
             if (args.answer is None) == (args.answers_file is None):
@@ -104,17 +116,19 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
                 raise ValueError("--max-attempts must not lower the total attempt limit")
             task.budget.max_attempts = limit
         config = Config.model_validate_json(read_text(store.path("config.snapshot.json")))
+        diagnostics = io.StringIO()
         outcome = asyncio.run(
             run_foreground(
                 repo_root,
                 task,
                 config=config,
                 resume_run=store.run_id,
+                err=diagnostics,
                 non_interactive=getattr(args, "non_interactive", False) or args.json,
                 out=sys.stderr if args.json else sys.stdout,
             )
         )
-        _print_result(outcome, as_json=args.json)
+        _print_result(outcome, as_json=args.json, diagnostics=diagnostics.getvalue())
         return outcome.exit_code
     except (ValueError, OSError, yaml.YAMLError) as exc:
         return _error(f"relay {args.command}: {exc}", 2, args.json)

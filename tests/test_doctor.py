@@ -326,4 +326,4 @@ def test_doctor_exits_one_on_a_failed_check_and_two_on_an_unknown_check(
     assert main(["-C", str(tmp_path), "doctor"]) == Exit.FAILURE
     capsys.readouterr()
     assert main(["-C", str(tmp_path), "doctor", "--check", "nope"]) == Exit.INVALID
-    assert "unknown check 'nope'" in capsys.readouterr().out
+    assert "unknown check 'nope'" in capsys.readouterr().err

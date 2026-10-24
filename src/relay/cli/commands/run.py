@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
@@ -94,12 +95,14 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
     except (ConfigError, ValueError, OSError, yaml.YAMLError) as exc:
         return _fail(f"relay run: {exc}", Exit.INVALID, args.json)
 
+    diagnostics = io.StringIO()
     try:
         result = asyncio.run(
             run_foreground(
                 repo_root,
                 task,
                 config=config,
+                err=diagnostics,
                 non_interactive=args.non_interactive or args.json,
                 cli_permissions=cli_permissions,
                 agent_permissions=agent_permissions,
@@ -112,7 +115,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
     except Exception as exc:  # noqa: BLE001 - the CLI never prints a traceback for a run
         return _fail(f"relay run: {exc}", Exit.FAILURE, args.json)
 
-    _print_result(result, as_json=args.json)
+    _print_result(result, as_json=args.json, diagnostics=diagnostics.getvalue())
     return int(Exit(result.exit_code))
 
 
@@ -204,10 +207,17 @@ def _parse_agent_permissions(value: str | None) -> dict[str, PermissionLevel] | 
     return parsed or None
 
 
-def _print_result(result: RunResult, *, as_json: bool) -> None:
+def _print_result(result: RunResult, *, as_json: bool, diagnostics: str = "") -> None:
+    if result.exit_code == Exit.BLOCKED and diagnostics:
+        print(diagnostics, file=sys.stderr, end="")
     if as_json:
         print(json.dumps(result.to_json(), indent=2, ensure_ascii=False))
         return
+    if not as_json and result.exit_code != Exit.OK:
+        print(
+            result.error or "; ".join(result.reasons) or f"run ended with exit {result.exit_code}",
+            file=sys.stderr,
+        )
     if result.exit_code == Exit.OK:
         print(
             f"run {result.run_id} node {result.node_id}: {result.node_status} "

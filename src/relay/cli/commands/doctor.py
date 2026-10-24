@@ -8,6 +8,7 @@ from pathlib import Path
 
 from relay.core.doctor import DoctorContext, default_registry, run_checks
 
+from ..errors import report_error
 from ..exitcodes import Exit
 
 
@@ -31,7 +32,10 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         )
     except KeyError as exc:
         known = ", ".join(c.id for c in registry)
-        print(f"relay doctor: unknown check {exc.args[0]!r} (known: {known})")
-        return Exit.INVALID
+        return report_error(
+            f"relay doctor: unknown check {exc.args[0]!r} (known: {known})",
+            Exit.INVALID,
+            args.json,
+        )
     print(report.to_json() if args.json else report.render_text())
     return Exit.FAILURE if report.exit_code else Exit.OK

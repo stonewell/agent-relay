@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -14,6 +16,7 @@ from .commands import apply as apply_command
 from .commands import clean as clean_command
 from .commands import doctor, result, routes, run, status
 from .commands import input as input_command
+from .errors import report_error
 from .exitcodes import Exit
 from .phases import COMMAND_PHASE, IMPLEMENTED, availability_error
 
@@ -39,21 +42,42 @@ def build_parser() -> argparse.ArgumentParser:
     for name in COMMAND_PHASE:
         if name not in IMPLEMENTED:
             stub = commands.add_parser(name, add_help=False)
+            stub.add_argument("--json", action="store_true")
             stub.add_argument("rest", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
-    if args.command is None:
-        parser.print_help(sys.stderr)
-        return Exit.INVALID
-    problem = availability_error(args.command)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    options = raw[: raw.index("--")] if "--" in raw else raw
+    as_json = "--json" in options
+    errors = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(errors) if as_json else contextlib.nullcontext():
+            args, unknown = parser.parse_known_args(raw)
+            problem = availability_error(args.command) if args.command else None
+            if problem is None and unknown:
+                parser.error("unrecognized arguments: " + " ".join(unknown))
+    except SystemExit as exc:
+        if as_json and exc.code:
+            report_error(errors.getvalue().strip(), Exit.INVALID, True)
+        raise
     if problem is not None:
-        print(problem, file=sys.stderr)
-        return Exit.INVALID
-    repo_root = Path(args.repo).resolve()
+        return report_error(problem, Exit.INVALID, as_json)
+    if args.command is None:
+        if not as_json:
+            parser.print_help(sys.stderr)
+        return report_error("relay: choose a command; run relay --help", Exit.INVALID, as_json)
+    try:
+        return _dispatch(args, Path(args.repo).resolve())
+    except KeyboardInterrupt:
+        return report_error("relay: cancelled by operator", Exit.CANCELLED, as_json)
+    except Exception as exc:  # noqa: BLE001 - the CLI boundary never emits a traceback
+        return report_error(f"relay {args.command}: {exc}", Exit.FAILURE, as_json)
+
+
+def _dispatch(args: argparse.Namespace, repo_root: Path) -> int:
     if args.command in ("reply", "resume"):
         return input_command.run(args, repo_root)
     if args.command == "agents":
