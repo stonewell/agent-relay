@@ -13,12 +13,24 @@ RunState = Literal["running", "done", "failed", "blocked", "cancelled", "interru
 NodeState = Literal["pending", "running", "done", "failed", "blocked", "cancelled"]
 
 
+class WorkerRecord(SpecModel):
+    pid: int = Field(gt=0)
+    start: int | None = None
+
+
 class NodeRecord(SpecModel):
     dir: str
     state: NodeState = "pending"
     blocked_reason: str | None = None
     attempts: int = Field(default=0, ge=0)
     active_duration_s: float = Field(default=0.0, ge=0)
+    attempt_started_at: str | None = None
+    attempt_timeout_s: float | None = None
+    question_revision: int = Field(default=0, ge=0)
+    process_tracking: bool = False
+    worker_pending: bool = False
+    worker: WorkerRecord | None = None
+    recovery_pending: bool = False
     input_key: str | None = None
     output_commit: Sha | None = None
 

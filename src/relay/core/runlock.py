@@ -161,7 +161,9 @@ def mark_interrupted(repo_root: Path, run_id: str) -> bool:
     alone (idempotent). If the run record does not exist there is nothing to mark.
     """
     try:
-        store = RunStore.open(repo_root, run_id)
+        store = RunStore(repo_root, run_id)
+        if not store.run_dir.is_dir():
+            return False
     except StoreError:
         return False
     record = store.read_run()

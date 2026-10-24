@@ -41,7 +41,9 @@ def add_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser])
     reply.add_argument("--resume", action="store_true")
     reply.add_argument("--yes", action="store_true")
     reply.add_argument("--json", action="store_true")
-    resume = subparsers.add_parser("resume", help="resume an answered single-node run")
+    resume = subparsers.add_parser(
+        "resume", help="resume an interrupted or answered single-node run"
+    )
     resume.add_argument("run_id")
     resume.add_argument("--max-attempts", type=_positive_int)
     resume.add_argument("--non-interactive", action="store_true")
@@ -123,6 +125,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
                 task,
                 config=config,
                 resume_run=store.run_id,
+                retry_failed=getattr(args, "retry_failed", False),
                 err=diagnostics,
                 non_interactive=getattr(args, "non_interactive", False) or args.json,
                 out=sys.stderr if args.json else sys.stdout,

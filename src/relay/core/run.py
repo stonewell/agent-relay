@@ -28,6 +28,8 @@ not rejected for missing executable checks, but their verification is recorded a
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import secrets
@@ -59,23 +61,34 @@ from relay.core.gitbase import (
     GitBaseError,
     InvalidRefError,
     NotARepositoryError,
+    read_ref,
     resolve_base,
 )
 from relay.core.gitexclude import ExcludeError, ensure_exclude_block
 from relay.core.model_router import NO_MODEL, select_model
 from relay.core.permissions import decide, format_banner, resolve_level
-from relay.core.publish import PublicationError, node_ref, publish, publish_integration
+from relay.core.platform.proc import observe_processes
+from relay.core.platform.procid import process_identity
+from relay.core.publish import (
+    PublicationError,
+    integration_branch,
+    node_ref,
+    publish,
+    publish_integration,
+)
+from relay.core.recovery import foreground_interrupts, prepare_interrupted
 from relay.core.registry import Config, snapshot
 from relay.core.route_log import RouteLog
 from relay.core.router import route_agent
 from relay.core.runlock import RunLock, RunLockError
+from relay.core.runrecord import WorkerRecord
 from relay.core.specs import load_spec
 from relay.core.specs.answers import AnswerValue, Submission
 from relay.core.specs.common import Access, NodeStatus, PermissionLevel
 from relay.core.specs.graph import Graph, GraphNode
 from relay.core.specs.result import Changes, ResultSpec, Verification, VerifyDetail
 from relay.core.specs.task import TaskCore, TaskSpec
-from relay.core.store import RunStore, StoreError, iso
+from relay.core.store import RunStore, StoreError, iso, sweep_temp_files
 from relay.core.verify import (
     NoExecutableChecksError,
     VerificationError,
@@ -239,15 +252,42 @@ class _AttemptRunner:
 
     async def run(self, attempt: int, model: str | None) -> RunResult | _AttemptFailure:
         started = time.monotonic()
+
+        def begin(record: Any) -> None:
+            record.nodes[self.node_id].attempt_started_at = iso(datetime.now(UTC))
+            record.nodes[self.node_id].attempt_timeout_s = self.timeout_s
+            record.nodes[self.node_id].recovery_pending = False
+            record.nodes[self.node_id].process_tracking = True
+
+        self.store.update_run(begin)
         try:
-            return await self._run(attempt, model)
+            with observe_processes(self._observe_process):
+                return await self._run(attempt, model)
         finally:
             duration = time.monotonic() - started
 
             def update(record: Any) -> None:
                 record.nodes[self.node_id].active_duration_s += duration
+                record.nodes[self.node_id].attempt_started_at = None
+                record.nodes[self.node_id].attempt_timeout_s = None
 
             self.store.update_run(update)
+
+    def _observe_process(self, phase: str, pid: int | None) -> None:
+        def change(record: Any) -> None:
+            node = record.nodes[self.node_id]
+            if phase == "starting":
+                node.worker_pending = True
+                node.worker = None
+            elif phase == "started" and pid is not None:
+                identity = process_identity(pid)
+                node.worker = WorkerRecord(pid=identity.pid, start=identity.start)
+                node.worker_pending = False
+            elif phase == "finished":
+                node.worker = None
+                node.worker_pending = False
+
+        self.store.update_run(change)
 
     async def _run(self, attempt: int, model: str | None) -> RunResult | _AttemptFailure:
         """Run the agent phase, then capture/verify/publish when the agent reported success."""
@@ -302,6 +342,11 @@ class _AttemptRunner:
         if result.status == "needs_input":
             self.question_revision += 1
             result.question_revision = self.question_revision
+            self.store.update_run(
+                lambda record: setattr(
+                    record.nodes[self.node_id], "question_revision", self.question_revision
+                )
+            )
             result.id = self.node_id
             result.agent = self.agent_name
             result.changes = Changes(input_commit=self.base_commit)
@@ -497,6 +542,7 @@ class _AttemptRunner:
                 self.worktree_manager.decommission_candidate(candidate_path)
 
 
+@foreground_interrupts
 async def run_foreground(
     repo_root: Path,
     task: TaskSpec,
@@ -514,6 +560,7 @@ async def run_foreground(
     err: TextIO | None = None,
     non_interactive: bool = False,
     resume_run: str | None = None,
+    retry_failed: bool = False,
 ) -> RunResult:
     """Run one node in the foreground and return a :class:`RunResult`.
 
@@ -542,7 +589,7 @@ async def run_foreground(
     access = _access(category, task.access)
     node_id = task.id
     try:
-        node_ref("run", node_id)
+        node_ref(resume_run or "run", node_id)
     except PublicationError as exc:
         return fail(EXIT_INVALID, str(exc))
 
@@ -655,7 +702,7 @@ async def run_foreground(
 
     try:
         store = (
-            RunStore.open(repo_root, resume_run)
+            RunStore(repo_root, resume_run)
             if resume_run is not None
             else RunStore.create(repo_root, config_hash=config_hash, run_id=run_id)
         )
@@ -676,14 +723,19 @@ async def run_foreground(
         task.budget.max_attempts if task.budget.max_attempts is not None else DEFAULT_MAX_ATTEMPTS
     )
     try:
-        lock = RunLock.acquire(repo_root, store.run_id)
+        lock = RunLock.acquire(repo_root, store.run_id, takeover=resume_run is not None)
         start_attempt_number = 1
         prior_revision = 0
         if resume_run is not None:
-            resume_state = _prepare_resume(store, task, max_attempts)
+            resume_state = _prepare_resume(store, task, max_attempts, retry_failed=retry_failed)
             if isinstance(resume_state, RunResult):
+                if resume_state.exit_code == EXIT_OK:
+                    worktree_manager.decommission_candidate(store.path(f"{node_id}/candidate"))
+                    worktree_manager.decommission(node_id)
                 return resume_state
             start_attempt_number, prior_revision = resume_state
+            sweep_temp_files(store.run_dir)
+            worktree_manager.decommission_candidate(store.path(f"{node_id}/candidate"))
         sensitive_paths: list[str] = []
         if resume_run is None:
             store.write_text("config.snapshot.json", config_text)
@@ -756,123 +808,31 @@ async def run_foreground(
             question_revision=prior_revision,
         )
 
-        last_reason = f"node {node_id} did not complete an attempt"
-        last_exit_code = EXIT_FAILURE
-        attempts_run = 0
-
-        for attempt in range(start_attempt_number, max_attempts + 1):
-            # Every retry goes back through the Router before it starts (section 8.2); with no
-            # escalation or cross-agent fallback in this slice it stays on the same agent.
-            if attempt > start_attempt_number:
-                retry_decision = route_agent(
-                    config,
-                    classification,
-                    pinned=agent_name,
-                    available=available,
-                    levels=levels,
-                    permissions=permission.effective,
-                    est_tokens=len(task.goal.split()),
-                    files=len(task.context.files) + len(task.owns),
-                    attempt=attempt,
-                )
-                if retry_decision.rejected or retry_decision.agent != agent_name:
-                    route_log.route(
-                        node_id=node_id,
-                        attempt=attempt,
-                        event="rejected",
-                        category=category,
-                        complexity=classification.complexity,
-                        agent_decision=retry_decision,
-                        executed=False,
-                    )
-                    last_reason = (
-                        f"attempt {attempt}: no eligible agent for the retry: "
-                        f"{retry_decision.reason}"
-                    )
-                    last_exit_code = EXIT_NO_AGENT
-                    break
-                retry_model = select_model(
-                    agent_config,
-                    classification,
-                    est_tokens=len(task.goal.split()),
-                    files=len(task.context.files) + len(task.owns),
-                    attempt=attempt,
-                )
-                model_decision = retry_model
-                resolved_model = retry_model.model
-                if model_tier is not None:
-                    resolved_model = agent_config.models.get(model_tier, model_tier)
-                task.routing.model = resolved_model
-                task.routing.effort = retry_model.effort
-                task.routing.model_rule = retry_model.model_rule
-                route_log.route(
-                    node_id=node_id,
-                    attempt=attempt,
-                    event="routed",
-                    category=category,
-                    complexity=classification.complexity,
-                    agent_decision=retry_decision,
-                    model_decision=retry_model,
-                    title=task.title,
-                    goal=task.goal,
-                )
-
-            if not _set_attempt_timeout(runner, effective_timeout):
-                return RunResult(
-                    EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("duration_exhausted",)
-                )
-            store.update_run(lambda record: setattr(record, "state", "running"))
-            attempts_run = attempt
-            _set_node(store, node_id, "running", attempts=attempt)
-            outcome = await runner.run(
-                attempt, None if resolved_model == NO_MODEL else resolved_model
-            )
-            if isinstance(outcome, RunResult):
-                if outcome.exit_code == EXIT_BLOCKED:
-                    outcome = _handle_input(
-                        runner, outcome, non_interactive, stdout, stderr, attempt, max_attempts
-                    )
-                    if outcome is None:
-                        continue
-                return outcome
-
-            # The attempt failed. Record it durably; the next iteration re-routes and starts a
-            # new attempt, whose `start_attempt` archives this attempt's result file.
-            if (
-                task.budget.max_duration_s is not None
-                and store.read_run().nodes[node_id].active_duration_s >= task.budget.max_duration_s
-            ):
-                _set_node(store, node_id, "blocked", blocked_reason="duration_exhausted")
-                store.update_run(lambda record: setattr(record, "state", "blocked"))
-                events.append("run.finished", {"state": "blocked"})
-                return RunResult(
-                    EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("duration_exhausted",)
-                )
-            last_reason = outcome.reason
-            last_exit_code = outcome.exit_code
-            events.append(
-                "warning",
-                {
-                    "message": last_reason,
-                    "node_id": node_id,
-                    "attempt": attempt,
-                    "exit": last_exit_code,
-                },
-            )
-            if attempt >= max_attempts or not outcome.retryable:
-                break
-
-        _set_node(store, node_id, "failed", attempts=attempts_run)
-        store.update_run(lambda record: setattr(record, "state", "failed"))
-        events.append("node.finished", {"node_id": node_id, "status": "failed"})
-        events.append("run.finished", {"state": "failed"})
+        return await _drive_attempts(
+            runner,
+            config,
+            classification,
+            available,
+            levels,
+            route_log,
+            resolved_model,
+            model_tier,
+            start_attempt_number,
+            max_attempts,
+            non_interactive,
+            stdout,
+            stderr,
+            effective_timeout,
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        store.update_run(lambda record: setattr(record, "state", "interrupted"))
+        EventLog(store.events_path).append("run.finished", {"state": "interrupted"})
         return RunResult(
-            exit_code=last_exit_code,
-            run_id=store.run_id,
-            node_id=node_id,
-            node_status="failed",
-            reasons=(last_reason,),
-            error=last_reason,
+            4,
+            store.run_id,
+            node_id,
+            "interrupted",
+            reasons=(f"resume with relay resume {store.run_id}",),
         )
     except RunLockError as exc:
         return fail(EXIT_FAILURE, str(exc), run_id=store.run_id)
@@ -1095,26 +1055,98 @@ def _handle_input(
 
 
 def _prepare_resume(
-    store: RunStore, task: TaskSpec, max_attempts: int
+    store: RunStore,
+    task: TaskSpec,
+    max_attempts: int,
+    *,
+    retry_failed: bool = False,
 ) -> tuple[int, int] | RunResult:
     record = store.read_run()
     node_id = task.id
-    if record.state != "blocked" or len(record.nodes) != 1 or node_id not in record.nodes:
-        raise ValueError("resume requires a blocked single-node input run")
-    pending = current_questions(store, node_id)
-    revision = pending.question_revision or 1
-    submissions = read_answers(store.node_dir(node_id), node_id).submissions
-    if not any(entry.question_revision == revision for entry in submissions):
-        raise ValueError("record answers with relay reply before resuming")
-    next_attempt = record.nodes[node_id].attempts + 1
+    if len(record.nodes) != 1 or node_id not in record.nodes:
+        raise ValueError("foreground resume requires exactly one recorded node")
+    node = record.nodes[node_id]
+    recovery = (
+        record.state == "interrupted"
+        or (record.state == "done" and record.final_commit is None)
+        or node.recovery_pending
+        or (retry_failed and record.state == "failed")
+    )
+    revision = max(
+        [
+            node.question_revision,
+            *[
+                entry.question_revision
+                for entry in read_answers(store.node_dir(node_id), node_id).submissions
+            ],
+        ]
+    )
+    with contextlib.suppress(OSError, ValueError):
+        previous = load_spec(ResultSpec, store.node_dir(node_id) / "result.spec.yaml")
+        if previous.status == "needs_input":
+            revision = max(revision, previous.question_revision or 1)
+    if recovery:
+        if not prepare_interrupted(store, node_id):
+            return RunResult(
+                EXIT_BLOCKED,
+                store.run_id,
+                node_id,
+                "blocked",
+                reasons=(
+                    f"worker_unconfirmed; inspect .agents/runs/{store.run_id}/run.json "
+                    "before resuming",
+                ),
+            )
+        if node.state == "done" and node.output_commit is not None:
+            return _finish_recovered_node(store, node_id, node.output_commit)
+        EventLog(store.events_path).append(
+            "warning", {"node_id": node_id, "message": "resuming interrupted foreground node"}
+        )
+    elif record.state == "blocked":
+        pending = current_questions(store, node_id)
+        revision = pending.question_revision or 1
+        submissions = read_answers(store.node_dir(node_id), node_id).submissions
+        if not any(entry.question_revision == revision for entry in submissions):
+            raise ValueError("record answers with relay reply before resuming")
+    else:
+        raise ValueError(
+            "resume requires an interrupted or answered blocked run; "
+            "use relay run --retry for a failed run"
+        )
+    next_attempt = node.attempts + 1
     if next_attempt > max_attempts:
         _set_node(store, node_id, "blocked", blocked_reason="attempts_exhausted")
+        store.update_run(lambda record: setattr(record, "state", "blocked"))
+        EventLog(store.events_path).append("run.finished", {"state": "blocked"})
         return RunResult(
-            EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("attempts_exhausted",)
+            EXIT_BLOCKED,
+            store.run_id,
+            node_id,
+            "blocked",
+            reasons=("attempts_exhausted; raise the total with relay resume --max-attempts N",),
         )
     original = load_spec(TaskSpec, store.node_dir(node_id) / "task.spec.yaml")
     task.repo.input_commit = original.repo.input_commit
     return next_attempt, revision
+
+
+def _finish_recovered_node(store: RunStore, node_id: str, output: str) -> RunResult:
+    if (
+        read_ref(store.repo_root, node_ref(store.run_id, node_id)) != output
+        or read_ref(store.repo_root, integration_branch(store.run_id)) != output
+    ):
+        raise PublicationError(
+            "completed node refs do not match the durable output; refusing redispatch"
+        )
+    record = store.read_run()
+    record.state = "done"
+    record.final_commit = output
+    record.nodes[node_id].recovery_pending = False
+    store.write_run(record)
+    EventLog(store.events_path).append(
+        "run.finished", {"state": "done", "integration_commit": output}
+    )
+    return RunResult(EXIT_OK, store.run_id, node_id, "done", output, output)
 
 
 def _set_attempt_timeout(runner: _AttemptRunner, timeout: float) -> bool:
@@ -1130,3 +1162,140 @@ def _set_attempt_timeout(runner: _AttemptRunner, timeout: float) -> bool:
         return False
     runner.timeout_s = min(timeout, remaining)
     return True
+
+
+async def _drive_attempts(
+    runner: _AttemptRunner,
+    config: Config,
+    classification: Classification,
+    available: Mapping[str, bool],
+    levels: Mapping[str, tuple[PermissionLevel, ...]],
+    route_log: RouteLog,
+    resolved_model: str,
+    model_tier: str | None,
+    start_attempt_number: int,
+    max_attempts: int,
+    non_interactive: bool,
+    stdout: TextIO,
+    stderr: TextIO,
+    effective_timeout: float,
+) -> RunResult:
+    store, node_id, task = runner.store, runner.node_id, runner.task
+    agent_name = runner.agent_name
+    agent_config = config.agents[agent_name]
+    events = runner.events
+    category = task.category
+    last_reason = f"node {node_id} did not complete an attempt"
+    last_exit_code = EXIT_FAILURE
+    attempts_run = 0
+
+    for attempt in range(start_attempt_number, max_attempts + 1):
+        # Every retry goes back through the Router before it starts (section 8.2); with no
+        # escalation or cross-agent fallback in this slice it stays on the same agent.
+        if attempt > start_attempt_number:
+            retry_decision = route_agent(
+                config,
+                classification,
+                pinned=agent_name,
+                available=available,
+                levels=levels,
+                permissions=runner.permission,
+                est_tokens=len(task.goal.split()),
+                files=len(task.context.files) + len(task.owns),
+                attempt=attempt,
+            )
+            if retry_decision.rejected or retry_decision.agent != agent_name:
+                route_log.route(
+                    node_id=node_id,
+                    attempt=attempt,
+                    event="rejected",
+                    category=category,
+                    complexity=classification.complexity,
+                    agent_decision=retry_decision,
+                    executed=False,
+                )
+                last_reason = (
+                    f"attempt {attempt}: no eligible agent for the retry: {retry_decision.reason}"
+                )
+                last_exit_code = EXIT_NO_AGENT
+                break
+            retry_model = select_model(
+                agent_config,
+                classification,
+                est_tokens=len(task.goal.split()),
+                files=len(task.context.files) + len(task.owns),
+                attempt=attempt,
+            )
+            resolved_model = retry_model.model
+            if model_tier is not None:
+                resolved_model = agent_config.models.get(model_tier, model_tier)
+            task.routing.model = resolved_model
+            task.routing.effort = retry_model.effort
+            task.routing.model_rule = retry_model.model_rule
+            route_log.route(
+                node_id=node_id,
+                attempt=attempt,
+                event="routed",
+                category=category,
+                complexity=classification.complexity,
+                agent_decision=retry_decision,
+                model_decision=retry_model,
+                title=task.title,
+                goal=task.goal,
+            )
+
+        if not _set_attempt_timeout(runner, effective_timeout):
+            return RunResult(
+                EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("duration_exhausted",)
+            )
+        store.update_run(lambda record: setattr(record, "state", "running"))
+        attempts_run = attempt
+        _set_node(store, node_id, "running", attempts=attempt)
+        outcome = await runner.run(attempt, None if resolved_model == NO_MODEL else resolved_model)
+        if isinstance(outcome, RunResult):
+            if outcome.exit_code == EXIT_BLOCKED:
+                outcome = _handle_input(
+                    runner, outcome, non_interactive, stdout, stderr, attempt, max_attempts
+                )
+                if outcome is None:
+                    continue
+            return outcome
+
+        # The attempt failed. Record it durably; the next iteration re-routes and starts a
+        # new attempt, whose `start_attempt` archives this attempt's result file.
+        if (
+            task.budget.max_duration_s is not None
+            and store.read_run().nodes[node_id].active_duration_s >= task.budget.max_duration_s
+        ):
+            _set_node(store, node_id, "blocked", blocked_reason="duration_exhausted")
+            store.update_run(lambda record: setattr(record, "state", "blocked"))
+            events.append("run.finished", {"state": "blocked"})
+            return RunResult(
+                EXIT_BLOCKED, store.run_id, node_id, "blocked", reasons=("duration_exhausted",)
+            )
+        last_reason = outcome.reason
+        last_exit_code = outcome.exit_code
+        events.append(
+            "warning",
+            {
+                "message": last_reason,
+                "node_id": node_id,
+                "attempt": attempt,
+                "exit": last_exit_code,
+            },
+        )
+        if attempt >= max_attempts or not outcome.retryable:
+            break
+
+    _set_node(store, node_id, "failed", attempts=attempts_run)
+    store.update_run(lambda record: setattr(record, "state", "failed"))
+    events.append("node.finished", {"node_id": node_id, "status": "failed"})
+    events.append("run.finished", {"state": "failed"})
+    return RunResult(
+        exit_code=last_exit_code,
+        run_id=store.run_id,
+        node_id=node_id,
+        node_status="failed",
+        reasons=(last_reason,),
+        error=last_reason,
+    )

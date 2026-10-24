@@ -29,6 +29,9 @@ _LEVELS = ("full", "workspace", "readonly")
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:  # pyright: ignore[reportPrivateUsage]
     parser = subparsers.add_parser("run", help="run one task in the foreground")
     parser.add_argument("request", nargs="?", metavar="REQUEST", help="the task to run")
+    parser.add_argument(
+        "--retry", metavar="RUN", help="retry a failed run using its recorded inputs"
+    )
     parser.add_argument("--task", metavar="FILE", help="load a YAML or JSON task spec")
     parser.add_argument("--agent", metavar="A", help="pin the node to this agent")
     parser.add_argument(
@@ -87,6 +90,47 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
 
 
 def run(args: argparse.Namespace, repo_root: Path) -> int:
+    if args.retry is not None:
+        from . import input as input_command
+
+        overrides = (
+            "request",
+            "task",
+            "agent",
+            "category",
+            "permissions",
+            "agent_permissions",
+            "model_tier",
+            "check",
+            "build",
+            "test",
+            "lint",
+            "verify",
+            "verification_skip_reason",
+            "timeout",
+        )
+        if (
+            any(getattr(args, name) is not None for name in overrides)
+            or args.allow_dirty
+            or args.exclude
+        ):
+            return _fail(
+                "relay run --retry uses recorded inputs; only --max-attempts, "
+                "--non-interactive and --json may be supplied",
+                Exit.INVALID,
+                args.json,
+            )
+        return input_command.run(
+            argparse.Namespace(
+                command="resume",
+                run_id=args.retry,
+                max_attempts=args.max_attempts,
+                non_interactive=args.non_interactive,
+                json=args.json,
+                retry_failed=True,
+            ),
+            repo_root,
+        )
     try:
         config = load_config(project_root=repo_root).config
         task = _task_spec(args, repo_root)
