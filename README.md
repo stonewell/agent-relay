@@ -24,7 +24,8 @@ sections 7, 9 and 10. `doctor` runs model-calling checks only when explicitly se
 in the command reference.
 
 Completed tasks, validation evidence and remaining release work are recorded only in the
-[task status](docs/development-plan.md#task-status) section. Offline tests and recorded outputs
+[task status](docs/development-plan.md#task-status) section. For sequencing, use the plan's
+[remaining-work order](docs/development-plan.md#remaining-work-in-order). Offline tests and recorded outputs
 provide different evidence from live runs; see the [fixture guide](tests/fixtures/recorded/README.md).
 
 ## Run a task and apply it

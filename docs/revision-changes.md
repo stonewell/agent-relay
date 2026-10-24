@@ -9,7 +9,7 @@ Section references (`section N`) in older entries point into `design.md` as it w
 | Document | Version |
 |---|---|
 | `design.md` | v0.28 |
-| `development-plan.md` | v0.8 |
+| `development-plan.md` | v0.9 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
@@ -461,3 +461,11 @@ This revision records local validation already performed; it does not claim a ne
 | UX2 / P1 | Foreground resume could answer questions but could not recover an interrupted attempt or explicitly retry a failed run. | Defined bounded whole-attempt recovery and process-identity safeguards in design sections 6 and 14 for task 1.23. |
 | UX3 / P1 | Interruption could lose the question-set counter and make later questions reuse an old revision. | Persisted the counter and preserved prior answer/result revisions during recovery; design sections 6 and 8.2. |
 | UX4 / P2 | Remaining-work ordering still listed completed implementation and mixed it with deferred validation. | Reconciled the development-plan Task status section and refreshed the README recovery examples. |
+
+## Dependency and remaining-work review (plan v0.9)
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| DP1 / P2 | The milestone summary serialized CI before independent foundation implementation and overstated supervisor dependencies for later phases. | Replaced the summary with the dependencies and exit gates expressed by the task tables. |
+| DP2 / P2 | The remaining-work section omitted optional work available during the validation deferral and could read as a strict sequence between independent checks. | Separated optional implementation, deferred MVP closure and post-M2 work; identified independent CI, adapter and walkthrough checks. |
+| DP3 / P2 | The acceptance wording for 1.26 and 1.30 did not fully express their existing nightly-automation and final-sign-off scope. | Tightened those task rows without changing task IDs, priorities or phase scope. |

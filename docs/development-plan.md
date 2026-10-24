@@ -33,7 +33,9 @@ This plan splits the phases in design section 16 into tasks, orders them by prio
 | **M6 Breadth** | Antigravity/Gemini, Cursor, cost accounting, shadow-git | 4 |
 | **M7 Gateway** | Provider gateway, LLM planner | 5 |
 
-Critical path to M2: `0.1 -> 0.2 -> 0.3/0.4 -> 0.5 -> 1.x pipeline -> 1.24/1.31 -> 1.30`. Everything in phases 2 to 5 depends on M2; phases 3 to 5 depend on M4 (except Antigravity/Gemini and Cursor adapters, which need only M2).
+Task dependencies in the phase tables define implementation order. CI task 0.2 is an M0/M2 exit gate, rather than a prerequisite for independent schema and core implementation. M2 sign-off in 1.30 also requires every phase-1 P0/P1 exit check; completed downstream implementation does not close an outstanding adapter or CI validation gate.
+
+All phases after phase 1 wait for M2. Phase 2b additionally waits for M3, and phase 3 waits for M4. Phase-4 and phase-5 tasks use their individual milestone dependencies below; they do not all require the background supervisor.
 
 ---
 
@@ -122,11 +124,11 @@ Goal: `relay run "<request>"` routes a task, runs Claude or Codex in an isolated
 | ID | Task | Pri | Size | Depends | Design | Done when |
 |---|---|---|---|---|---|---|
 | 1.25 | Integration suite on a temp git repo with the stub CLI: full run, same-agent retry, verification failure and foreground input paths; phase-2 routing extensions belong to 2.8 | P0 | L | 1.19, 1.21, 1.31 | 16 | Suite runs in CI on both OSes |
-| 1.26 | Live smoke tests (`RELAY_LIVE=1`) for Claude and Codex, run manually and nightly where credentials exist | P1 | S | 1.9, 1.10 | 16 | Documented procedure; passes on the reference machine |
+| 1.26 | Live smoke tests (`RELAY_LIVE=1`) for Claude and Codex, run manually and nightly where credentials exist | P1 | S | 1.9, 1.10 | 16 | Documented procedure and nightly coverage implemented; reference smoke tests pass |
 | 1.27 | Windows hardening pass: spawn, paths, env, tree kill, locks, line endings | P0 | M | 1.14, 1.18 | 7.2, 9.4 | Whole phase 1 suite green on Windows |
 | 1.28 | User docs: quickstart, `agents.yaml` reference, command reference, troubleshooting, known limits (Windows `full` only, no graphs) | P1 | M | 1.24 | all | A new user completes a run and an apply from the docs alone |
 | 1.29 | Error handling and UX polish: actionable messages, `--json` output for all commands, `available from phase N` errors for later commands | P1 | M | 1.19, 1.22 | 14, 16 | Argument, configuration, runtime, approval and later-phase error paths follow section 14 in text and JSON modes |
-| 1.30 | MVP acceptance run: scripted scenarios on the reference machine (simple feature, bugfix with same-agent retry, ambiguous task with `needs_input`, failed verification, apply with dirty tree) | P0 | M | 1.24, 1.25, 1.27, 1.31 | 16 | All scenarios pass (**M2**) |
+| 1.30 | MVP acceptance run and sign-off: scripted scenarios on the reference machine (simple feature, bugfix with same-agent retry, ambiguous task with `needs_input`, failed verification, apply with dirty tree) | P0 | M | 1.24, 1.25, 1.27, 1.31 | 16 | All five scenarios and every phase-1 exit criterion pass (**M2**) |
 | 1.31 | CLI intake for authorized verification and attempt limits | P0 | M | 1.16, 1.19 | 14, 10, 8.2 | A command-line write request can receive authorized verification and limit inputs, complete through apply without a Python caller, and still rejects missing checks |
 
 **Exit criteria (M2):** all tasks P0 and P1 done; the five acceptance scenarios in 1.30 pass on Windows and Linux; the phase 1 test areas in design section 16 are green; known limits are documented.
@@ -303,11 +305,33 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 
 ### Remaining work in order
 
-The remaining phase-1 work below is held under the operator's validation deferral.
-When that work resumes, follow the dependency order:
+The status table above is the source for completed work and validation evidence. The following
+sequence preserves the operator's validation deferral; it does not waive milestone gates or
+restart completed tasks.
 
-1. **0.2 and 1.10:** obtain remote CI and successful live Codex evidence.
-2. **1.21 and 1.25:** close their remaining adapter/CI validation gates.
-3. **1.26:** finish paired live smoke sign-off and credential-enabled nightly automation.
-4. **1.28:** review the documented walkthrough with an authenticated CLI and a new user.
-5. **1.30:** complete final acceptance and M2 sign-off after all required phase-1 tasks close.
+**Available implementation while validation is held**
+
+1. **1.6 (P2):** implement `relay run --dry-run` and preview route entries. This is optional and does not block M2.
+
+The other remaining foundation spike, **0.12 (P2)**, involves permission-profile validation and
+stays outside the active implementation queue under the current deferral. Task **1.26** still
+has nightly automation work, but that validation workstream is also held.
+
+**Required MVP closure when validation resumes**
+
+1. **0.2 (P0):** obtain a green remote Windows/Linux CI run. This can proceed independently of 1.10.
+2. **1.10 (P0):** complete successful live Codex structured-output and session-resume checks.
+3. **1.21 (P0):** complete the remaining Codex clarification canary after 1.10.
+4. **1.25 (P0):** confirm integration coverage in CI after 0.2 and 1.21 close.
+5. **1.26 (P1):** finish paired live smoke sign-off and nightly automation after 1.10.
+6. **1.28 (P1):** complete the authenticated new-user walkthrough; its implementation prerequisite, 1.24, is already done, so it can also proceed independently of the CI/Codex checks.
+7. **1.30 (P0):** finalize acceptance and M2 sign-off after the required phase-1 tasks close.
+
+**Next implementation phase after M2**
+
+1. **2.1:** graph validation.
+2. **2.2, 2.3 and 2.4:** scheduler, overlap handling and dependency snapshots, once 2.1 is done.
+3. **2.5:** verified merge nodes after 2.4.
+4. **2.6 and 2.7:** conflict resolution and final integration after 2.5.
+5. **2.8, 2.9 and 2.10:** retry/fallback policy, reuse/invalidation and planning, with their table prerequisites satisfied.
+6. **2.11:** foreground graph resume/cancel after 2.2 and 2.9; then assess M3 before phase 2b.
