@@ -125,7 +125,7 @@ Goal: `relay run "<request>"` routes a task, runs Claude or Codex in an isolated
 | 1.26 | Live smoke tests (`RELAY_LIVE=1`) for Claude and Codex, run manually and nightly where credentials exist | P1 | S | 1.9, 1.10 | 16 | Documented procedure; passes on the reference machine |
 | 1.27 | Windows hardening pass: spawn, paths, env, tree kill, locks, line endings | P0 | M | 1.14, 1.18 | 7.2, 9.4 | Whole phase 1 suite green on Windows |
 | 1.28 | User docs: quickstart, `agents.yaml` reference, command reference, troubleshooting, known limits (Windows `full` only, no graphs) | P1 | M | 1.24 | all | A new user completes a run and an apply from the docs alone |
-| 1.29 | Error handling and UX polish: actionable messages, `--json` output for all commands, `available from phase N` errors for later commands | P1 | M | 1.19, 1.22 | 14, 16 | Later commands print the phase error |
+| 1.29 | Error handling and UX polish: actionable messages, `--json` output for all commands, `available from phase N` errors for later commands | P1 | M | 1.19, 1.22 | 14, 16 | Argument, configuration, runtime, approval and later-phase error paths follow section 14 in text and JSON modes |
 | 1.30 | MVP acceptance run: scripted scenarios on the reference machine (simple feature, bugfix with same-agent retry, ambiguous task with `needs_input`, failed verification, apply with dirty tree) | P0 | M | 1.24, 1.25, 1.27, 1.31 | 16 | All scenarios pass (**M2**) |
 | 1.31 | CLI intake for authorized verification and attempt limits | P0 | M | 1.16, 1.19 | 14, 10, 8.2 | A command-line write request can receive authorized verification and limit inputs, complete through apply without a Python caller, and still rejects missing checks |
 
@@ -257,7 +257,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 
 | ID | Status | Date | Note |
 |---|---|---|---|
-| 0.1 | done | 2026-10-23 | Latest full suites: Windows/Python 3.11, 1,164 passed and 10 skipped; Linux via WSL/Python 3.12, 1,161 passed and 11 skipped; follow-up input tests, build and local static checks pass |
+| 0.1 | done | 2026-10-23 | Latest full suites: Windows/Python 3.11, 1,194 passed and 11 skipped; Linux via WSL/Python 3.12, 1,192 passed and 11 skipped; follow-up recovery/input tests, build and local static checks pass |
 | 0.2 | in progress | 2026-10-23 | Deferred at operator request; minimum/latest Python matrix and cache updates prepared; local matrix checks pass; a green remote run is still required and failed-log downloads require additional repository access |
 | 0.3 | done | 2026-10-22 | `relay.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; reserved-scope check is host-independent and conservative (case, globs, Windows aliases) with regression tests |
 | 0.4 | done | 2026-10-22 | `relay.core.registry` and `relay.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
@@ -289,10 +289,13 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 1.20 | done | 2026-10-23 | Permission policy and disposable canary tests pass on Windows and Linux; live canaries remain opt-in |
 | 1.21 | in progress | 2026-10-23 | Foreground CLI/TTY protocol implemented and tested; live Claude clarification doctor check passes; the Codex live check remains deferred with 1.10 |
 | 1.22 | done | 2026-10-22 | `status`/`result`/`agents`/`clean` read `run.json` and events directly; purge refuses live runs, needs `--yes` (exit 7) and never touches lock objects |
+| 1.23 | done | 2026-10-23 | Whole-attempt resume, explicit retry, cancellation and owner-death regressions pass on Windows/Linux; legacy and unknown-process safeguards covered |
 | 1.24 | done | 2026-10-23 | Git-mode apply complete; staged-edit preservation, dirty-baseline and separate-branch delivery regressions pass |
 | 1.25 | in progress | 2026-10-23 | Integration and five-scenario acceptance suites pass locally on Windows and Linux; remote CI confirmation remains deferred under 0.2 |
+| 1.26 | in progress | 2026-10-23 | Validation work deferred at operator request; opt-in tests and procedure exist, with nightly automation and paired live sign-off outstanding |
 | 1.27 | done | 2026-10-23 | Full Windows suite, foreground acceptance scenarios, long paths, process trees, locks and schema-through-batch regression checks pass |
-| 1.28 | in progress | 2026-10-23 | README walkthrough, input examples, reference links and troubleshooting complete; direct and input paths rehearse successfully with fake workers; authenticated new-user walkthrough remains |
+| 1.28 | in progress | 2026-10-23 | README walkthrough, input examples, reference links and troubleshooting complete; direct and input paths rehearse successfully with fake workers; authenticated new-user walkthrough deferred at operator request |
+| 1.29 | done | 2026-10-23 | Text/JSON argument, phase, missing-run, approval and handler-error regression checks pass locally |
 | 1.30 | in progress | 2026-10-23 | All five stub-CLI scenarios pass on Windows and Linux; M2 sign-off still awaits the deferred CI/Codex checks and remaining P1 release work |
 | 1.31 | done | 2026-10-23 | Validated request/spec intake, verification policy persistence, limits, worker requirements and end-to-end apply regressions pass |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
@@ -300,11 +303,11 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 
 ### Remaining work in order
 
-The current order preserves the requested deferrals. Task status and validation evidence are
-recorded in the table above; phase dependencies still gate later milestones.
+The remaining phase-1 work below is held under the operator's validation deferral.
+When that work resumes, follow the dependency order:
 
-1. **1.28:** review the documented walkthrough with an authenticated CLI and a new user.
-2. **1.29:** complete CLI error and JSON-output consistency checks.
-3. **1.23:** implement and exercise interrupted single-node recovery; this is separate from the answered-input resume already covered by 1.21.
-4. **1.26:** complete the live-smoke procedure and automation where credentials are available, after 1.10 is resumed.
-5. **0.2 and 1.10:** resume only when requested; then close the remaining validation for 1.21 and 1.25 and finalize 1.30/M2.
+1. **0.2 and 1.10:** obtain remote CI and successful live Codex evidence.
+2. **1.21 and 1.25:** close their remaining adapter/CI validation gates.
+3. **1.26:** finish paired live smoke sign-off and credential-enabled nightly automation.
+4. **1.28:** review the documented walkthrough with an authenticated CLI and a new user.
+5. **1.30:** complete final acceptance and M2 sign-off after all required phase-1 tasks close.

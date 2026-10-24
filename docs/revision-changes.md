@@ -8,8 +8,8 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.27 |
-| `development-plan.md` | v0.7 |
+| `design.md` | v0.28 |
+| `development-plan.md` | v0.8 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
@@ -452,3 +452,12 @@ This revision records local validation already performed; it does not claim a ne
 | UG2 / P2 | Foreground questions lacked user-facing examples for replies, answer files and explicit limit increases. | Added a reply/resume walkthrough and links to the canonical contracts. |
 | UG3 / P2 | The source-layout sketch omitted the foreground answer module and the command overview omitted existing doctor options. | Reconciled wording in design sections 14 and 15; no behavior changed. |
 | UG4 / P2 | Remaining work was spread across individual statuses without an order reflecting the requested deferrals. | Updated task 1.28 and added the remaining-work order inside the development plan's Task status section. |
+
+## CLI error handling and foreground recovery (design v0.28, plan v0.8)
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| UX1 / P2 | Parser, unknown-check and phase errors did not consistently honor JSON mode, and handler exceptions could escape. | Defined the command error boundary in design section 14 and expanded the acceptance check for task 1.29. |
+| UX2 / P1 | Foreground resume could answer questions but could not recover an interrupted attempt or explicitly retry a failed run. | Defined bounded whole-attempt recovery and process-identity safeguards in design sections 6 and 14 for task 1.23. |
+| UX3 / P1 | Interruption could lose the question-set counter and make later questions reuse an old revision. | Persisted the counter and preserved prior answer/result revisions during recovery; design sections 6 and 8.2. |
+| UX4 / P2 | Remaining-work ordering still listed completed implementation and mixed it with deferred validation. | Reconciled the development-plan Task status section and refreshed the README recovery examples. |

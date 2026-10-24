@@ -122,6 +122,27 @@ provenance and limits are defined in
 [section 8.2](docs/design.md#82-scheduling); reply flags are in
 [section 14](docs/design.md#14-relay-cli).
 
+## Recover an interrupted or failed run
+
+After an interruption, use the recorded run ID to resume. Increase the total attempt cap
+explicitly if the interrupted attempt used the available budget:
+
+```sh
+uv run relay -C ../relay-demo resume RUN --max-attempts 3 --non-interactive --json
+```
+
+To retry a failed run using its recorded task and configuration:
+
+```sh
+uv run relay -C ../relay-demo run --retry RUN --max-attempts 3 --non-interactive --json
+```
+
+Recovery and its process-identity safeguards are defined in
+[section 6](docs/design.md#6-context-exchange-and-run-store). If the blocked reason is
+`worker_unconfirmed`, inspect the recorded worker in `.agents/runs/RUN/run.json` and resolve
+its termination before retrying. Command flags and exit codes are in
+[section 14](docs/design.md#14-relay-cli).
+
 ## Configuration and troubleshooting
 
 | Reference | Where to look |
@@ -142,7 +163,7 @@ provenance and limits are defined in
 | Blocked for input (exit 6) | Follow the reply/resume walkthrough above and inspect the blocked reason. |
 | Approval required (exit 7) | Review the prepared operation and use the confirmation command printed by Relay. |
 | Dirty starting tree or overlapping edits during apply | Follow the snapshot and delivery rules in section 8.3; preserve your edits before retrying. |
-| Interrupted run | Consult section 14's current resume boundary; input resume and interruption recovery have different scopes. |
+| Interrupted or failed run | Use the recovery walkthrough above; the recorded attempt count is retained. |
 
 ## Layout
 
