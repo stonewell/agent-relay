@@ -42,6 +42,12 @@ class ProcessIdentity:
     start: int | None  # None when the start marker could not be read
 
 
+def process_identity(pid: int) -> ProcessIdentity:
+    """Snapshot a child identity for durable foreground recovery."""
+    state, marker = _probe(pid)
+    return ProcessIdentity(pid=pid, start=marker if state is IdentityState.ALIVE else None)
+
+
 def current_identity() -> ProcessIdentity:
     """Identity of the calling process."""
     pid = os.getpid()

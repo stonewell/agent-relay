@@ -24,7 +24,8 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -437,6 +438,10 @@ class SupervisedProcess:
         self._started = time.monotonic()
 
     @property
+    def pid(self) -> int:
+        return self._popen.pid
+
+    @property
     def returncode(self) -> int | None:
         return self._popen.returncode
 
@@ -459,6 +464,10 @@ class SupervisedProcess:
                 timed_out = True
                 self.kill_tree()
                 stdout, stderr = self._popen.communicate()
+        except BaseException:
+            self.kill_tree()
+            self._popen.communicate()
+            raise
         finally:
             self._close()
         return ProcessResult(
@@ -524,7 +533,23 @@ def _spawn(
         errors="replace",
         start_new_session=True,
     )
-    return SupervisedProcess(popen, _posix_killer(popen), lambda: None)
+    return SupervisedProcess(popen, _posix_killer(popen), _posix_killer(popen))
+
+
+ProcessObserver = Callable[[str, int | None], None]
+_PROCESS_OBSERVER: ContextVar[ProcessObserver | None] = ContextVar(
+    "relay_process_observer", default=None
+)
+
+
+@contextlib.contextmanager
+def observe_processes(observer: ProcessObserver) -> Generator[None]:
+    """Observe managed children within a foreground attempt, including repair and verification."""
+    token = _PROCESS_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _PROCESS_OBSERVER.reset(token)
 
 
 def run_process(
@@ -543,4 +568,19 @@ def run_process(
     the prompt text piped to the child's stdin and then closed; otherwise stdin is closed
     immediately so the child cannot hang waiting for input.
     """
-    return _spawn(argv, cwd=cwd, env=env).run(stdin, timeout_s)
+    observer = _PROCESS_OBSERVER.get()
+    if observer is not None:
+        observer("starting", None)
+    process = _spawn(argv, cwd=cwd, env=env)
+    try:
+        if observer is not None:
+            observer("started", process.pid)
+    except BaseException:
+        process.kill_tree()
+        process.run()
+        raise
+    try:
+        return process.run(stdin, timeout_s)
+    finally:
+        if observer is not None:
+            observer("finished", process.pid)
