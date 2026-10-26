@@ -557,6 +557,32 @@ def permission_canary_check(profile: PermissionProfile, cmd: str) -> Check:
     )
 
 
+def coordinator_canary_check(cmd: str) -> Check:
+    """A `paid` doctor check for the tool-free Claude coordinator profile (design 7.4).
+
+    Evidence for a reviewed qualification record only; it never creates one.
+    """
+
+    async def run(_ctx: DoctorContext) -> CheckResult:
+        from .coordinator_canary import run_coordinator_canary
+
+        result = await asyncio.to_thread(run_coordinator_canary, cmd)
+        remedy = _REMEDIES[result.outcome]
+        if result.outcome == "unavailable":
+            remedy = "install claude and run `relay doctor --check coordinator.claude`"
+        data = {"adapter": "claude", "outcome": result.outcome, "note": result.note}
+        summary = f"claude coordinator tool-free profile: {result.outcome} — {result.note}"
+        return CheckResult(_STATUS_FOR[result.outcome], summary, remedy=remedy, data=data)
+
+    return Check(
+        "coordinator.claude",
+        "claude coordinator tool-free profile",
+        run,
+        paid=True,
+        timeout_s=CANARY_TIMEOUT_S + 15.0,
+    )
+
+
 # --- adapter canaries (design sections 7, 14, 17; task 1.12) ---------------------------------
 
 AdapterCanaryOutcome = Literal["passed", "failed", "inconclusive", "unavailable", "error"]
@@ -1287,6 +1313,11 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
                     continue
                 cmd = agent.cmd
             registry.register(permission_canary_check(profile, cmd))
+        claude_agent = loaded.config.agents.get("claude")
+        if claude_agent is None or claude_agent.enabled:
+            registry.register(
+                coordinator_canary_check(claude_agent.cmd if claude_agent else "claude")
+            )
         # Adapter canaries (task 1.12): version and auth run free; structured, session and
         # quoting are `paid`. A disabled agent skips its canaries, and an adapter with no
         # agent entry (Antigravity) is probed with its default command so it reports
