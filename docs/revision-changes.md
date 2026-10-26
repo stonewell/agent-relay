@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.28 |
-| `development-plan.md` | v0.9 |
+| `design.md` | v0.30 |
+| `development-plan.md` | v0.12 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.30 / plan v0.12: added the phase-2c foreground interactive coordinator and Textual TUI, with milestone M8 and implementation tasks 2.20–2.29; narrowed task 5.4 to the advanced provider-backed planner extension. Details are recorded below.
 
 v0.10 review: git-local exclusion of runtime state, Windows path-length handling, estimated-cost labeling for defaulted pricing rates, unverified session-id fields marked, complete event catalog, default escalation order, approval-required exit code, defined `risk`/`rerouted`/`cost_ceiling` inputs, sensitive-file confirmation for `--allow-dirty`, and a precise reserved-path rule. Findings and resolutions are recorded in section 24.
 
@@ -469,3 +471,45 @@ This revision records local validation already performed; it does not claim a ne
 | DP1 / P2 | The milestone summary serialized CI before independent foundation implementation and overstated supervisor dependencies for later phases. | Replaced the summary with the dependencies and exit gates expressed by the task tables. |
 | DP2 / P2 | The remaining-work section omitted optional work available during the validation deferral and could read as a strict sequence between independent checks. | Separated optional implementation, deferred MVP closure and post-M2 work; identified independent CI, adapter and walkthrough checks. |
 | DP3 / P2 | The acceptance wording for 1.26 and 1.30 did not fully express their existing nightly-automation and final-sign-off scope. | Tightened those task rows without changing task IDs, priorities or phase scope. |
+
+## Foreground graph implementation priority (plan v0.10)
+
+| What changed | Where |
+|---|---|
+| Moved deferred MVP closure behind foreground graph implementation at operator request and lowered its remaining P0 tasks to P1. | Development-plan task tables and Remaining work in order |
+| Replaced task 2.1's release-milestone dependency with completed implementation prerequisites, while retaining MVP closure for graph milestone sign-off. | Development-plan milestone dependencies, task 2.1 and M3 exit criteria |
+| Moved optional dry-run work behind the active graph queue and preserved existing validation deferrals. | Development-plan Remaining work in order |
+
+## Foreground graph coordination (design v0.29, plan v0.11)
+
+| What changed | Where |
+|---|---|
+| Clarified graph depth, portable IDs, priority and worker pinning, and corrected the example depth bound. | Design section 8.1 |
+| Specified foreground graph intake, effective setting inheritance, planning output, replies, resume limits and file-based cancellation; distinguished foreground ownership from the future supervisor. | Design sections 8.6 and 14 |
+| Added graph validation, scheduling, reservations, dependency snapshots, verified merges and bounded conflict resolution, final integration, retry/fallback, reuse/invalidation and foreground commands. | Development-plan tasks 2.1–2.11; README graph walkthrough; wording reconciliations in design sections 14–15 and single-node CLI intake |
+| Specified adapter execution fingerprints for safe completed-node reuse, the initial Claude capability boundary, and retained-output behavior when reuse cannot be established. | Design sections 6 and 7.2; section 14 cross-reference |
+| Reconciled phase-2a task completion and current validation evidence after graph closure. | Development-plan Task status |
+| Document review: made the `readonly` profile for read-access nodes release-blocking (spike 0.12 raised to P1, new task 2.30); added coordinator-profile spike 2.31 and adapter capability task 2.32 ahead of 2.24; clarified that dependencies mean implemented and validation gates are separate; fixed priority/dependency inversions (2.3, 3.2, 5.3); extended security review to M8; removed run-id reuse, resume-privilege, `large-context` and stale phase-2 wording contradictions. | Design sections 3, 6, 8.3, 8.5, 8.6, 9.3, 15, 17; development-plan phases 0, 2a, 2c, 3, 5, risks and remaining work |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| GR1 / P1 | Concurrent Windows worktree setup could contend on shared Git configuration. | Serialized worktree creation while retaining concurrent worker execution; covered by the two-writer integration test. |
+| GR2 / P1 | Re-merging outputs already contained in a resolved descendant could repeat a conflict. | Removed ancestor inputs before deterministic snapshot merges and added retained-ancestry coverage. |
+| GR3 / P1 | Persisting omitted node defaults could change verification inheritance on resume. | Stored effective graph defaults and tested the public run/resume path. |
+| GR4 / P1 | Resumes left capture/merge scratch registered, and repeated blocked resumes could bypass orphan-worker checks. | Added scratch cleanup after termination proof and per-node recovery admission across repeated resumes (section 6). |
+| GR5 / P1 | Cancellation could release ownership while the underlying worker thread remained active, including during Runner-wide cancellation. | Held cancellation ownership until the worker thread completed, including Runner-wide cancellation (sections 6 and 8.2). |
+| GR6 / P2 | Replies for pending question nodes could be rejected in quiescent graphs with unrelated failed nodes. | Admitted valid pending-question replies in quiescent mixed-failure graphs (sections 8.2 and 14). |
+| GR7 / P2 | Unsupported implicit or terminal node-cancellation requests could be silently ignored. | Rejected unsupported implicit and terminal node-cancellation requests (section 14). |
+| GR8 / P1 | Registry-wide eligibility disabled production reuse; cached resolvers bypassed fingerprint/ref/hash checks, and cache misses could remove output refs before admitting an attempt. | Added the actual-adapter fingerprint capability, resolver integrity checks, and an admission guard protecting refs until an attempt was admitted (section 6). |
+| GR9 / P2 | Completed checkouts remained registered when interrupted runs reused a validated output. | Added decommissioning after validated hits with durability-preservation regressions (section 6). |
+| GR10 / P1 | Fallback or restored workers could miss the effective per-agent or CLI permission ceilings. | Resolved ceilings for each admitted actual agent and persisted a copied effective configuration for continuation (section 9.2). |
+| GR11 / P2 | Clarification could trigger failure escalation, while split retries could lose the selected route, model and attempt facts. | Separated failure retries from answer continuation and preserved the actual routing decision, history, attempt facts and overrides (sections 4.3, 4.4 and 8.2). |
+| GR12 / P1 | Inline answers could open a competing EventLog writer and duplicate canonical sequence numbers. | Shared the active writer for inline answers; quiescent callers closed only their own writer (sections 8.2 and 11). |
+
+## Interactive foreground coordination (design v0.30, plan v0.12)
+
+| What changed | Where |
+|---|---|
+| Added versioned conversation, coordination and handoff contracts; coordinator/progress capabilities; a session-owned foreground controller and Textual conversation/task/inspector UI. | Design sections 5.6, 6, 7.4, 8.7, 14.1 and 15 |
+| Added the phase-2c roadmap, test areas, capability qualification and open risks for approved interactive rounds, checkpoints and cumulative delivery. | Design sections 9–11 and 16–18 |
+| Added milestone M8 and phase-2c tasks 2.20–2.29, including the session-lock prerequisite and the separation of optional progress streaming from the P0 TUI; narrowed task 5.4 to the advanced provider-backed planner extension. | Development-plan milestones, phase 2c and tasks 2.20–2.29; task 5.4 |

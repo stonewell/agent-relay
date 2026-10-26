@@ -90,6 +90,66 @@ For your own project, select it with `-C`, describe your task and supply its tes
 Task-file intake and command overrides are described in
 [section 14](docs/design.md#14-relay-cli).
 
+## Coordinate Claude and Codex in one run
+
+Use a foreground graph for multiple workers. Both CLIs must already be installed and
+authenticated. In the target project's `.agents/agents.yaml`, use each CLI's configured model:
+
+```yaml
+agents:
+  claude:
+    models: {fast: default, balanced: default, deep: default}
+  codex:
+    models: {fast: default, balanced: default, deep: default}
+```
+
+For a Python project, save this as `graph.yaml` in that project and commit the configuration
+and graph before running. Replace the goals, paths and test command with those for your project:
+
+```yaml
+spec_version: 1
+commands:
+  test: uv run pytest -q
+nodes:
+  - id: implementation-a
+    category: implement
+    goal: Implement feature A and its tests under feature_a.
+    routing: {agent: claude}
+    owns: ["src/feature_a/**", "tests/feature_a/**"]
+  - id: implementation-b
+    category: implement
+    goal: Implement feature B and its tests under feature_b.
+    routing: {agent: codex}
+    owns: ["src/feature_b/**", "tests/feature_b/**"]
+```
+
+From this Relay checkout:
+
+```sh
+uv run relay -C ../your-project graph run graph.yaml --concurrency 2 --json
+uv run relay -C ../your-project status RUN --json
+uv run relay -C ../your-project result RUN implementation-a --json
+uv run relay -C ../your-project apply RUN --yes --json
+```
+
+Disjoint writers can run concurrently. Overlapping or unknown scopes serialize; add
+`depends_on` when one worker needs another's changes. Relay verifies merged output before
+publishing the integration branch. The graph stays attached to its foreground process.
+Completed-node reuse is allowed only when execution and authentication fingerprints can be
+compared safely. The initial comparable case is Claude API-key authentication with `--bare`
+and an explicit model; Codex, account/keychain authentication and CLI-default model contexts
+conservatively require re-execution. If the attempt cap blocks that re-execution, raise it
+without resetting counts:
+
+```sh
+uv run relay -C ../your-project resume RUN --max-attempts 3 --json
+```
+
+For questions or interruption, use `reply` and `resume`; cancel a live graph with
+`relay cancel RUN --yes`. See [graph intake](docs/design.md#14-relay-cli) for the full contract
+and [section 6](docs/design.md#6-context-exchange-and-run-store) for the reuse rule, plus the
+[task status](docs/development-plan.md#task-status) for validation and release gates.
+
 ## Answer a blocked task
 
 If the walkthrough exits with code 6, inspect `relay result` for the pending questions. For one
