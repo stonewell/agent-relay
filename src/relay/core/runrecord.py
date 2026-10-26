@@ -35,6 +35,14 @@ class NodeRecord(SpecModel):
     output_commit: Sha | None = None
 
 
+class SessionLink(SpecModel):
+    """Optional link from a run to the session round that launched it (design 6, 5.6)."""
+
+    session_id: str
+    plan_revision: int = Field(ge=1)
+    intent_id: str
+
+
 class RunRecord(VersionedSpec):
     run_id: RunId
     created_at: str
@@ -45,3 +53,4 @@ class RunRecord(VersionedSpec):
     nodes: dict[NodeId, NodeRecord] = {}
     final_commit: Sha | None = None
     budget_ledger: dict[str, Any] = {}
+    session: SessionLink | None = None

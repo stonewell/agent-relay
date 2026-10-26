@@ -67,6 +67,7 @@ from relay.core.apply import (
 )
 from relay.core.capture import CaptureResult, Change, ChangeCounts
 from relay.core.events import EventLog, EventLogCorrupt
+from relay.core.sessions import SessionError, session_guard
 from relay.core.specs.graph import Graph
 from relay.core.specs.task import Acceptance, Commands, TaskCore
 from relay.core.store import RunStore, StoreError
@@ -131,16 +132,19 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         return _fail(f"relay apply: cannot open the run event log: {exc}", Exit.FAILURE, as_json)
 
     try:
-        return _apply(
-            repo_root,
-            run_id,
-            target,
-            op_id,
-            as_json,
-            assume_yes=bool(args.yes),
-            log=log,
-            graph=record.graph,
-        )
+        with session_guard(repo_root, run_id):
+            return _apply(
+                repo_root,
+                run_id,
+                target,
+                op_id,
+                as_json,
+                assume_yes=bool(args.yes),
+                log=log,
+                graph=record.graph,
+            )
+    except SessionError as exc:
+        return _fail(f"relay apply: {exc}", Exit.FAILURE, as_json)
     finally:
         log.close()
 

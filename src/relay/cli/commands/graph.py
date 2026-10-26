@@ -14,6 +14,7 @@ import yaml
 from relay.core.graph import GraphResult, run_graph
 from relay.core.planner import TEMPLATES, plan
 from relay.core.registry import Config, load_config
+from relay.core.sessions import SessionError, session_guard
 from relay.core.specs import Graph, load_spec
 from relay.core.store import RunStore, atomic_write, read_text
 
@@ -154,9 +155,15 @@ def _cancel(args: argparse.Namespace, repo: Path) -> int:
             )
     if record.state != "running":
         raise ValueError(f"run is {record.state}; no active foreground run to cancel")
-    directory = store.path("cancel-requests")
-    directory.mkdir(exist_ok=True)
-    atomic_write(directory / f"{secrets.token_hex(8)}.json", json.dumps({"node": args.node}))
+    try:
+        with session_guard(repo, store.run_id):
+            directory = store.path("cancel-requests")
+            directory.mkdir(exist_ok=True)
+            atomic_write(
+                directory / f"{secrets.token_hex(8)}.json", json.dumps({"node": args.node})
+            )
+    except SessionError as exc:
+        raise ValueError(str(exc)) from exc
     print(
         json.dumps({"run_id": store.run_id, "node": args.node, "cancellation_requested": True})
         if args.json

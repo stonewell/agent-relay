@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .platform.procid import IdentityState, ProcessIdentity, check_identity, current_identity
+from .sessions import SessionBusy, SessionError, SessionOwner, linked_session
 from .store import RunStore, StoreError, locks_dir, read_text
 
 
@@ -56,6 +57,15 @@ class Owner:
 
 class RunLockError(RuntimeError):
     """Base for run-lock contention errors."""
+
+
+class RunLockSessionBusy(RunLockError):
+    """The run belongs to a session whose owner is another process (design section 6)."""
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.identity = None
+        super().__init__(f"run {run_id} is linked to a session: {reason}")
 
 
 class RunLockHeld(RunLockError):
@@ -222,17 +232,55 @@ def _overwrite_lock(path: Path, identity: ProcessIdentity) -> None:
 class RunLock:
     """A held run lock: the lock file that carries the owner identity."""
 
-    def __init__(self, path: Path, identity: ProcessIdentity) -> None:
+    def __init__(
+        self, path: Path, identity: ProcessIdentity, session: SessionOwner | None = None
+    ) -> None:
         self._path = path
         self.identity = identity
+        self._session = session  # a session lock this command took; released after the run's
 
     @property
     def held(self) -> bool:
         return self._path.exists()
 
     @classmethod
-    def acquire(cls, repo_root: Path, run_id: str, *, takeover: bool = False) -> RunLock:
-        """Acquire the run lock, refusing or taking over per the contention rules above.
+    def acquire(
+        cls,
+        repo_root: Path,
+        run_id: str,
+        *,
+        takeover: bool = False,
+        session_owner: SessionOwner | None = None,
+    ) -> RunLock:
+        """Acquire the run lock, honouring session ownership first (design section 6).
+
+        A run linked to a session needs that session's lock: the caller's own `session_owner`,
+        or one taken here for the command and released with the run lock. Session ownership is
+        always acquired before run ownership. Unlinked runs behave exactly as before.
+        """
+        session: SessionOwner | None = None
+        try:
+            linked = linked_session(repo_root, run_id)
+            if linked is not None and (
+                session_owner is None or session_owner.store.session_id != linked
+            ):
+                session = SessionOwner.acquire(repo_root, linked)
+        except SessionBusy as exc:
+            raise RunLockSessionBusy(run_id, str(exc)) from exc
+        except SessionError as exc:
+            raise RunLockSessionBusy(run_id, str(exc)) from exc
+        try:
+            lock = cls._acquire_file(repo_root, run_id, takeover=takeover)
+        except BaseException:
+            if session is not None:
+                session.close()
+            raise
+        lock._session = session  # pyright: ignore[reportPrivateUsage]
+        return lock
+
+    @classmethod
+    def _acquire_file(cls, repo_root: Path, run_id: str, *, takeover: bool) -> RunLock:
+        """Acquire the run lock file, refusing or taking over per the contention rules above.
 
         ``takeover`` must be ``True`` (explicit retry/resume intent) before a stale lock is
         taken over; without it a stale lock raises :class:`RunLockStale`. A live owner is
@@ -264,6 +312,9 @@ class RunLock:
         """Remove the lock file. Idempotent; a crash leaves it for the next contender."""
         with contextlib.suppress(FileNotFoundError):
             self._path.unlink()
+        if self._session is not None:
+            session, self._session = self._session, None
+            session.close()
 
     def __enter__(self) -> RunLock:
         return self

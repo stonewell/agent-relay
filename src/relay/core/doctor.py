@@ -265,6 +265,21 @@ async def check_git_exclude(ctx: DoctorContext) -> CheckResult:
     )
 
 
+async def check_session_locks(ctx: DoctorContext) -> CheckResult:
+    """Native session ownership needs working exclusive locks on the repository filesystem."""
+    from .platform.locks import probe_lock_support
+    from .store import locks_dir
+
+    probe = await asyncio.to_thread(probe_lock_support, locks_dir(ctx.repo_root))
+    if probe.supported:
+        return CheckResult("pass", probe.reason)
+    return CheckResult(
+        "unsupported",
+        f"interactive sessions are unavailable: {probe.reason}",
+        remedy="move the repository to a local filesystem; headless `relay run` is unaffected",
+    )
+
+
 def agent_cli_check(name: str, command: str) -> Check:
     """Probe an agent CLI: resolve it on PATH (PATHEXT aware) and run `<cmd> --version`."""
 
@@ -1293,6 +1308,7 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
     registry.register(
         Check("git.exclude", "runtime state is excluded", check_git_exclude, requires=("git",))
     )
+    registry.register(Check("session.locks", "session ownership locks work", check_session_locks))
     if ctx is not None:
         try:
             loaded = load_config(ctx.repo_root, user_config=ctx.user_config)

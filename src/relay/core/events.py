@@ -77,6 +77,24 @@ CATALOG: dict[str, EventType] = {
     "spawn.rejected": _t(open=True),
     "permission.denied": _t("node_id requested effective"),
     "warning": _t("message", open=True),
+    # Interactive sessions (phase 2c): ids, revisions, hashes and states only (section 11)
+    "session.created": _t(open=True),
+    "session.interrupted": _t(open=True),
+    "turn.started": _t(open=True),
+    "turn.finished": _t(open=True),
+    "coordinator.started": _t(open=True),
+    "coordinator.finished": _t(open=True),
+    "context.selected": _t(open=True),
+    "plan.proposed": _t("plan_revision", open=True),
+    "plan.approved": _t("plan_revision", open=True),
+    "plan.superseded": _t(open=True),
+    "launch.prepared": _t("intent_id run_id", open=True),
+    "launch.linked": _t("intent_id run_id", open=True),
+    "admission.paused": _t(open=True),
+    "admission.resumed": _t(open=True),
+    "checkpoint.started": _t(open=True),
+    "checkpoint.sealed": _t(open=True),
+    "checkpoint.conflicted": _t(open=True),
 }
 
 _FORBIDDEN_PAYLOAD = frozenset({"answers"})

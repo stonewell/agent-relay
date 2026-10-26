@@ -39,6 +39,7 @@ from typing import Any
 from relay.core import registry as registry_module
 from relay.core.registry import ConfigError, load_config
 from relay.core.runlock import OwnerState, inspect_owner
+from relay.core.sessions import protected_run_ids
 from relay.core.store import runs_dir
 from relay.core.worktree import WorktreeError, WorktreeManager
 
@@ -87,6 +88,7 @@ class _RunPlan:
     skipped: str | None = None
     active: bool = False
     error: str | None = None
+    note: str | None = None
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:  # pyright: ignore[reportPrivateUsage]
@@ -162,8 +164,24 @@ def _plan(
         return []
     loaded = load_config(project_root=repo_root, user_config=registry_module.USER_CONFIG)
     plans: list[_RunPlan] = []
+    retained = protected_run_ids(repo_root) if purge else set[str]()
     for candidate in ids:
-        plan = _plan_run(repo_root, candidate, loaded.config.paths.worktree_root, purge=purge)
+        if candidate in retained and run_id is not None:
+            raise CleanError(
+                f"run {candidate} is referenced by a retained session and cannot be purged; "
+                "delete the session first",
+                Exit.FAILURE,
+            )
+        plan = _plan_run(
+            repo_root,
+            candidate,
+            loaded.config.paths.worktree_root,
+            purge=purge and candidate not in retained,
+        )
+        if candidate in retained:
+            plan.note = (
+                "referenced by a retained session; worktrees and scratch cleaned, record kept"
+            )
         if older is not None and plan.skipped is None:
             age = _run_age(repo_root, candidate)
             if age is not None and age < older.total_seconds():
@@ -465,6 +483,8 @@ def _summary_lines(plans: list[_RunPlan], repo_root: Path, *, dry_run: bool = Fa
         if plan.skipped is not None:
             lines.append(f"run {plan.run_id}: skipped ({plan.skipped})")
             continue
+        if plan.note is not None:
+            lines.append(f"run {plan.run_id}: {plan.note}")
         if (
             plan.state is None
             and not plan.worktrees
@@ -512,6 +532,7 @@ def _plan_json(plan: _RunPlan, repo_root: Path, *, dry_run: bool) -> dict[str, A
         "run_id": plan.run_id,
         "state": plan.state,
         "skipped": plan.skipped,
+        "note": plan.note,
         "worktrees": [
             {
                 "path": display_path(removal.path, repo_root),
