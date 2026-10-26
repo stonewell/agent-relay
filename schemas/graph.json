@@ -312,6 +312,21 @@
           "default": null,
           "title": "Permissions"
         },
+        "priority": {
+          "default": 0,
+          "title": "Priority",
+          "type": "integer"
+        },
+        "routing": {
+          "$ref": "#/$defs/Routing",
+          "default": {
+            "agent": null,
+            "agent_rule": null,
+            "effort": null,
+            "model": null,
+            "model_rule": null
+          }
+        },
         "title": {
           "anyOf": [
             {
@@ -409,6 +424,74 @@
         }
       },
       "title": "Policy",
+      "type": "object"
+    },
+    "Routing": {
+      "additionalProperties": true,
+      "description": "Orchestrator-owned; ids match the route log (section 4.4).",
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent"
+        },
+        "agent_rule": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent Rule"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "model_rule": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Rule"
+        }
+      },
+      "title": "Routing",
       "type": "object"
     },
     "RunCheck": {

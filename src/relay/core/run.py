@@ -1,9 +1,9 @@
 """Foreground ``relay run`` loop for a single node (design sections 6, 8.2, 9, 10, 14).
 
-One node runs in the foreground, with same-agent retries up to ``max_attempts``.
+One node runs in the foreground, with bounded retries up to ``max_attempts``.
 Every attempt is routed, started through ``start_attempt`` (so an earlier attempt's
 ``result.spec.yaml`` is archived under ``attempts/NN/``), and only a verified, published attempt
-ends the node ``done``. Escalation, fallback and timeout retry policy arrive in phase 2a;
+ends the node ``done``. Retries can escalate models and fall back across unpinned agents.
 Foreground input uses durable question sets and operator replies (task 1.21).
 Execution has no supervisor or task graph. This module is the single
 writer of a run's durable state for the lifetime of the foreground process: it takes the
@@ -36,7 +36,7 @@ import secrets
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -54,7 +54,7 @@ from relay.adapters.parsing import ResultInvalid
 from relay.core.answers import answer_context, current_questions, read_answers, record_answers
 from relay.core.capture import CaptureError, capture_changes
 from relay.core.classifier import Classification, classify
-from relay.core.events import EventLog, EventLogCorrupt
+from relay.core.events import EventLog, EventLogCorrupt, read_events
 from relay.core.gitbase import (
     DirtyTreeError,
     EmptyRepositoryError,
@@ -65,7 +65,7 @@ from relay.core.gitbase import (
     resolve_base,
 )
 from relay.core.gitexclude import ExcludeError, ensure_exclude_block
-from relay.core.model_router import NO_MODEL, select_model
+from relay.core.model_router import NO_MODEL, ModelDecision, escalate, select_model
 from relay.core.permissions import decide, format_banner, resolve_level
 from relay.core.platform.proc import observe_processes
 from relay.core.platform.procid import process_identity
@@ -77,9 +77,9 @@ from relay.core.publish import (
     publish_integration,
 )
 from relay.core.recovery import foreground_interrupts, prepare_interrupted
-from relay.core.registry import Config, snapshot
+from relay.core.registry import Agent, Config, snapshot
 from relay.core.route_log import RouteLog
-from relay.core.router import route_agent
+from relay.core.router import AgentDecision, route_agent
 from relay.core.runlock import RunLock, RunLockError
 from relay.core.runrecord import WorkerRecord
 from relay.core.specs import load_spec
@@ -87,6 +87,7 @@ from relay.core.specs.answers import AnswerValue, Submission
 from relay.core.specs.common import Access, NodeStatus, PermissionLevel
 from relay.core.specs.graph import Graph, GraphNode
 from relay.core.specs.result import Changes, ResultSpec, Verification, VerifyDetail
+from relay.core.specs.route import PreviousRoute, RouteEntry, RouteEvent
 from relay.core.specs.task import TaskCore, TaskSpec
 from relay.core.store import RunStore, StoreError, iso, sweep_temp_files
 from relay.core.verify import (
@@ -181,6 +182,17 @@ def _input_key(task: TaskSpec, input_commit: str, config_hash: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _override_model(model: ModelDecision, agent: Agent, tier: str | None) -> ModelDecision:
+    if tier is None:
+        return model
+    return replace(
+        model,
+        model=agent.models.get(tier, tier),
+        tier=tier if tier in agent.models else None,
+        model_rule="cli-override",
+    )
+
+
 def _default_adapters(config: Config) -> dict[str, AgentAdapter]:
     """Claude and Codex adapters for the configured agents (design section 7.1).
 
@@ -249,6 +261,15 @@ class _AttemptRunner:
     agent_name: str
     resume_session: str | None = None
     question_revision: int = 0
+    graph_mode: bool = False
+
+    def _run_state(self, state: str) -> None:
+        if not self.graph_mode:
+            self.store.update_run(lambda record: setattr(record, "state", state))
+
+    def _run_finished(self, state: str) -> None:
+        if not self.graph_mode:
+            self.events.append("run.finished", {"state": state})
 
     async def run(self, attempt: int, model: str | None) -> RunResult | _AttemptFailure:
         started = time.monotonic()
@@ -338,6 +359,8 @@ class _AttemptRunner:
         # (section 6); a fresh session is used when extraction failed.
         if result.session is not None:
             self.resume_session = result.session.cli_session_id
+        if self.graph_mode and result.spawn_requests:
+            return _AttemptFailure("spawn_requests is available from phase 4", EXIT_INVALID, False)
 
         if result.status == "needs_input":
             self.question_revision += 1
@@ -354,7 +377,7 @@ class _AttemptRunner:
             relative = self.node_dir.relative_to(self.store.run_dir).as_posix()
             self.store.write_spec(f"{relative}/result.spec.yaml", result)
             _set_node(self.store, self.node_id, "blocked", blocked_reason="needs_input")
-            self.store.update_run(lambda record: setattr(record, "state", "blocked"))
+            self._run_state("blocked")
             self.events.append(
                 "input.requested",
                 {
@@ -373,9 +396,9 @@ class _AttemptRunner:
         if result.status in ("blocked", "cancelled"):
             # A terminal non-done status is not retried in this slice.
             _set_node(self.store, self.node_id, "failed")
-            self.store.update_run(lambda record: setattr(record, "state", "failed"))
+            self._run_state("failed")
             self.events.append("node.finished", {"node_id": self.node_id, "status": "failed"})
-            self.events.append("run.finished", {"state": "failed"})
+            self._run_finished("failed")
             return RunResult(
                 exit_code=EXIT_FAILURE,
                 run_id=self.store.run_id,
@@ -415,6 +438,10 @@ class _AttemptRunner:
                 self.worktree_path, self.base_commit, candidate_dir=candidate_dir
             )
             candidate_path = capture.candidate_path
+            if self.graph_mode and self.access == "read" and not capture.empty:
+                return _AttemptFailure(
+                    "readonly node changed its input snapshot", EXIT_VERIFICATION_FAILED, False
+                )
 
             self.events.append(
                 "attempt.phase", {"node_id": node_id, "attempt": attempt, "phase": "verify"}
@@ -427,8 +454,8 @@ class _AttemptRunner:
                     )
                 except NoExecutableChecksError as exc:
                     _set_node(self.store, node_id, "failed")
-                    self.store.update_run(lambda record: setattr(record, "state", "failed"))
-                    self.events.append("run.finished", {"state": "failed"})
+                    self._run_state("failed")
+                    self._run_finished("failed")
                     return RunResult(
                         exit_code=EXIT_INVALID,
                         run_id=self.store.run_id,
@@ -471,20 +498,22 @@ class _AttemptRunner:
                 node_dir=self.node_dir,
                 attempt=attempt,
             )
-            integration = publish_integration(
-                self.repo_root,
-                self.store.run_id,
-                base_commit=self.base_commit,
-                outputs=[(node_id, publication.output_commit)],
-            )
-            self.events.append(
-                "integration.published",
-                {
-                    "commit": integration.commit,
-                    "branch": integration.branch,
-                    "nodes": [node_id],
-                },
-            )
+            integration = None
+            if not self.graph_mode:
+                integration = publish_integration(
+                    self.repo_root,
+                    self.store.run_id,
+                    base_commit=self.base_commit,
+                    outputs=[(node_id, publication.output_commit)],
+                )
+                self.events.append(
+                    "integration.published",
+                    {
+                        "commit": integration.commit,
+                        "branch": integration.branch,
+                        "nodes": [node_id],
+                    },
+                )
 
             final_status: NodeStatus = "done"
             result_spec = _finalize_result(
@@ -522,18 +551,19 @@ class _AttemptRunner:
                     "duration": round(proc.duration_s, 3),
                 },
             )
-            self.store.update_run(lambda record: setattr(record, "state", "done"))
-            self.store.update_run(partial(_set_final_commit, commit=integration.commit))
-            self.events.append(
-                "run.finished", {"state": "done", "integration_commit": integration.commit}
-            )
+            if integration is not None:
+                self.store.update_run(lambda record: setattr(record, "state", "done"))
+                self.store.update_run(partial(_set_final_commit, commit=integration.commit))
+                self.events.append(
+                    "run.finished", {"state": "done", "integration_commit": integration.commit}
+                )
             return RunResult(
                 exit_code=EXIT_OK,
                 run_id=self.store.run_id,
                 node_id=node_id,
                 node_status="done",
                 output_commit=publication.output_commit,
-                integration_commit=integration.commit,
+                integration_commit=integration.commit if integration is not None else None,
             )
         finally:
             # The capture candidate is scratch: remove it whether this attempt published, failed
@@ -574,6 +604,14 @@ async def run_foreground(
     """
     stdout = sys.stdout if out is None else out
     stderr = sys.stderr if err is None else err
+    if agent_permissions:
+        # Preserve CLI ceilings in the effective snapshot for separate retries.
+        config = config.model_copy(deep=True)
+        for name, level in agent_permissions.items():
+            if name in config.agents:
+                config.agents[name].permissions = _most_restrictive(
+                    config.agents[name].permissions, level
+                )
 
     def fail(
         code: int,
@@ -586,6 +624,21 @@ async def run_foreground(
         return RunResult(exit_code=code, run_id=run_id, reasons=reasons, error=error)
 
     category = task.category
+    requested_task_permissions = task.permissions
+    pinned_agent = task.routing.agent
+    routing_attempt = 1
+    if resume_run is not None:
+        saved_record = RunStore(repo_root, resume_run).read_run()
+        saved_graph = saved_record.graph
+        if saved_graph is not None:
+            pinned_agent = saved_graph.nodes[0].routing.agent
+            if model_tier is None and saved_graph.nodes[0].routing.model_rule == "cli-override":
+                model_tier = saved_graph.nodes[0].routing.model
+        if model_tier is None and task.routing.model_rule == "cli-override":
+            # Legacy checkpoints stored only the effective model, not the requested tier.
+            model_tier = task.routing.model
+        if task.id in saved_record.nodes:
+            routing_attempt = saved_record.nodes[task.id].attempts + 1
     access = _access(category, task.access)
     node_id = task.id
     try:
@@ -643,13 +696,13 @@ async def run_foreground(
     decision = route_agent(
         config,
         classification,
-        pinned=task.routing.agent,
+        pinned=pinned_agent,
         available=available,
         levels=levels,
         permissions=pre_resolution.effective,
         est_tokens=len(task.goal.split()),
         files=len(task.context.files) + len(task.owns),
-        attempt=1,
+        attempt=routing_attempt,
     )
     if decision.rejected or decision.agent is None:
         return fail(
@@ -664,11 +717,10 @@ async def run_foreground(
         classification,
         est_tokens=len(task.goal.split()),
         files=len(task.context.files) + len(task.owns),
-        attempt=1,
+        attempt=routing_attempt,
     )
+    model_decision = _override_model(model_decision, agent_config, model_tier)
     resolved_model = model_decision.model
-    if model_tier is not None:
-        resolved_model = agent_config.models.get(model_tier, model_tier)
 
     # Re-resolve permissions with the chosen agent's config (and per-agent CLI override).
     cli_level = _most_restrictive(cli_permissions, (agent_permissions or {}).get(agent_name))
@@ -753,7 +805,11 @@ async def run_foreground(
         input_key = _input_key(task, base_commit, config_hash)
         if context:
             input_key = hashlib.sha256((input_key + context).encode()).hexdigest()
-        store.update_run(lambda record: setattr(record, "graph", _single_node_graph(task)))
+        store.update_run(
+            lambda record: setattr(
+                record, "graph", _single_node_graph(task, pinned_agent, model_tier)
+            )
+        )
         store.write_spec(f"{node_dir.relative_to(store.run_dir).as_posix()}/task.spec.yaml", task)
 
         events = EventLog(store.events_path)
@@ -771,18 +827,6 @@ async def run_foreground(
                     "sensitive_paths": sensitive_paths,
                 },
             )
-        route_log.route(
-            node_id=node_id,
-            attempt=start_attempt_number,
-            resumed=resume_run is not None,
-            event="routed",
-            category=category,
-            complexity=classification.complexity,
-            agent_decision=decision,
-            model_decision=model_decision,
-            title=task.title,
-            goal=task.goal,
-        )
         banner = format_banner((permission,), run_id=store.run_id)
         print(banner, file=stdout)
 
@@ -815,7 +859,8 @@ async def run_foreground(
             available,
             levels,
             route_log,
-            resolved_model,
+            decision,
+            model_decision,
             model_tier,
             start_attempt_number,
             max_attempts,
@@ -823,6 +868,11 @@ async def run_foreground(
             stdout,
             stderr,
             effective_timeout,
+            registry,
+            pinned_agent,
+            requested_task_permissions,
+            cli_permissions,
+            agent_permissions or {},
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         store.update_run(lambda record: setattr(record, "state", "interrupted"))
@@ -876,10 +926,17 @@ def _remaining_timeout(deadline: float | None) -> float | None:
     return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
-def _single_node_graph(task: TaskSpec) -> Graph:
+def _single_node_graph(
+    task: TaskSpec, pinned_agent: str | None = None, model_tier: str | None = None
+) -> Graph:
     node = GraphNode.model_validate(
         {"id": task.id, **{name: getattr(task, name) for name in TaskCore.model_fields}}
     )
+    node.routing.agent = pinned_agent
+    if model_tier is not None:
+        # Keep request provenance separate from the actual model in task.spec/events:
+        # the same logical tier may resolve differently after an agent fallback.
+        node.routing.model, node.routing.model_rule = model_tier, "cli-override"
     return Graph(
         nodes=[node],
         commands=task.commands,
@@ -1033,6 +1090,7 @@ def _handle_input(
                     submitted_at=iso(datetime.now(UTC)),
                     answers=answers,
                 ),
+                events=runner.events,
             )
             if attempt < max_attempts:
                 runner.resume_session = None
@@ -1171,7 +1229,8 @@ async def _drive_attempts(
     available: Mapping[str, bool],
     levels: Mapping[str, tuple[PermissionLevel, ...]],
     route_log: RouteLog,
-    resolved_model: str,
+    initial_decision: AgentDecision,
+    initial_model: ModelDecision,
     model_tier: str | None,
     start_attempt_number: int,
     max_attempts: int,
@@ -1179,32 +1238,122 @@ async def _drive_attempts(
     stdout: TextIO,
     stderr: TextIO,
     effective_timeout: float,
+    adapters: Mapping[str, AgentAdapter],
+    pinned_agent: str | None,
+    requested_task_permissions: PermissionLevel | None,
+    cli_permissions: PermissionLevel | None,
+    agent_permissions: Mapping[str, PermissionLevel],
 ) -> RunResult:
     store, node_id, task = runner.store, runner.node_id, runner.task
-    agent_name = runner.agent_name
+    agent_name: str = runner.agent_name
     agent_config = config.agents[agent_name]
     events = runner.events
     category = task.category
     last_reason = f"node {node_id} did not complete an attempt"
     last_exit_code = EXIT_FAILURE
-    attempts_run = 0
+    attempts_run = start_attempt_number - 1
+    current_model = initial_model
+    previous: PreviousRoute | None = None
+    excluded: set[str] = set()
+    if start_attempt_number > 1:
+        history = read_events(store.events_path)
+        prior_agent: str | None = None
+        restored_permission: PermissionLevel | None = None
+        for event in history:
+            if event.type != "node.routed" or event.data["node_id"] != node_id:
+                continue
+            entry = RouteEntry.model_validate(event.data["decision"])
+            if not entry.executed or entry.agent is None or entry.attempt >= start_attempt_number:
+                continue
+            selected = select_model(
+                config.agents[entry.agent],
+                classification,
+                est_tokens=len(task.goal.split()),
+                files=len(task.context.files) + len(task.owns),
+                attempt=entry.attempt,
+            )
+            if entry.event == "escalated" and prior_agent == entry.agent:
+                selected = escalate(config.agents[entry.agent], current_model)
+            elif prior_agent == entry.agent and entry.model == current_model.model:
+                selected = current_model
+            if prior_agent and prior_agent != entry.agent:
+                excluded.add(prior_agent)
+            current_model = replace(
+                selected,
+                model=entry.model or NO_MODEL,
+                effort=entry.effort,
+                model_rule=entry.model_rule or selected.model_rule,
+            )
+            agent_name = prior_agent = entry.agent
+            restored_permission = entry.permissions
+        agent_config = config.agents[agent_name]
+        if prior_agent is not None:
+            requested_task_permissions = _most_restrictive(
+                requested_task_permissions, restored_permission
+            )
+        failure = next(
+            (
+                event
+                for event in reversed(history)
+                if event.type == "warning"
+                and event.data.get("node_id") == node_id
+                and event.data.get("attempt") == start_attempt_number - 1
+            ),
+            None,
+        )
+        if failure is not None and prior_agent is not None:
+            previous = PreviousRoute(
+                agent=agent_name, model=current_model.model, reason=str(failure.data["message"])
+            )
 
     for attempt in range(start_attempt_number, max_attempts + 1):
-        # Every retry goes back through the Router before it starts (section 8.2); with no
-        # escalation or cross-agent fallback in this slice it stays on the same agent.
-        if attempt > start_attempt_number:
+        # Every retry goes back through the Router before it starts (section 8.2); without
+        # an explicit pin, fallback retains the existing worktree and total attempt count.
+        retry_decision = initial_decision
+        retry_model = current_model
+        retry_event: RouteEvent = "routed"
+        if attempt > 1:
+            next_model = (
+                escalate(agent_config, current_model)
+                if previous is not None and model_tier is None
+                else current_model
+            )
+            retry_available = dict(available)
+            retry_pin: str | None = agent_name
+            if next_model != current_model and available.get(agent_name, False):
+                retry_event = "escalated"
+            elif previous is not None and pinned_agent is None:
+                excluded.add(agent_name)
+                retry_available = {k: v and k not in excluded for k, v in available.items()}
+                retry_pin = None
+                retry_event = "fallback"
             retry_decision = route_agent(
                 config,
                 classification,
-                pinned=agent_name,
-                available=available,
+                pinned=retry_pin,
+                available=retry_available,
                 levels=levels,
                 permissions=runner.permission,
                 est_tokens=len(task.goal.split()),
                 files=len(task.context.files) + len(task.owns),
                 attempt=attempt,
             )
-            if retry_decision.rejected or retry_decision.agent != agent_name:
+            if retry_decision.rejected and retry_pin is None:
+                # At the ceiling, remaining attempts can still retry the current model
+                # when no other eligible worker exists (section 4.3).
+                retry_decision = route_agent(
+                    config,
+                    classification,
+                    pinned=agent_name,
+                    available=available,
+                    levels=levels,
+                    permissions=runner.permission,
+                    est_tokens=len(task.goal.split()),
+                    files=len(task.context.files) + len(task.owns),
+                    attempt=attempt,
+                )
+                retry_event = "routed"
+            if retry_decision.rejected or retry_decision.agent is None:
                 route_log.route(
                     node_id=node_id,
                     attempt=attempt,
@@ -1219,30 +1368,63 @@ async def _drive_attempts(
                 )
                 last_exit_code = EXIT_NO_AGENT
                 break
-            retry_model = select_model(
-                agent_config,
-                classification,
-                est_tokens=len(task.goal.split()),
-                files=len(task.context.files) + len(task.owns),
-                attempt=attempt,
+            chosen_agent = retry_decision.agent
+            if chosen_agent != agent_name:
+                retry_decision = replace(retry_decision, agent_rule="fallback")
+                agent_name = chosen_agent
+                agent_config = config.agents[agent_name]
+                runner.resume_session = None
+            retry_model = current_model
+            if previous is not None and retry_event == "fallback":
+                retry_model = select_model(
+                    agent_config,
+                    classification,
+                    est_tokens=len(task.goal.split()),
+                    files=len(task.context.files) + len(task.owns),
+                    attempt=attempt,
+                )
+            if retry_event == "escalated":
+                retry_model = next_model
+        retry_model = _override_model(retry_model, agent_config, model_tier)
+        current_model = retry_model
+        resolved_model = retry_model.model
+        permission = decide(
+            agent_name,
+            levels[agent_name],
+            resolve_level(
+                task=requested_task_permissions,
+                cli=_most_restrictive(cli_permissions, agent_permissions.get(agent_name)),
+                agent=agent_config.permissions,
+                default=config.defaults.permissions,
+                planner_read_only=runner.access == "read",
+            ),
+        )
+        if not permission.supported:
+            last_reason, last_exit_code = (
+                permission.reason or "unsupported permissions",
+                EXIT_INVALID,
             )
-            resolved_model = retry_model.model
-            if model_tier is not None:
-                resolved_model = agent_config.models.get(model_tier, model_tier)
-            task.routing.model = resolved_model
-            task.routing.effort = retry_model.effort
-            task.routing.model_rule = retry_model.model_rule
-            route_log.route(
-                node_id=node_id,
-                attempt=attempt,
-                event="routed",
-                category=category,
-                complexity=classification.complexity,
-                agent_decision=retry_decision,
-                model_decision=retry_model,
-                title=task.title,
-                goal=task.goal,
-            )
+            break
+        task.permissions = runner.permission = permission.effective
+        runner.agent_name, runner.adapter = agent_name, adapters[agent_name]
+        task.routing.model, task.routing.agent = resolved_model, agent_name
+        task.routing.agent_rule = retry_decision.agent_rule
+        task.routing.effort, task.routing.model_rule = retry_model.effort, retry_model.model_rule
+        retry_decision = replace(retry_decision, permissions=runner.permission)
+        route_log.route(
+            node_id=node_id,
+            attempt=attempt,
+            event=retry_event,
+            category=category,
+            complexity=classification.complexity,
+            agent_decision=retry_decision,
+            model_decision=retry_model,
+            title=task.title,
+            goal=task.goal,
+            previous=previous,
+            resumed=start_attempt_number > 1,
+        )
+        store.write_spec(f"{runner.node_dir.name}/task.spec.yaml", task)
 
         if not _set_attempt_timeout(runner, effective_timeout):
             return RunResult(
@@ -1258,6 +1440,7 @@ async def _drive_attempts(
                     runner, outcome, non_interactive, stdout, stderr, attempt, max_attempts
                 )
                 if outcome is None:
+                    previous = None
                     continue
             return outcome
 
@@ -1275,6 +1458,7 @@ async def _drive_attempts(
             )
         last_reason = outcome.reason
         last_exit_code = outcome.exit_code
+        previous = PreviousRoute(agent=agent_name, model=resolved_model, reason=last_reason)
         events.append(
             "warning",
             {
@@ -1284,7 +1468,7 @@ async def _drive_attempts(
                 "exit": last_exit_code,
             },
         )
-        if attempt >= max_attempts or not outcome.retryable:
+        if attempt >= max_attempts or (not outcome.retryable and "timed out" not in outcome.reason):
             break
 
     _set_node(store, node_id, "failed", attempts=attempts_run)
