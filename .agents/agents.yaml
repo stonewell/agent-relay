@@ -1,0 +1,23 @@
+version: 1
+defaults:
+  permissions: full
+  concurrency: 2
+  timeout_s: 1800
+  fallback: [codex, claude]
+
+agents:
+  claude:
+    enabled: true
+    cmd: claude
+    concurrency: 1
+    models: {fast: default, balanced: default, deep: default}
+  codex:
+    enabled: true
+    cmd: codex
+    concurrency: 1
+    models: {fast: default, balanced: default, deep: default}
+  gemini:
+    enabled: false
+  cursor:
+    enabled: false # Pending adapter integration
+    cmd: agent
