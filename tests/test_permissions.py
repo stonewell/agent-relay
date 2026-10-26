@@ -16,6 +16,7 @@ import pytest
 
 from harness import context, task
 from relay.adapters.antigravity import AntigravityAdapter
+from relay.adapters.base import advertised_levels
 from relay.adapters.claude import ClaudeAdapter
 from relay.adapters.claude import PermissionUnsupported as ClaudeUnsupported
 from relay.adapters.codex import CodexAdapter
@@ -245,7 +246,7 @@ def test_probe_levels_parse_from_a_real_python_binary() -> None:
     # `sys.executable --version` succeeds, so `probe()` runs end-to-end without an agent CLI.
     probe = asyncio.run(CodexAdapter(cmd=sys.executable).probe())
     assert probe.available is True
-    assert probe.levels == ("full",)
+    assert probe.levels == advertised_levels("codex")
 
 
 # --- banner (design sections 9.4, 14) -------------------------------------------------------

@@ -19,7 +19,7 @@ from typing import Any, cast
 import pytest
 
 from harness import context, git
-from relay.adapters.base import ProcessResult, RunContext
+from relay.adapters.base import ProcessResult, RunContext, advertised_levels
 from relay.adapters.codex import CodexAdapter, ResultInvalid, drop_nulls, strict_schema
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
 from relay.core.specs.task import Routing
@@ -126,8 +126,8 @@ def test_build_invocation_permission_flags(tmp_path: Path) -> None:
 
 
 def test_build_invocation_fails_closed_for_unadvertised_level(tmp_path: Path) -> None:
-    adapter = CodexAdapter()  # advertises `full` only
-    ctx = replace(context(tmp_path), permission="readonly")
+    adapter = CodexAdapter()  # never advertises `workspace`
+    ctx = replace(context(tmp_path), permission="workspace")
     with pytest.raises(ValueError, match="cannot honour"):
         adapter.build_invocation(_spec(), ctx)
 
@@ -145,7 +145,8 @@ def test_probe_parses_version_and_levels() -> None:
     probe = asyncio.run(CodexAdapter(cmd=sys.executable).probe())
     assert probe.available is True
     assert probe.version is not None and probe.version.count(".") >= 1
-    assert probe.levels == ("full",)  # conservative until task 1.20 canaries the profiles
+    assert probe.levels == advertised_levels("codex")  # only canary-verified platforms (2.30)
+    assert "workspace" not in probe.levels
 
 
 # --- strict schema conversion (design 5.4) ----------------------------------------------------

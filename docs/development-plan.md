@@ -288,6 +288,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | ID | Status | Date | Note |
 |---|---|---|---|
 | 0.1 | done | 2026-10-23 | Foundation checks and suite runs completed; current graph validation evidence is summarized below |
+| 0.12 | done | 2026-10-26 | Spike C on Windows 11: Claude Code 2.1.310 `--permission-mode plan` and Codex 0.164.0 `-s read-only` canaries return `enforced` (direct-write case only); Codex `workspace-write` is `inconclusive`; Linux/macOS not run. Canary fix: Codex canary needs `--skip-git-repo-check` in its non-git directory |
 | 0.2 | in progress | 2026-10-26 | Deferred at operator request; minimum/latest Python matrix and cache updates prepared; local matrix checks pass; remote CI remains held |
 | 0.3 | done | 2026-10-22 | `relay.core.specs` (pydantic) with generated `schemas/*.json`; design examples validate; reserved-scope check is host-independent and conservative (case, globs, Windows aliases) with regression tests |
 | 0.4 | done | 2026-10-22 | `relay.core.registry` and `relay.core.predicates`; built-in defaults in `builtin_agents.yaml`; config test area covered (merge, ids, priority, defaults, phase-4 rejection) |
@@ -339,6 +340,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 2.9 | done | 2026-10-26 | Actual-adapter reuse fingerprints, conservative unknown-mode handling, cache/ref admission and retained-output cleanup completed; reuse and retention regressions passed on Windows and Linux (design 6) |
 | 2.10 | done | 2026-10-26 | Four deterministic planning templates and the graph CLI implemented and checked through public commands (design 14, 17) |
 | 2.11 | done | 2026-10-26 | Graph resume, cancellation, integration recovery and inline event-writer handling implemented; graph and recovery regressions passed on Windows and Linux (design 6, 8.2, 14) |
+| 2.30 | in progress | 2026-10-26 | `advertised_levels` promotes `readonly` for Claude and Codex on Windows only (`READONLY_VERIFIED_PLATFORMS`); Linux canary and an end-to-end read-node run on both OSes remain before done |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 
 **Final graph validation evidence (2026-10-26):** full post-graph-fix suites passed on Windows (1,255 passed, 12 skipped; 647.58 seconds) and Linux (1,254 passed, 11 skipped; 231.61 seconds). Subsequent focused standalone/reuse/retention/graph-integration regressions passed on Windows (52 passed, 1 skipped across retry, input, recovery and run; plus 2 logical-model provenance cases) and Linux (187 passed, 1 skipped across retry, input, recovery, run, run CLI, graph, reuse, Claude and events; plus 2 logical-model provenance cases). After the last source patch, Ruff check, Ruff format check across all 127 Python files, full Pyright and `uv build` passed. Independent review found no remaining issues in graph recovery/cancellation, standalone retry history/model overrides, permission caps, inline event sequencing or reuse/cache retention. No live CLI/model calls or remote CI ran; those MVP validation gates remain held.

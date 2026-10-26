@@ -39,7 +39,7 @@ from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 from relay.core.store import read_text
 
-from .base import Invocation, Probe, RunContext, WorkerHandle, task_prompt
+from .base import Invocation, Probe, RunContext, WorkerHandle, advertised_levels, task_prompt
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -94,11 +94,12 @@ class CodexAdapter:
         cmd: str = "codex",
         *,
         agent: AgentEnv | None = None,
-        levels: tuple[PermissionLevel, ...] = ("full",),
+        levels: tuple[PermissionLevel, ...] | None = None,
     ) -> None:
         self.cmd = cmd
         self._agent = agent
-        self._levels = levels
+        # Default: what the canaries verified on this platform (task 2.30).
+        self._levels = levels if levels is not None else advertised_levels(self.id)
 
     # --- AgentAdapter ---------------------------------------------------------------------
 

@@ -386,7 +386,8 @@ def _canary_args(
     if profile.adapter == "claude":
         return (("-p", *flags), prompt + "\n")
     if profile.adapter == "codex":
-        return (("exec", *flags, "-C", str(work), "-"), prompt + "\n")
+        # The canary directory is deliberately not a git repository.
+        return (("exec", *flags, "--skip-git-repo-check", "-C", str(work), "-"), prompt + "\n")
     if profile.adapter == "agy":
         # This probe is plain prose; keep its argv form safe for Windows batch shims.
         return (("-p", prompt.replace("\n", " "), *flags), None)

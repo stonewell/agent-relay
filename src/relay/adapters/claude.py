@@ -35,7 +35,15 @@ from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle, task_prompt
+from .base import (
+    Invocation,
+    Probe,
+    ProcessResult,
+    RunContext,
+    WorkerHandle,
+    advertised_levels,
+    task_prompt,
+)
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -175,8 +183,10 @@ class ClaudeAdapter:
         version = await asyncio.to_thread(self._run_version, resolved, env)
         if version is None:
             notes = (*notes, "--version produced no output")
-        # Only `full` is verified in this phase; `readonly`/`workspace` arrive with task 1.20.
-        return Probe(available=True, version=version, levels=("full",), notes=notes)
+        # `readonly` only where its canary returned `enforced` (task 2.30); never `workspace`.
+        return Probe(
+            available=True, version=version, levels=advertised_levels(self.id), notes=notes
+        )
 
     def _run_version(self, resolved: ResolvedCommand, env: Mapping[str, str]) -> str | None:
         result = run_process(resolved, cwd=Path.cwd(), env=env)

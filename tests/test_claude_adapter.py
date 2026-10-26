@@ -17,7 +17,13 @@ from typing import Any, cast
 
 import pytest
 
-from relay.adapters.base import RESULT_FILE, Invocation, ProcessResult, RunContext
+from relay.adapters.base import (
+    RESULT_FILE,
+    Invocation,
+    ProcessResult,
+    RunContext,
+    advertised_levels,
+)
 from relay.adapters.claude import ClaudeAdapter, PermissionUnsupported, ResultInvalid
 from relay.core.registry import Agent
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
@@ -183,11 +189,12 @@ def test_workspace_fails_closed(tmp_path: Path) -> None:
         adapter.build_invocation(spec(), ctx(tmp_path, permission="workspace"))
 
 
-def test_probe_advertises_only_full(tmp_path: Path) -> None:
+def test_probe_advertises_only_verified_levels(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(agent(), cmd=sys.executable, parent_env=dict(os.environ))
     probe = asyncio.run(adapter.probe())
     assert probe.available is True
-    assert probe.levels == ("full",)
+    assert probe.levels == advertised_levels("claude")
+    assert "workspace" not in probe.levels
     assert probe.version is not None
     assert probe.version.startswith("Python")
 
@@ -493,7 +500,7 @@ def test_live_smoke_probe_and_parse(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(agent(), parent_env=dict(os.environ))
     probe = asyncio.run(adapter.probe())
     assert probe.available is True
-    assert probe.levels == ("full",)
+    assert probe.levels == advertised_levels("claude")
     token = "smoke-" + secrets.token_hex(6)
     task = spec()
     task.goal = (
