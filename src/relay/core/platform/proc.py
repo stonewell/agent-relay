@@ -23,6 +23,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextvars import ContextVar
@@ -459,7 +460,26 @@ class SupervisedProcess:
         stderr = ""
         try:
             try:
-                stdout, stderr = self._popen.communicate(input=stdin, timeout=timeout_s)
+                cancellation = _CANCELLATION.get()
+                if cancellation is None:
+                    stdout, stderr = self._popen.communicate(input=stdin, timeout=timeout_s)
+                else:
+                    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+                    while True:
+                        if cancellation.is_set():
+                            self.kill_tree()
+                            self._popen.communicate()
+                            raise ProcessCancelled("attempt cancelled")
+                        remaining = deadline - time.monotonic() if deadline is not None else 0.1
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(self._popen.args, timeout_s or 0)
+                        try:
+                            stdout, stderr = self._popen.communicate(
+                                input=stdin, timeout=min(0.1, remaining)
+                            )
+                            break
+                        except subprocess.TimeoutExpired:
+                            stdin = None
             except subprocess.TimeoutExpired:
                 timed_out = True
                 self.kill_tree()
@@ -537,6 +557,27 @@ def _spawn(
 
 
 ProcessObserver = Callable[[str, int | None], None]
+_CANCELLATION: ContextVar[threading.Event | None] = ContextVar(
+    "relay_process_cancellation", default=None
+)
+
+
+class ProcessCancelled(RuntimeError):
+    """The foreground scheduler cancelled this attempt and its process tree."""
+
+
+@contextlib.contextmanager
+def cancel_processes_when(event: threading.Event) -> Generator[None]:
+    """Make every supervised process in this context observe scheduler cancellation."""
+    token = _CANCELLATION.set(event)
+    try:
+        if event.is_set():
+            raise ProcessCancelled("attempt cancelled")
+        yield
+    finally:
+        _CANCELLATION.reset(token)
+
+
 _PROCESS_OBSERVER: ContextVar[ProcessObserver | None] = ContextVar(
     "relay_process_observer", default=None
 )
@@ -569,6 +610,9 @@ def run_process(
     immediately so the child cannot hang waiting for input.
     """
     observer = _PROCESS_OBSERVER.get()
+    cancellation = _CANCELLATION.get()
+    if cancellation is not None and cancellation.is_set():
+        raise ProcessCancelled("attempt cancelled")
     if observer is not None:
         observer("starting", None)
     process = _spawn(argv, cwd=cwd, env=env)

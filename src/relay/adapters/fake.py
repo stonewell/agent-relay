@@ -75,6 +75,9 @@ class FakeAdapter:
 
     # --- AgentAdapter ---------------------------------------------------------------------
 
+    def reuse_fingerprint(self, task: TaskSpec) -> str:
+        return self._version
+
     async def probe(self) -> Probe:
         if not self._available:
             return Probe(available=False, notes=("fake adapter marked unavailable",))

@@ -18,6 +18,7 @@ import contextlib
 import json
 import os
 import re
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -272,6 +273,7 @@ class RouteLog:
         run_id: RunId,
         now: Callable[[], datetime] | None = None,
     ) -> None:
+        self._lock = threading.RLock()
         self._events = event_log
         self._routes_path = routes_path
         self._route_log_path = route_log_path
@@ -318,37 +320,38 @@ class RouteLog:
         durable before this call returns; a failure there propagates and prevents dispatch.
         Projection failures emit ``route.log.write_failed`` and never block execution.
         """
-        seq = self._next_seq
-        ts = iso(self._now())
-        entry = build_entry(
-            run_id=self._run_id,
-            node_id=node_id,
-            attempt=attempt,
-            event=event,
-            category=category,
-            complexity=complexity,
-            agent_decision=agent_decision,
-            model_decision=model_decision,
-            title=title,
-            goal=goal,
-            include_goal=self._config.include_goal,
-            title_max_chars=self._config.title_max_chars,
-            previous=previous,
-            executed=executed,
-            resumed=resumed,
-            ts=ts,
-            seq=seq,
-        )
-        payload = entry.model_dump(mode="json", by_alias=True)
-        # Canonical event: durable, written before dispatch. Failure prevents dispatch.
-        self._events.append(
-            "node.routed",
-            {"node_id": entry.node_id, "route_seq": seq, "decision": payload},
-        )
-        self._next_seq += 1
-        if self._config.enabled:
-            self._write_projections(entry, payload)
-        return entry
+        with self._lock:
+            seq = self._next_seq
+            ts = iso(self._now())
+            entry = build_entry(
+                run_id=self._run_id,
+                node_id=node_id,
+                attempt=attempt,
+                event=event,
+                category=category,
+                complexity=complexity,
+                agent_decision=agent_decision,
+                model_decision=model_decision,
+                title=title,
+                goal=goal,
+                include_goal=self._config.include_goal,
+                title_max_chars=self._config.title_max_chars,
+                previous=previous,
+                executed=executed,
+                resumed=resumed,
+                ts=ts,
+                seq=seq,
+            )
+            payload = entry.model_dump(mode="json", by_alias=True)
+            # Canonical event: durable, written before dispatch. Failure prevents dispatch.
+            self._events.append(
+                "node.routed",
+                {"node_id": entry.node_id, "route_seq": seq, "decision": payload},
+            )
+            self._next_seq += 1
+            if self._config.enabled:
+                self._write_projections(entry, payload)
+            return entry
 
     def _write_projections(self, entry: RouteEntry, payload: dict[str, Any]) -> None:
         try:

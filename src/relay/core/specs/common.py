@@ -12,7 +12,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validat
 SPEC_VERSION = 1
 """Highest spec major version this build understands (section 5.4)."""
 
-CURRENT_PHASE = 1
+CURRENT_PHASE = 2
 """Roadmap phase of this build. Features from later phases are rejected (section 16)."""
 
 COST_FEATURE_PHASE = 4

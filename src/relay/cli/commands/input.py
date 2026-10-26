@@ -108,6 +108,10 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
                 print(json.dumps({"run_id": store.run_id, "recorded": recorded}))
                 return 0
         record = store.read_run()
+        if store.path("graph.marker").exists():
+            from .graph import resume
+
+            return resume(args, repo_root, store)
         if len(record.nodes) != 1:
             raise ValueError("foreground resume requires exactly one node")
         node_id = next(iter(record.nodes))

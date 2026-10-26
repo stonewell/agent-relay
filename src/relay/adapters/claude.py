@@ -21,6 +21,7 @@ native-payload extraction (``structured_output``) and enrichment (session id, mo
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 from collections.abc import Mapping
@@ -133,6 +134,34 @@ class ClaudeAdapter:
         self._parent_env: Mapping[str, str] = dict(os.environ) if parent_env is None else parent_env
 
     # --- AgentAdapter -----------------------------------------------------------------
+
+    def reuse_fingerprint(self, task: TaskSpec) -> str | None:
+        # Bare API-key mode bypasses mutable account/config discovery. Other explicit
+        # environment overrides could select providers/helpers that have no such proof.
+        if (
+            not task.routing.model
+            or not task.routing.model.strip()
+            or task.routing.model == "default"
+            or _auth_mode(self._parent_env, self._agent) != "api-key"
+            or any(key != "ANTHROPIC_API_KEY" for key in self._agent.env)
+        ):
+            return None
+        env = build_env(
+            agent_config=self._agent,
+            extra_env=_auth_env(self._parent_env),
+            parent_env=self._parent_env,
+        )
+        key = env.get("ANTHROPIC_API_KEY")
+        if not key:
+            return None
+        payload = json.dumps(
+            [self._cmd, "bare", task.routing.model, task.routing.effort, task.permissions, env],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hmac.new(
+            key.encode(), b"relay.execution-fingerprint.v1\0" + payload, "sha256"
+        ).hexdigest()
 
     async def probe(self) -> Probe:
         parent = self._parent_env

@@ -11,7 +11,7 @@ from relay.cli.commands import doctor
 from relay.cli.main import main
 
 
-@pytest.mark.parametrize("command", ["plan", "graph", "cancel", "opencode-config", "replay"])
+@pytest.mark.parametrize("command", ["opencode-config", "replay"])
 def test_future_commands_prioritize_phase_errors(
     command: str, capsys: pytest.CaptureFixture[str]
 ) -> None:

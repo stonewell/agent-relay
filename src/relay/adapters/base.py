@@ -9,7 +9,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from relay.core.env import CompleteEnv
 from relay.core.platform.proc import (
@@ -148,6 +148,13 @@ class AgentAdapter(Protocol):
     ) -> ResultSpec: ...
 
     async def cancel(self, handle: WorkerHandle) -> None: ...
+
+
+@runtime_checkable
+class ReuseFingerprint(Protocol):
+    """Optional, pure capability; None means execution/auth state is uncomparable."""
+
+    def reuse_fingerprint(self, task: TaskSpec) -> str | None: ...
 
 
 def start_attempt(adapter: AgentAdapter, task: TaskSpec, ctx: RunContext) -> Invocation:

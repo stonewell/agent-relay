@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import secrets
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -124,6 +125,7 @@ class RunStore:
     """One run directory under `<repo>/.agents/runs/`. The orchestrator is its single writer."""
 
     def __init__(self, repo_root: Path, run_id: RunId) -> None:
+        self._lock = threading.RLock()
         self.repo_root = repo_root
         self.run_id = run_id
         self.run_dir = runs_dir(repo_root) / run_id
@@ -219,24 +221,26 @@ class RunStore:
 
     def update_run(self, change: Callable[[RunRecord], None]) -> RunRecord:
         """Read, modify and atomically rewrite `run.json` (single writer, no locking here)."""
-        record = self.read_run()
-        change(record)
-        self.write_run(record)
-        return record
+        with self._lock:
+            record = self.read_run()
+            change(record)
+            self.write_run(record)
+            return record
 
     # --- nodes ----------------------------------------------------------------------------
 
     def add_node(self, node_id: NodeId) -> Path:
         """Create the next `NN-<node-id>/` directory and record it in `run.json`."""
-        record = self.read_run()
-        if node_id in record.nodes:
-            return self.run_dir / record.nodes[node_id].dir
-        name = f"{len(record.nodes) + 1:02d}-{node_id}"
-        directory = self.run_dir / name
-        directory.mkdir()
-        record.nodes[node_id] = NodeRecord(dir=name)
-        self.write_run(record)
-        return directory
+        with self._lock:
+            record = self.read_run()
+            if node_id in record.nodes:
+                return self.run_dir / record.nodes[node_id].dir
+            name = f"{len(record.nodes) + 1:02d}-{node_id}"
+            directory = self.run_dir / name
+            directory.mkdir()
+            record.nodes[node_id] = NodeRecord(dir=name)
+            self.write_run(record)
+            return directory
 
     def node_dir(self, node_id: NodeId) -> Path:
         record = self.read_run()

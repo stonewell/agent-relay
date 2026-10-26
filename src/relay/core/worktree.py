@@ -45,6 +45,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -272,6 +273,7 @@ class WorktreeManager:
         parent_env: Mapping[str, str] | None = None,
     ) -> None:
         _validate_component(run_id, "run id")
+        self._lock = threading.RLock()
         self.repo_root = repo_root
         self.run_id = run_id
         self._resolved = resolve_worktree_root(
@@ -329,32 +331,33 @@ class WorktreeManager:
         (resume preserves the node's prior edits, design section 8.2); a path occupied by
         anything else is an error so two nodes never share a directory.
         """
-        _validate_component(node_id, "node id")
-        _validate_component(input_commit, "input commit")
-        path = self.node_path(node_id)
-        commit = self._resolve_commit(input_commit)
+        with self._lock:
+            _validate_component(node_id, "node id")
+            _validate_component(input_commit, "input commit")
+            path = self.node_path(node_id)
+            commit = self._resolve_commit(input_commit)
 
-        if path.exists():
-            if exist_ok and self._is_worktree_at(path, commit):
-                return self._inspect(
-                    path, node_id, input_commit, branch, ("reused existing worktree",)
-                )
-            raise WorktreePathInUse(f"worktree path {path} already exists")
+            if path.exists():
+                if exist_ok and self._is_worktree_at(path, commit):
+                    return self._inspect(
+                        path, node_id, input_commit, branch, ("reused existing worktree",)
+                    )
+                raise WorktreePathInUse(f"worktree path {path} already exists")
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if self._resolved.short:
-                self._create_short(path, commit, branch)
-            else:
-                if branch is not None:
-                    _git(self.repo_root, "worktree", "add", "-b", branch, str(path), commit)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if self._resolved.short:
+                    self._create_short(path, commit, branch)
                 else:
-                    _git(self.repo_root, "worktree", "add", "--detach", str(path), commit)
-            notes = self._setup_aux(path)
-        except BaseException:
-            self._cleanup_failed_creation(path, branch)
-            raise
-        return self._inspect(path, node_id, input_commit, branch, notes)
+                    if branch is not None:
+                        _git(self.repo_root, "worktree", "add", "-b", branch, str(path), commit)
+                    else:
+                        _git(self.repo_root, "worktree", "add", "--detach", str(path), commit)
+                notes = self._setup_aux(path)
+            except BaseException:
+                self._cleanup_failed_creation(path, branch)
+                raise
+            return self._inspect(path, node_id, input_commit, branch, notes)
 
     # --- decommission ------------------------------------------------------------------
 

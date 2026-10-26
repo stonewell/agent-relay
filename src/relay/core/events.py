@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -224,6 +225,7 @@ class EventLog:
         owner_generation: int = 0,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
+        self._lock = threading.RLock()
         self.path = path
         self.owner_generation = owner_generation
         self._now = now
@@ -246,19 +248,20 @@ class EventLog:
         hashes: Mapping[str, str] | None = None,
     ) -> Event:
         """Durably append one event; returns it only after the bytes are on disk."""
-        payload = dict(data or {})
-        validate_event(type_, payload)
-        event = Event(
-            seq=self._next_seq,
-            ts=iso(self._now()),
-            type=type_,
-            owner_generation=self.owner_generation,
-            data=payload,
-            hashes=hashes,
-        )
-        self._write_line(event.to_json().encode("utf-8"))
-        self._next_seq += 1
-        return event
+        with self._lock:
+            payload = dict(data or {})
+            validate_event(type_, payload)
+            event = Event(
+                seq=self._next_seq,
+                ts=iso(self._now()),
+                type=type_,
+                owner_generation=self.owner_generation,
+                data=payload,
+                hashes=hashes,
+            )
+            self._write_line(event.to_json().encode("utf-8"))
+            self._next_seq += 1
+            return event
 
     def _write_line(self, body: bytes) -> None:
         self._handle.write(body + b"\n")  # one write call per record

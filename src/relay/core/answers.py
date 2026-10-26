@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,10 @@ def current_questions(store: RunStore, node_id: str) -> ResultSpec:
     if node_id not in record.nodes:
         raise ValueError("unknown node")
     node = record.nodes[node_id]
-    if record.state != "blocked" or node.state != "blocked":
+    waiting_run = record.state == "blocked" or (
+        store.path("graph.marker").exists() and record.state == "failed"
+    )
+    if not waiting_run or node.state != "blocked":
         raise ValueError("node is not waiting for input")
     result = load_spec(ResultSpec, store.node_dir(node_id) / "result.spec.yaml")
     if result.status != "needs_input":
@@ -50,7 +54,9 @@ def validate_answers(result: ResultSpec, answers: dict[str, AnswerValue]) -> Non
             raise ValueError(f"invalid option for {question.id}")
 
 
-def record_answers(store: RunStore, node_id: str, submission: Submission) -> bool:
+def record_answers(
+    store: RunStore, node_id: str, submission: Submission, *, events: EventLog | None = None
+) -> bool:
     """Caller holds the run lock; validate before appending to the atomic snapshot."""
     result = current_questions(store, node_id)
     existing = read_answers(store.node_dir(node_id), node_id)
@@ -67,16 +73,19 @@ def record_answers(store: RunStore, node_id: str, submission: Submission) -> boo
     existing.submissions.append(submission)
     relative = store.node_dir(node_id).relative_to(store.run_dir).as_posix()
     store.write_spec(f"{relative}/input_answers.yaml", existing)
-    EventLog(store.events_path).append(
-        "input.recorded",
-        {
-            "node_id": node_id,
-            "question_revision": submission.question_revision,
-            "submission_id": submission.submission_id,
-            "provenance": submission.provenance,
-            "content_hash": submission.content_hash(),
-        },
-    )
+    # Inline answers share the active writer's sequence; quiescent CLI replies own a
+    # short-lived log under the run lock.
+    with nullcontext(events) if events is not None else EventLog(store.events_path) as writer:
+        writer.append(
+            "input.recorded",
+            {
+                "node_id": node_id,
+                "question_revision": submission.question_revision,
+                "submission_id": submission.submission_id,
+                "provenance": submission.provenance,
+                "content_hash": submission.content_hash(),
+            },
+        )
     task = load_spec(TaskSpec, store.node_dir(node_id) / "task.spec.yaml")
     record = store.read_run()
     node = record.nodes[node_id]

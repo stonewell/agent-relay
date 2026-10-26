@@ -288,7 +288,7 @@ def test_cli_version_and_help(capsys: pytest.CaptureFixture[str]) -> None:
 
 @pytest.mark.parametrize(
     ("command", "phase"),
-    [("plan", 2), ("graph", 2), ("cancel", 2), ("opencode-config", 3), ("replay", 4)],
+    [("opencode-config", 3), ("replay", 4)],
 )
 def test_later_phase_commands_are_rejected_with_the_phase(
     command: str, phase: int, capsys: pytest.CaptureFixture[str]
