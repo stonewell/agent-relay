@@ -340,6 +340,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 2.9 | done | 2026-10-26 | Actual-adapter reuse fingerprints, conservative unknown-mode handling, cache/ref admission and retained-output cleanup completed; reuse and retention regressions passed on Windows and Linux (design 6) |
 | 2.10 | done | 2026-10-26 | Four deterministic planning templates and the graph CLI implemented and checked through public commands (design 14, 17) |
 | 2.11 | done | 2026-10-26 | Graph resume, cancellation, integration recovery and inline event-writer handling implemented; graph and recovery regressions passed on Windows and Linux (design 6, 8.2, 14) |
+| 2.20 | done | 2026-10-26 | `specs/coordination.py` closed response union (`ask_user`, `request_context`, `propose_plan`, `review`, `finish`) with exported `schemas/coordinator-response.json`; `core/coordinator.py` limits and exact-profile qualification matrix, deliberately empty so every coordinator is unavailable until 2.31/2.32 produce reviewed evidence; actual mode qualification remains a release gate |
 | 2.30 | in progress | 2026-10-26 | `advertised_levels` promotes `readonly` for Claude and Codex on Windows only (`READONLY_VERIFIED_PLATFORMS`); Linux canary and an end-to-end read-node run on both OSes remain before done |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 

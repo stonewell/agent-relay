@@ -1,0 +1,1132 @@
+{
+  "$defs": {
+    "ArtifactSelection": {
+      "additionalProperties": false,
+      "description": "A hash-pinned artifact of a sealed source run (section 5.6 cross-round imports).",
+      "properties": {
+        "artifact": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Artifact",
+          "type": "string"
+        },
+        "attempt": {
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "artifact",
+          "default": "artifact",
+          "title": "Kind",
+          "type": "string"
+        },
+        "lines": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LineRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "node_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Node Id",
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "node_id",
+        "attempt",
+        "artifact",
+        "sha256"
+      ],
+      "title": "ArtifactSelection",
+      "type": "object"
+    },
+    "AskUser": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "ask_user",
+          "default": "ask_user",
+          "title": "Action",
+          "type": "string"
+        },
+        "questions": {
+          "items": {
+            "$ref": "#/$defs/OpenQuestion"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Questions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "questions"
+      ],
+      "title": "AskUser",
+      "type": "object"
+    },
+    "Budget": {
+      "additionalProperties": true,
+      "properties": {
+        "max_attempts": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Attempts"
+        },
+        "max_cost_usd": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Cost Usd"
+        },
+        "max_duration_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Duration S"
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout S"
+        }
+      },
+      "title": "Budget",
+      "type": "object"
+    },
+    "Commands": {
+      "additionalProperties": true,
+      "properties": {
+        "build": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build"
+        },
+        "lint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lint"
+        },
+        "test": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test"
+        }
+      },
+      "title": "Commands",
+      "type": "object"
+    },
+    "Context": {
+      "additionalProperties": true,
+      "properties": {
+        "files": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Files",
+          "type": "array"
+        },
+        "from": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ContextRef"
+          },
+          "title": "From",
+          "type": "array"
+        },
+        "symbols": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Symbols",
+          "type": "array"
+        }
+      },
+      "title": "Context",
+      "type": "object"
+    },
+    "ContextRef": {
+      "additionalProperties": true,
+      "description": "Reference to an upstream result field or artifact (`context.from`).",
+      "properties": {
+        "artifact": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact"
+        },
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Field"
+        },
+        "node": {
+          "title": "Node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node"
+      ],
+      "title": "ContextRef",
+      "type": "object"
+    },
+    "EvidenceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "result",
+            "artifact",
+            "verification",
+            "diff"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "node_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Node Id",
+          "type": "string"
+        },
+        "ref": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_id",
+        "kind",
+        "ref"
+      ],
+      "title": "EvidenceRef",
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "blocker"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "text",
+        "evidence"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "Finish": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "finish",
+          "default": "finish",
+          "title": "Action",
+          "type": "string"
+        },
+        "delivery_recommendation": {
+          "default": "none",
+          "enum": [
+            "apply",
+            "revise",
+            "discard",
+            "none"
+          ],
+          "title": "Delivery Recommendation",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "title": "Finish",
+      "type": "object"
+    },
+    "Graph": {
+      "additionalProperties": true,
+      "properties": {
+        "commands": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Commands"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "integration_acceptance": {
+          "default": [],
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RunCheck"
+              },
+              {
+                "$ref": "#/$defs/ScopeCheck"
+              }
+            ]
+          },
+          "title": "Integration Acceptance",
+          "type": "array"
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/GraphNode"
+          },
+          "minItems": 1,
+          "title": "Nodes",
+          "type": "array"
+        },
+        "policy": {
+          "$ref": "#/$defs/Policy",
+          "default": {
+            "cost_ceiling_usd": null,
+            "cost_mode": null,
+            "max_depth": 2,
+            "max_nodes": 20,
+            "on_failure": "continue-independent"
+          }
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "const": "auto",
+              "type": "string"
+            }
+          ],
+          "default": "auto",
+          "title": "Run Id"
+        },
+        "spec_version": {
+          "default": 1,
+          "title": "Spec Version",
+          "type": "integer"
+        },
+        "verification_skip_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verification Skip Reason"
+        },
+        "verify": {
+          "default": "default",
+          "enum": [
+            "default",
+            "none"
+          ],
+          "title": "Verify",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "title": "Graph",
+      "type": "object"
+    },
+    "GraphNode": {
+      "additionalProperties": true,
+      "properties": {
+        "acceptance": {
+          "default": [],
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RunCheck"
+              },
+              {
+                "$ref": "#/$defs/ScopeCheck"
+              }
+            ]
+          },
+          "title": "Acceptance",
+          "type": "array"
+        },
+        "access": {
+          "anyOf": [
+            {
+              "enum": [
+                "read",
+                "write"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Access"
+        },
+        "budget": {
+          "$ref": "#/$defs/Budget",
+          "default": {
+            "max_attempts": null,
+            "max_cost_usd": null,
+            "max_duration_s": null,
+            "timeout_s": null
+          }
+        },
+        "category": {
+          "enum": [
+            "implement",
+            "bugfix",
+            "refactor",
+            "test",
+            "review",
+            "debug",
+            "migrate",
+            "docs-for-code",
+            "codebase-research",
+            "architecture"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "commands": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Commands"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "constraints": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Constraints",
+          "type": "array"
+        },
+        "context": {
+          "$ref": "#/$defs/Context",
+          "default": {
+            "files": [],
+            "from": [],
+            "symbols": []
+          }
+        },
+        "depends_on": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "goal": {
+          "minLength": 1,
+          "title": "Goal",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Language"
+        },
+        "owns": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Owns",
+          "type": "array"
+        },
+        "permissions": {
+          "anyOf": [
+            {
+              "enum": [
+                "full",
+                "workspace",
+                "readonly"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Permissions"
+        },
+        "priority": {
+          "default": 0,
+          "title": "Priority",
+          "type": "integer"
+        },
+        "routing": {
+          "$ref": "#/$defs/Routing",
+          "default": {
+            "agent": null,
+            "agent_rule": null,
+            "effort": null,
+            "model": null,
+            "model_rule": null
+          }
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "verification_skip_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verification Skip Reason"
+        },
+        "verify": {
+          "default": "default",
+          "enum": [
+            "default",
+            "none"
+          ],
+          "title": "Verify",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "goal",
+        "id"
+      ],
+      "title": "GraphNode",
+      "type": "object"
+    },
+    "LineRange": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "minimum": 1,
+          "title": "End",
+          "type": "integer"
+        },
+        "start": {
+          "minimum": 1,
+          "title": "Start",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "LineRange",
+      "type": "object"
+    },
+    "OpenQuestion": {
+      "additionalProperties": true,
+      "properties": {
+        "default": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default"
+        },
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "default": "free",
+          "enum": [
+            "free",
+            "choice"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "options": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Options"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ],
+      "title": "OpenQuestion",
+      "type": "object"
+    },
+    "Policy": {
+      "additionalProperties": true,
+      "properties": {
+        "cost_ceiling_usd": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost Ceiling Usd"
+        },
+        "cost_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "advisory",
+                "hard"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost Mode"
+        },
+        "max_depth": {
+          "default": 2,
+          "minimum": 0,
+          "title": "Max Depth",
+          "type": "integer"
+        },
+        "max_nodes": {
+          "default": 20,
+          "minimum": 1,
+          "title": "Max Nodes",
+          "type": "integer"
+        },
+        "on_failure": {
+          "default": "continue-independent",
+          "enum": [
+            "fail-fast",
+            "continue-independent"
+          ],
+          "title": "On Failure",
+          "type": "string"
+        }
+      },
+      "title": "Policy",
+      "type": "object"
+    },
+    "ProposePlan": {
+      "additionalProperties": false,
+      "description": "A complete graph proposal; follow-up work is another proposal, never a spawn request.",
+      "properties": {
+        "action": {
+          "const": "propose_plan",
+          "default": "propose_plan",
+          "title": "Action",
+          "type": "string"
+        },
+        "change_summary": {
+          "anyOf": [
+            {
+              "maxLength": 8000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Change Summary"
+        },
+        "explanation": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "title": "Explanation",
+          "type": "string"
+        },
+        "graph": {
+          "$ref": "#/$defs/Graph"
+        }
+      },
+      "required": [
+        "explanation",
+        "graph"
+      ],
+      "title": "ProposePlan",
+      "type": "object"
+    },
+    "RepoSelection": {
+      "additionalProperties": false,
+      "description": "A repository object read from the pinned base, never from the host filesystem.",
+      "properties": {
+        "kind": {
+          "const": "repo",
+          "default": "repo",
+          "title": "Kind",
+          "type": "string"
+        },
+        "lines": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LineRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "path": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "RepoSelection",
+      "type": "object"
+    },
+    "RequestContext": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "request_context",
+          "default": "request_context",
+          "title": "Action",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "selections": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "artifact": "#/$defs/ArtifactSelection",
+                "repo": "#/$defs/RepoSelection"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/RepoSelection"
+              },
+              {
+                "$ref": "#/$defs/ArtifactSelection"
+              }
+            ]
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Selections",
+          "type": "array"
+        }
+      },
+      "required": [
+        "reason",
+        "selections"
+      ],
+      "title": "RequestContext",
+      "type": "object"
+    },
+    "Review": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "review",
+          "default": "review",
+          "title": "Action",
+          "type": "string"
+        },
+        "findings": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "maxItems": 50,
+          "title": "Findings",
+          "type": "array"
+        },
+        "remaining_questions": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/OpenQuestion"
+          },
+          "maxItems": 8,
+          "title": "Remaining Questions",
+          "type": "array"
+        },
+        "summary": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "title": "Review",
+      "type": "object"
+    },
+    "Routing": {
+      "additionalProperties": true,
+      "description": "Orchestrator-owned; ids match the route log (section 4.4).",
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent"
+        },
+        "agent_rule": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent Rule"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "model_rule": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Rule"
+        }
+      },
+      "title": "Routing",
+      "type": "object"
+    },
+    "RunCheck": {
+      "additionalProperties": false,
+      "description": "Executable acceptance check, run by the Verifier.",
+      "properties": {
+        "expect_exit": {
+          "default": 0,
+          "title": "Expect Exit",
+          "type": "integer"
+        },
+        "expect_output": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expect Output"
+        },
+        "run": {
+          "minLength": 1,
+          "title": "Run",
+          "type": "string"
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout S"
+        }
+      },
+      "required": [
+        "run"
+      ],
+      "title": "RunCheck",
+      "type": "object"
+    },
+    "ScopeCheck": {
+      "additionalProperties": false,
+      "description": "Scope check only; never counts as an executable check (section 10).",
+      "properties": {
+        "diff_scope": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Diff Scope",
+          "type": "array"
+        }
+      },
+      "required": [
+        "diff_scope"
+      ],
+      "title": "ScopeCheck",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The single object a coordinator call returns (the schema root must be an object).",
+  "properties": {
+    "response": {
+      "discriminator": {
+        "mapping": {
+          "ask_user": "#/$defs/AskUser",
+          "finish": "#/$defs/Finish",
+          "propose_plan": "#/$defs/ProposePlan",
+          "request_context": "#/$defs/RequestContext",
+          "review": "#/$defs/Review"
+        },
+        "propertyName": "action"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AskUser"
+        },
+        {
+          "$ref": "#/$defs/RequestContext"
+        },
+        {
+          "$ref": "#/$defs/ProposePlan"
+        },
+        {
+          "$ref": "#/$defs/Review"
+        },
+        {
+          "$ref": "#/$defs/Finish"
+        }
+      ],
+      "title": "Response"
+    },
+    "spec_version": {
+      "default": 1,
+      "title": "Spec Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "response"
+  ],
+  "title": "CoordinatorResponse",
+  "type": "object"
+}

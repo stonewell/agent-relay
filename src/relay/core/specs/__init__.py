@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from ..yamlio import load_yaml
 from .answers import InputAnswers, Submission
 from .common import SPEC_VERSION
+from .coordination import CoordinatorResponse
 from .graph import Graph, GraphNode, Policy
 from .result import OpenQuestion, ResultSpec
 from .route import RouteEntry
@@ -19,6 +20,7 @@ from .task import TaskSpec
 __all__ = [
     "SCHEMAS",
     "SPEC_VERSION",
+    "CoordinatorResponse",
     "Graph",
     "GraphNode",
     "InputAnswers",
@@ -42,6 +44,7 @@ SCHEMAS: dict[str, type[BaseModel]] = {
     "graph": Graph,
     "input-answers": InputAnswers,
     "route-entry": RouteEntry,
+    "coordinator-response": CoordinatorResponse,
 }
 
 
