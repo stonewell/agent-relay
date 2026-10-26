@@ -1,0 +1,40 @@
+policy:
+  max_depth: 3
+integration_acceptance: []
+nodes:
+- category: codebase-research
+  goal: 'Inspect the code and propose a concrete plan: finish the left over tasks
+    4.2 for current project'
+  access: read
+  id: research
+- category: implement
+  goal: finish the left over tasks 4.2 for current project
+  context:
+    files: []
+    from:
+    - node: research
+      field: summary
+  acceptance: []
+  depends_on:
+  - research
+  access: write
+  id: implement
+- category: test
+  goal: 'Add regression coverage for: finish the left over tasks 4.2 for current project'
+  context:
+    files: []
+    from:
+    - node: implement
+      field: summary
+  acceptance: []
+  depends_on:
+  - implement
+  access: write
+  id: tests
+- category: review
+  goal: 'Review the implementation and tests: finish the left over tasks 4.2 for current
+    project'
+  depends_on:
+  - tests
+  access: read
+  id: review

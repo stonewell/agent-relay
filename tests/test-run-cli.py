@@ -276,7 +276,7 @@ def test_explicit_skip_is_preserved_through_apply(
     assert json.loads(capsys.readouterr().out)["verification"]["outcome"] == "skipped"
 
 
-def test_timeout_is_honored_without_retrying_a_timed_out_attempt(
+def test_timeout_retries_are_bounded_by_the_total_attempt_limit(
     running: tuple[Path, FakeAdapter], capsys: pytest.CaptureFixture[str]
 ) -> None:
     repo, adapter = running
@@ -301,7 +301,9 @@ def test_timeout_is_honored_without_retrying_a_timed_out_attempt(
     )
     payload = json.loads(capsys.readouterr().out)
     assert "timed out" in payload["error"]
-    assert len(adapter.invocations) == 1
+    assert len(adapter.invocations) == 3
+    record = RunStore(repo, payload["run_id"]).read_run()
+    assert record.nodes["n1"].attempts == 3
 
 
 def test_apply_rechecks_the_authorized_policy_on_a_changed_target(

@@ -15,6 +15,7 @@ from .commands import agents as agents_command
 from .commands import apply as apply_command
 from .commands import clean as clean_command
 from .commands import doctor, result, routes, run, status
+from .commands import graph as graph_command
 from .commands import input as input_command
 from .errors import report_error
 from .exitcodes import Exit
@@ -39,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_parser(commands)
     input_command.add_parsers(commands)
     status.add_parser(commands)
+    graph_command.add_parsers(commands)
     for name in COMMAND_PHASE:
         if name not in IMPLEMENTED:
             stub = commands.add_parser(name, add_help=False)
@@ -78,6 +80,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _dispatch(args: argparse.Namespace, repo_root: Path) -> int:
+    if args.command in ("graph", "plan", "cancel"):
+        return graph_command.run(args, repo_root)
     if args.command in ("reply", "resume"):
         return input_command.run(args, repo_root)
     if args.command == "agents":

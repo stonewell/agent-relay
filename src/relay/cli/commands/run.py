@@ -21,7 +21,7 @@ from relay.core.specs.task import Commands, RunCheck, ScopeCheck, TaskSpec
 from ..exitcodes import Exit
 
 _NODE_ID = "n1"
-"""The node id of a single-node run (the graph arrives with phase 2)."""
+"""The node id used for a single-node run."""
 
 _LEVELS = ("full", "workspace", "readonly")
 
@@ -209,7 +209,10 @@ def _task_spec(args: argparse.Namespace, repo_root: Path) -> TaskSpec:
     # Mutations above must pass the same validation as a newly loaded spec.
     task = TaskSpec.model_validate(task.model_dump(mode="json", by_alias=True))
     if task.depends_on or task.context.from_:
-        raise ValueError("task dependencies and context.from are available from phase 2")
+        raise ValueError(
+            "single-node relay run does not accept task dependencies or context.from; "
+            "use relay graph run FILE"
+        )
     if (
         task.repo.root != "."
         or task.repo.base_branch is not None

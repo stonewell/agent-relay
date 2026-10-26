@@ -24,6 +24,9 @@ COMMAND_PHASE: dict[str, int] = {
 }
 
 IMPLEMENTED = {
+    "graph",
+    "plan",
+    "cancel",
     "reply",
     "resume",
     "agents",
