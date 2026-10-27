@@ -27,6 +27,7 @@ import os
 import secrets
 import threading
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -60,7 +61,12 @@ __all__ = [
     "SessionOwnershipUnavailable",
     "SessionRecord",
     "SessionStore",
+    "RunDeletion",
+    "SessionDeletion",
+    "SessionDeletionPlan",
+    "delete_session",
     "linked_session",
+    "plan_session_deletion",
     "protected_run_ids",
     "round_state",
     "session_guard",
@@ -70,6 +76,8 @@ SESSIONS_DIR = "sessions"
 SESSION_JSON = "session.json"
 SESSION_EVENTS = "events.jsonl"
 MESSAGES = "messages.jsonl"
+DELETING = "deleting"
+SESSION_REFS = "refs/relay-sessions"
 
 
 class SessionError(RuntimeError):
@@ -294,8 +302,26 @@ class SessionOwner:
         self._events: EventLog | None = None
 
     @classmethod
-    def acquire(cls, repo_root: Path, session_id: str) -> SessionOwner:
-        store = SessionStore.open(repo_root, session_id)
+    def acquire(
+        cls,
+        repo_root: Path,
+        session_id: str,
+        *,
+        finishing_deletion: bool = False,
+        recover: bool = True,
+    ) -> SessionOwner:
+        """Take the session lock. `recover=False` inspects without changing any record."""
+        # Not `SessionStore.open`: sweeping temp files before holding the lock would race a
+        # live owner's atomic writes. Leftovers are swept once ownership is held.
+        store = SessionStore(repo_root, session_id)
+        if not (store.dir / SESSION_JSON).is_file():
+            raise SessionError(f"session {session_id} not found under {sessions_dir(repo_root)}")
+        if (store.dir / DELETING).exists() and not finishing_deletion:
+            # Recovery reconciles an interrupted deletion before admitting new work (section 6).
+            raise SessionError(
+                f"deletion of session {session_id} was interrupted; confirm deletion again to "
+                "finish it"
+            )
         locks = locks_dir(repo_root)
         probe = probe_lock_support(locks)
         if not probe.supported:
@@ -305,8 +331,10 @@ class SessionOwner:
             lock.acquire()
         except LockHeld as exc:
             raise SessionBusy(f"session {session_id} is owned by another process") from exc
+        sweep_temp_files(store.dir)
         owner = cls(store, lock)
-        owner._recover()
+        if recover and not finishing_deletion:
+            owner._recover()
         return owner
 
     # --- lifecycle ------------------------------------------------------------------------
@@ -329,6 +357,11 @@ class SessionOwner:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    def _close_events(self) -> None:
+        if self._events is not None:
+            self._events.close()
+            self._events = None
 
     def _require(self) -> None:
         if not self._lock.held:
@@ -391,11 +424,14 @@ class SessionOwner:
         parent: int | None = None,
         expected_revision: int | None = None,
         base: dict[str, Any] | None = None,
+        proposer: dict[str, Any] | None = None,
     ) -> int:
         """Persist an immutable plan revision and make it current; returns its number.
 
         `base` names the explicit retained base (checkpoint or integration) the round starts
         from; it is part of the digest the operator approves. None means the repository HEAD.
+        `proposer` is the exact coordinator profile that proposed the plan; when given it is
+        part of the digest too, so a changed coordinator cannot inherit the approval.
         """
         with self._mutex:
             record = self._check_revision(expected_revision)
@@ -408,7 +444,12 @@ class SessionOwner:
                 "explanation": explanation,
                 "graph": graph,
                 "base": base,
-                "digest": digest_of({"graph": graph, "base": base}),
+                "proposer": proposer,
+                "digest": digest_of(
+                    {"graph": graph, "base": base}
+                    if proposer is None
+                    else {"graph": graph, "base": base, "proposer": proposer}
+                ),
             }
             directory = self.store.dir / "plans"
             directory.mkdir(exist_ok=True)
@@ -750,3 +791,290 @@ def protected_run_ids(repo_root: Path) -> set[str]:
             if record.intent is not None:
                 protected.add(record.intent.run_id)
     return protected
+
+
+# --- confirmed deletion ---------------------------------------------------------------------------
+
+
+def _unconfirmed_execution(repo_root: Path, store: SessionStore) -> list[str]:
+    """Why deleting now could lose track of execution (empty when it is safe)."""
+    record = store.read()
+    problems: list[str] = []
+    if record.state == "active":
+        problems.append("the session was not closed cleanly; open it once so it is recovered")
+    if record.intent is not None and record.intent.state == "pending":
+        problems.append(f"approved launch {record.intent.intent_id} has not been reconciled")
+    for turn in store.list_records("turns"):
+        if turn.get("status") in ("active", "blocked"):
+            problems.append(
+                f"coordinator turn {turn.get('turn_id')} is {turn.get('status')}: its coordinator "
+                "process is not confirmed stopped"
+            )
+    for call in store.list_records("calls"):
+        if call.get("status") == "started":
+            problems.append(f"coordinator call {call.get('call_id')} was never confirmed finished")
+    for run_id in record.linked_runs:
+        # Not `RunStore.open`: no sweeping of another writer's temp files.
+        run_store = RunStore(repo_root, run_id)
+        if not run_store.run_json.is_file():
+            continue
+        try:
+            run = run_store.read_run()
+        except (StoreError, OSError, ValueError) as exc:
+            problems.append(f"run {run_id} is unreadable: {exc}")
+            continue
+        if run.state == "running":
+            problems.append(f"run {run_id} is still running or was never recovered")
+        for node_id, node in run.nodes.items():
+            if node.worker is not None or node.worker_pending or node.recovery_pending:
+                problems.append(f"run {run_id} node {node_id} has an unconfirmed worker")
+    return problems
+
+
+RoundDelivery = Literal["delivered", "undelivered", "unknown"]
+
+
+@dataclass(frozen=True)
+class RunDeletion:
+    """One run that deleting the session removes, and whether its work was delivered."""
+
+    run_id: str
+    state: str
+    delivery: RoundDelivery
+    detail: str
+    refs: tuple[str, ...]
+    worktrees: int
+    scratch: bool
+    blocker: str | None
+
+
+@dataclass(frozen=True)
+class SessionDeletionPlan:
+    session_id: str
+    runs: tuple[RunDeletion, ...]
+    session_refs: tuple[str, ...]
+    problems: tuple[str, ...]
+    """Reasons deletion is refused now (live or unverifiable execution, shared runs)."""
+
+    @property
+    def undelivered(self) -> tuple[RunDeletion, ...]:
+        return tuple(r for r in self.runs if r.delivery != "delivered")
+
+
+@dataclass(frozen=True)
+class SessionDeletion:
+    session_id: str
+    runs: tuple[str, ...]
+    refs: tuple[str, ...]
+
+
+def _git_lines(repo_root: Path, *args: str) -> list[str] | None:
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return proc.stdout.splitlines() if proc.returncode == 0 else None
+
+
+def _round_delivery(
+    repo_root: Path, store: SessionStore, item: RoundRecord
+) -> tuple[str, RoundDelivery, str]:
+    """(run state, delivery, detail): delivered means a user branch already contains it."""
+    run_store = RunStore(repo_root, item.run_id)  # no sweep
+    if not run_store.run_json.is_file():
+        return "missing", "undelivered", "the run record is missing"
+    try:
+        run = run_store.read_run()
+    except (StoreError, OSError, ValueError) as exc:
+        return "unreadable", "unknown", f"the run record is unreadable: {exc}"
+    commit: str | None = None
+    if run.state == "done" and run.final_commit:
+        commit = run.final_commit
+    elif item.checkpoint_id:
+        path = store.dir / "checkpoints" / f"{item.checkpoint_id}.json"
+        with contextlib.suppress(OSError, ValueError):
+            commit = json.loads(read_text(path)).get("combined_commit")
+    if not commit:
+        return run.state, "undelivered", f"{run.state}, no delivered result"
+    branches = _git_lines(
+        repo_root, "for-each-ref", "--contains", commit, "--format=%(refname)", "refs/heads/"
+    )
+    if branches is None:
+        return run.state, "unknown", "whether it was applied cannot be checked"
+    users = [b for b in branches if not b.startswith("refs/heads/relay/")]
+    if users:
+        names = ", ".join(b.removeprefix("refs/heads/") for b in users[:3])
+        return run.state, "delivered", f"contained in {names}"
+    return run.state, "undelivered", f"{run.state}, not applied to any branch"
+
+
+def _session_runs(repo_root: Path, store: SessionStore) -> list[str]:
+    """The runs linked to this session (rounds, a reserved launch, and a deletion's list)."""
+    record = store.read()
+    ids = list(record.linked_runs)
+    if record.intent is not None and record.intent.run_id not in ids:
+        ids.append(record.intent.run_id)
+    marker = store.dir / DELETING
+    if marker.is_file():
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            for run_id in json.loads(read_text(marker)).get("runs", []):
+                if str(run_id) not in ids:
+                    ids.append(str(run_id))
+    return [run_id for run_id in ids if (runs_dir(repo_root) / run_id).exists()]
+
+
+def _shared_with_others(repo_root: Path, session_id: str, run_ids: list[str]) -> list[str]:
+    problems: list[str] = []
+    for other in SessionStore.list_sessions(repo_root):
+        if other == session_id:
+            continue
+        with contextlib.suppress(SessionError, OSError, ValueError):
+            record = SessionStore(repo_root, other).read()
+            referenced = set(record.linked_runs)
+            if record.intent is not None:
+                referenced.add(record.intent.run_id)
+            for run_id in run_ids:
+                if run_id in referenced:
+                    problems.append(f"run {run_id} is also referenced by session {other}")
+    return problems
+
+
+def plan_session_deletion(
+    repo_root: Path, session_id: str, *, worktree_root: str | None = None
+) -> SessionDeletionPlan:
+    """Exactly what deleting the session removes; read-only (no lock, no sweeping)."""
+    from .run_purge import owner_blocker, plan_run_purge
+
+    store = SessionStore(repo_root, session_id)
+    if not (store.dir / SESSION_JSON).is_file():
+        raise SessionError(f"session {session_id} not found under {sessions_dir(repo_root)}")
+    root = worktree_root or _worktree_root(repo_root)
+    record = store.read()
+    rounds = {item.run_id: item for item in record.rounds}
+    run_ids = _session_runs(repo_root, store)
+    problems: list[str] = []
+    if not (store.dir / DELETING).exists():
+        problems += _unconfirmed_execution(repo_root, store)
+    problems += _shared_with_others(repo_root, session_id, run_ids)
+    runs: list[RunDeletion] = []
+    for run_id in run_ids:
+        item = rounds.get(run_id) or RoundRecord(run_id=run_id, plan_revision=1)
+        state, delivery, detail = _round_delivery(repo_root, store, item)
+        blocker = owner_blocker(repo_root, run_id)
+        if blocker is not None:
+            problems.append(blocker)
+        purge = plan_run_purge(repo_root, run_id, root)
+        runs.append(
+            RunDeletion(
+                run_id, state, delivery, detail, tuple(purge.refs), len(purge.worktrees),
+                purge.scratch is not None, blocker,
+            )
+        )  # fmt: skip
+    refs = _git_lines(
+        repo_root, "for-each-ref", "--format=%(refname)", f"{SESSION_REFS}/{session_id}/"
+    )
+    return SessionDeletionPlan(session_id, tuple(runs), tuple(refs or ()), tuple(problems))
+
+
+def _worktree_root(repo_root: Path) -> str:
+    from . import registry
+
+    return registry.load_config(
+        project_root=repo_root, user_config=registry.USER_CONFIG
+    ).config.paths.worktree_root
+
+
+def delete_session(
+    repo_root: Path,
+    session_id: str,
+    *,
+    include_undelivered: bool = False,
+    worktree_root: str | None = None,
+) -> SessionDeletion:
+    """Delete a session and its runs after operator confirmation (section 6).
+
+    Ownership is acquired first (:class:`SessionBusy` if another process owns it), without
+    recovery, so a refused deletion changes no record. Refused with :class:`SessionConflict`:
+    active or unconfirmed execution (including coordinator turns and calls not proven
+    finished), a run whose owner is alive or cannot be checked, a run another session also
+    references, and -- unless `include_undelivered` records the operator's explicit
+    confirmation -- any round whose work is not contained in a user branch, or whose applied
+    state cannot be checked.
+
+    A durable marker listing the runs is written before anything is removed. Each run is purged
+    like `relay clean --purge-runs` (worktrees, scratch, then `refs/relay/<run>/...` and
+    `refs/heads/relay/<run>/...`, then its record); then the session's checkpoint refs and
+    records go, `session.json` last. Deleting again after a crash finishes the job; ownership
+    is refused until then. No other ref is touched, so the user's branches never change. Lock
+    objects are never created, replaced or unlinked; the session lock keeps its id reserved.
+    """
+    import shutil
+
+    from .run_purge import execute_run_purge, owner_blocker, plan_run_purge
+
+    # Not `SessionStore.open`: sweeping before the lock is held would race a live owner.
+    store = SessionStore(repo_root, session_id)
+    if not (store.dir / SESSION_JSON).is_file():
+        raise SessionError(f"session {session_id} not found under {sessions_dir(repo_root)}")
+    finishing = (store.dir / DELETING).exists()
+    owner = SessionOwner.acquire(repo_root, session_id, finishing_deletion=finishing, recover=False)
+    try:
+        root = worktree_root or _worktree_root(repo_root)
+        run_ids = _session_runs(repo_root, store)
+        problems = [] if finishing else _unconfirmed_execution(repo_root, store)
+        problems += _shared_with_others(repo_root, session_id, run_ids)
+        problems += [b for b in (owner_blocker(repo_root, r) for r in run_ids) if b is not None]
+        if problems:
+            raise SessionConflict("cannot delete the session: " + "; ".join(problems))
+        if not finishing:
+            rounds = {item.run_id: item for item in store.read().rounds}
+            pending: list[str] = []
+            for run_id in run_ids:
+                item = rounds.get(run_id) or RoundRecord(run_id=run_id, plan_revision=1)
+                _, delivery, detail = _round_delivery(repo_root, store, item)
+                if delivery != "delivered":
+                    pending.append(f"{run_id} ({detail})")
+            if pending and not include_undelivered:
+                raise SessionConflict(
+                    "these rounds were not delivered (or their applied state is unknown) and "
+                    "would be deleted with the session: "
+                    + "; ".join(pending)
+                    + ". Confirm deleting them explicitly."
+                )
+            marker = {"at": iso(datetime.now(UTC)), "runs": run_ids}
+            atomic_write(store.dir / DELETING, json.dumps(marker) + "\n")
+        for run_id in run_ids:
+            execute_run_purge(repo_root, plan_run_purge(repo_root, run_id, root))
+        prefix = f"{SESSION_REFS}/{store.session_id}/"
+        refs = _git_lines(repo_root, "for-each-ref", "--format=%(refname)", prefix)
+        if refs is None:
+            raise SessionError("cannot list the session's refs; deletion can be retried")
+        removed: list[str] = []
+        for ref in refs:
+            if ref.startswith(prefix):
+                if _git_lines(repo_root, "update-ref", "-d", ref) is None:
+                    raise SessionError(f"cannot delete {ref}; deletion can be retried")
+                removed.append(ref)
+        with owner._mutex:  # pyright: ignore[reportPrivateUsage]
+            owner._close_events()  # pyright: ignore[reportPrivateUsage]
+            keep = {SESSION_JSON, DELETING}
+            for child in list(store.dir.iterdir()):
+                if child.name in keep:
+                    continue
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            (store.dir / SESSION_JSON).unlink()  # now hidden from listings: nothing else remains
+            (store.dir / DELETING).unlink()
+            store.dir.rmdir()
+        return SessionDeletion(session_id, tuple(run_ids), tuple(removed))
+    finally:
+        with owner._mutex:  # pyright: ignore[reportPrivateUsage]
+            owner._close_events()  # pyright: ignore[reportPrivateUsage]
+        owner._lock.release()  # pyright: ignore[reportPrivateUsage]

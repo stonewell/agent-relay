@@ -27,6 +27,7 @@ from .delivery import sync_delivery_policy
 from .graph import GraphResult, run_graph
 from .progress import ProgressChannel
 from .registry import Config
+from .runlock import OwnerState, inspect_owner
 from .scheduler import SchedulerControl
 from .sessions import SessionConflict, SessionError, SessionOwner
 from .specs import Graph
@@ -194,6 +195,42 @@ class SessionController:
             raise SessionConflict(f"run {run_id} has no recorded graph")
         await asyncio.to_thread(self.owner.restore_round, run_id)
         await asyncio.to_thread(store.update_run, lambda r: setattr(r, "interrupted_reason", None))
+        return await self._launch(store, record.graph, resume=True)
+
+    async def continue_round(self, run_id: str) -> str:
+        """Explicitly continue an interrupted, not superseded round (never done on reopen).
+
+        This is the operator's continuation after a stop or an owner death (section 8.7): the
+        round must be this session's active round and its run `interrupted` for a reason other
+        than a checkpoint, or still `running` with a stale or absent owner (a crash). The
+        durable gate is reopened as part of the action, and run recovery proves old workers
+        ended before anything is dispatched (section 6).
+        """
+        if self._closed:
+            raise SessionError("controller is shut down")
+        if self.running:
+            raise SessionConflict("a round is already active in this session")
+        rounds = [x for x in self.owner.record.rounds if x.run_id == run_id]
+        if not rounds or rounds[0].state != "active":
+            raise SessionConflict(f"run {run_id} is not an active round of this session")
+        repo = self.owner.store.repo_root
+        store = await asyncio.to_thread(RunStore.open, repo, run_id)
+        record = await asyncio.to_thread(store.read_run)
+        if record.state == "running":
+            # An owner that died leaves `running` until takeover; only a stale or absent owner
+            # may be taken over, and run recovery still proves its workers ended (section 6).
+            owner = await asyncio.to_thread(inspect_owner, repo, run_id)
+            if owner.state not in (OwnerState.STALE, OwnerState.ABSENT):
+                raise SessionConflict(
+                    f"run {run_id} is still owned by a live or unverifiable process"
+                )
+        elif record.state != "interrupted" or record.interrupted_reason == "checkpoint":
+            raise SessionConflict(f"run {run_id} is {record.state}, not an interrupted round")
+        if record.graph is None:
+            raise SessionConflict(f"run {run_id} has no recorded graph")
+        if self.owner.record.admission != "open":
+            await asyncio.to_thread(self.owner.open_admission)
+        await asyncio.to_thread(self.owner.mark_active)
         return await self._launch(store, record.graph, resume=True)
 
     async def _bound(self) -> None:

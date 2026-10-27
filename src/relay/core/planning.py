@@ -59,7 +59,7 @@ from .specs.coordination import (
     Review,
 )
 from .specs.result import OpenQuestion
-from .store import RunStore, iso
+from .store import RunStore, StoreError, iso
 from .verify import executable_commands
 
 __all__ = [
@@ -67,6 +67,8 @@ __all__ = [
     "PlanningEngine",
     "PlanningSetup",
     "TurnResult",
+    "proposer_record",
+    "recover_turns",
     "validate_plan",
 ]
 
@@ -230,6 +232,9 @@ class PlanningEngine:
         self.owner = owner
         self.setup = setup
         self.broker = ContextBroker(owner.store.repo_root, setup.limits)
+        self.plan_base: dict[str, Any] | None = None
+        """The explicit retained base (checkpoint or unapplied integration) new proposals start
+        from; it is saved with the plan and covered by its approval digest. None means HEAD."""
 
     # --- public turns -----------------------------------------------------------------------
 
@@ -600,6 +605,8 @@ class PlanningEngine:
                 explanation=action.explanation
                 + (f"\nChanges: {action.change_summary}" if action.change_summary else ""),
                 parent=current or None,
+                base=self.plan_base,
+                proposer=proposer_record(self.setup.qualification),
             )
             await asyncio.to_thread(
                 self.owner.append_message,
@@ -660,7 +667,10 @@ class PlanningEngine:
                         )
                     )
                     continue
-                store = RunStore.open(self.owner.store.repo_root, selection.run_id)
+                # Not `RunStore.open`: sweeping temp files would race a live run's writer.
+                store = RunStore(self.owner.store.repo_root, selection.run_id)
+                if not store.run_json.is_file():
+                    raise StoreError(f"run {selection.run_id} not found")
                 items.append(
                     ArtifactItem(
                         store,
@@ -678,34 +688,53 @@ class PlanningEngine:
     # --- recovery ----------------------------------------------------------------------------
 
     def recover(self) -> dict[str, str]:
-        """After owner death: prove old coordinator processes ended; never repeat a call.
+        """After owner death: prove old coordinator processes ended (see :func:`recover_turns`)."""
+        return recover_turns(self.owner)
 
-        Active turns become `interrupted` (their consumed steps and time are preserved) or
-        `blocked` when an old coordinator process cannot be shown to have terminated.
-        """
-        states: dict[str, str] = {}
-        for turn in self.owner.store.list_records("turns"):
-            if turn["status"] != "active":
+
+def proposer_record(qualification: Qualification) -> dict[str, Any]:
+    """The exact coordinator profile and mode saved with (and digested into) a proposed plan."""
+    profile = qualification.profile
+    return {
+        "agent": profile.agent,
+        "cli_version": profile.cli_version,
+        "os": profile.os,
+        "auth_mode": profile.auth_mode,
+        "config_digest": profile.config_digest,
+        "mode": qualification.mode,
+    }
+
+
+def recover_turns(owner: SessionOwner) -> dict[str, str]:
+    """After owner death: prove old coordinator processes ended; never repeat a call.
+
+    Active turns become `interrupted` (their consumed steps and time are preserved) or
+    `blocked` when an old coordinator process cannot be shown to have terminated. This needs no
+    coordinator, so a reopened session recovers even while coordination is unavailable.
+    """
+    states: dict[str, str] = {}
+    for turn in owner.store.list_records("turns"):
+        if turn["status"] != "active":
+            continue
+        blocked = False
+        for call_id in turn["calls"]:
+            call = owner.store.read_record("calls", call_id)
+            if call is None or call["status"] != "started":
                 continue
-            blocked = False
-            for call_id in turn["calls"]:
-                call = self.owner.store.read_record("calls", call_id)
-                if call is None or call["status"] != "started":
-                    continue
-                marker = NodeRecord(
-                    dir="coordinator",
-                    worker_pending=bool(call.get("worker_pending")),
-                    worker=WorkerRecord(**call["worker"]) if call.get("worker") else None,
-                )
-                if not stop_old_worker(marker):
-                    blocked = True
-                else:
-                    call["status"] = "interrupted"
-                    self.owner.write_record("calls", call_id, call)
-            turn["status"] = "blocked" if blocked else "interrupted"
-            self.owner.write_record("turns", turn["turn_id"], turn)
-            states[turn["turn_id"]] = turn["status"]
-        return states
+            marker = NodeRecord(
+                dir="coordinator",
+                worker_pending=bool(call.get("worker_pending")),
+                worker=WorkerRecord(**call["worker"]) if call.get("worker") else None,
+            )
+            if not stop_old_worker(marker):
+                blocked = True
+            else:
+                call["status"] = "interrupted"
+                owner.write_record("calls", call_id, call)
+        turn["status"] = "blocked" if blocked else "interrupted"
+        owner.write_record("turns", turn["turn_id"], turn)
+        states[turn["turn_id"]] = turn["status"]
+    return states
 
 
 class _Repair(Exception):

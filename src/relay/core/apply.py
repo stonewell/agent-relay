@@ -61,6 +61,10 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 
 
+_GIT_TIMEOUT_S = 900.0
+"""Upper bound for one delivery git command (merges in large repositories included)."""
+
+
 class ApplyError(RuntimeError):
     """Delivery of a run's integration commit failed."""
 
@@ -742,9 +746,15 @@ def _run(
     try:
         return subprocess.run(
             ["git", "-C", str(repo_root), *args],
+            # No inherited stdin (a TUI owns the terminal) and a generous bound, so a git
+            # process that never ends cannot hang delivery forever.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             env={**os.environ, **(env or {})},
+            timeout=_GIT_TIMEOUT_S,
         )
     except FileNotFoundError as exc:
         raise GitApplyError(args, "git is not installed or not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitApplyError(args, f"git did not finish within {_GIT_TIMEOUT_S:.0f}s") from exc
