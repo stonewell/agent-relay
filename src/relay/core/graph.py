@@ -27,8 +27,10 @@ from .gitbase import (
     EmptyRepositoryError,
     InvalidRefError,
     NotARepositoryError,
+    base_ref,
     read_ref,
     resolve_base,
+    write_ref,
 )
 from .gitexclude import ensure_exclude_block
 from .model_router import ModelDecision, escalate, select_model
@@ -50,6 +52,7 @@ from .scopes import writers_overlap
 from .sessions import SessionOwner
 from .snapshots import merge_snapshot
 from .specs import Graph, GraphNode, ResultSpec, TaskSpec, load_spec
+from .specs.checkpoint import RetainedBase
 from .specs.common import PermissionLevel, normalize_repo_path
 from .specs.route import PreviousRoute, RouteEntry, RouteEvent
 from .specs.task import Commands, RunCheck
@@ -897,6 +900,7 @@ async def run_graph(
     store: RunStore | None = None,
     session_owner: SessionOwner | None = None,
     control: SchedulerControl | None = None,
+    retained_base: RetainedBase | None = None,
 ) -> GraphResult:
     """Coordinate one foreground graph, with no detached supervisor or IPC."""
     if concurrency is not None and concurrency < 1:
@@ -982,16 +986,23 @@ async def run_graph(
         else:
             store.write_text("graph.marker", "foreground\n")
             ensure_exclude_block(repo)
-            base = resolve_base(repo, store.run_id, allow_dirty=allow_dirty)
-            coordinator.base = base.commit
+            if retained_base is not None:
+                # An explicit, pinned base (checkpoint or unapplied integration): never HEAD.
+                assert retained_base.commit is not None
+                write_ref(repo, base_ref(store.run_id), retained_base.commit)
+                store.update_run(lambda r: setattr(r, "base", retained_base))
+                coordinator.base = retained_base.commit
+            else:
+                base = resolve_base(repo, store.run_id, allow_dirty=allow_dirty)
+                coordinator.base = base.commit
             project = repo / "PROJECT.spec.md"
             store.write_text("PROJECT.spec.md", read_text(project) if project.exists() else "")
             events.append(
                 "run.started",
                 {
                     "config_hash": config_hash,
-                    "base_commit": base.commit,
-                    "allow_dirty": allow_dirty,
+                    "base_commit": coordinator.base,
+                    "allow_dirty": allow_dirty and retained_base is None,
                     "run_id": store.run_id,
                 },
             )

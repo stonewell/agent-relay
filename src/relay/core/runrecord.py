@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from .specs.checkpoint import RetainedBase
 from .specs.common import NodeId, RunId, Sha, SpecModel, VersionedSpec
 from .specs.graph import Graph
 
@@ -54,3 +55,5 @@ class RunRecord(VersionedSpec):
     final_commit: Sha | None = None
     budget_ledger: dict[str, Any] = {}
     session: SessionLink | None = None
+    base: RetainedBase | None = None
+    interrupted_reason: str | None = None

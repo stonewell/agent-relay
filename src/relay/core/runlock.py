@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .platform.procid import IdentityState, ProcessIdentity, check_identity, current_identity
-from .sessions import SessionBusy, SessionError, SessionOwner, linked_session
+from .sessions import SessionBusy, SessionError, SessionOwner, linked_session, round_state
 from .store import RunStore, StoreError, locks_dir, read_text
 
 
@@ -269,6 +269,16 @@ class RunLock:
             raise RunLockSessionBusy(run_id, str(exc)) from exc
         except SessionError as exc:
             raise RunLockSessionBusy(run_id, str(exc)) from exc
+        if (session is not None or session_owner is not None) and (
+            round_state(repo_root, run_id) == "superseded"
+        ):
+            if session is not None:
+                session.close()
+            raise RunLockSessionBusy(
+                run_id,
+                "this round was superseded by a checkpoint and cannot resume; "
+                "restore it explicitly from its session",
+            )
         try:
             lock = cls._acquire_file(repo_root, run_id, takeover=takeover)
         except BaseException:

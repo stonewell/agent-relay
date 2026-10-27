@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -22,12 +22,14 @@ from typing import Any, Literal
 from relay.adapters.base import AgentAdapter
 
 from .answers import record_answers
+from .checkpoints import resolve_retained_base, seal_checkpoint
 from .graph import GraphResult, run_graph
 from .registry import Config
 from .scheduler import SchedulerControl
 from .sessions import SessionConflict, SessionError, SessionOwner
 from .specs import Graph
 from .specs.answers import AnswerValue, Submission
+from .specs.checkpoint import CheckpointManifest, RetainedBase
 from .store import RunStore, iso
 
 __all__ = ["AnswerRejected", "CommandResult", "SessionController"]
@@ -89,11 +91,24 @@ class SessionController:
             raise SessionError("controller is shut down")
         if self.running:
             raise SessionConflict("a round is already active in this session")
-        store = await asyncio.to_thread(self.owner.start_run)
         record = self.owner.record
-        assert record.intent is not None
+        if record.intent is None:
+            raise SessionConflict("no approved launch intent")
         plan = self.owner.store.plan(record.intent.plan_revision)
+        # Validate an explicit base (checkpoint/integration) before anything is created.
+        retained = await asyncio.to_thread(resolve_retained_base, self.owner, plan.get("base"))
+        store = await asyncio.to_thread(self.owner.start_run)
         graph = Graph.model_validate(plan["graph"])
+        return await self._launch(store, graph, retained_base=retained)
+
+    async def _launch(
+        self,
+        store: RunStore,
+        graph: Graph,
+        *,
+        retained_base: RetainedBase | None = None,
+        resume: bool = False,
+    ) -> str:
         control = SchedulerControl()
         control.hold(True)
         self._control, self._store = control, store
@@ -105,13 +120,76 @@ class SessionController:
                 adapters=self._adapters,
                 concurrency=self._concurrency,
                 allow_dirty=self._allow_dirty,
+                resume_run=store.run_id if resume else None,
                 store=store,
                 session_owner=self.owner,
                 control=control,
+                retained_base=retained_base,
             )
         )
         await self._bound()
         return store.run_id
+
+    async def revise(
+        self,
+        command_id: str,
+        *,
+        cancel_active: bool = False,
+        timeout_s: float | None = None,
+        verify: Callable[[str], None] | None = None,
+    ) -> CheckpointManifest | None:
+        """Checkpoint and revise (section 8.7): pause, settle, seal, supersede.
+
+        The durable gate closes first, before answers, retries or new dispatch. Admitted work
+        may finish (`timeout_s` bounds the wait) or be cancelled explicitly; cancellation
+        waits for the managed process and worker thread to stop. The run then stays
+        `interrupted` with a checkpoint reason (never `done`), its verified outputs are
+        sealed, and the round is marked superseded so it cannot resume until explicitly
+        restored. Returns None when the command was an identical duplicate.
+        """
+        task, control = self._require_round()
+        store = self._store
+        assert store is not None
+        if not await asyncio.to_thread(self._command, command_id, {"kind": "revise"}):
+            return None
+        await asyncio.to_thread(self.owner.close_admission)
+        control.pause()
+        if cancel_active:
+            running = [
+                key for key, node in store.read_run().nodes.items() if node.state == "running"
+            ]
+            control.cancelled_nodes.update(running)
+        if not await self.drain(timeout_s=timeout_s):
+            raise SessionConflict(
+                "active work did not finish in time; wait longer or cancel it explicitly"
+            )
+        control.hold(False)
+        task.cancel()  # the run records itself `interrupted` once its workers are drained
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(
+            store.update_run, lambda r: setattr(r, "interrupted_reason", "checkpoint")
+        )
+        manifest = await asyncio.to_thread(
+            seal_checkpoint, self.owner, store, reason="revise", verify=verify
+        )
+        await asyncio.to_thread(self.owner.supersede_round, store.run_id, manifest.checkpoint_id)
+        self._task = self._control = self._store = None
+        return manifest
+
+    async def restore_round(self, run_id: str) -> str:
+        """Explicitly restore a superseded round and resume it (never done on reopen)."""
+        if self.running:
+            raise SessionConflict("a round is already active in this session")
+        repo = self.owner.store.repo_root
+        store = await asyncio.to_thread(RunStore.open, repo, run_id)
+        record = await asyncio.to_thread(store.read_run)
+        if record.state != "interrupted" or record.interrupted_reason != "checkpoint":
+            raise SessionConflict(f"run {run_id} is not an interrupted checkpointed round")
+        if record.graph is None:
+            raise SessionConflict(f"run {run_id} has no recorded graph")
+        await asyncio.to_thread(self.owner.restore_round, run_id)
+        await asyncio.to_thread(store.update_run, lambda r: setattr(r, "interrupted_reason", None))
+        return await self._launch(store, record.graph, resume=True)
 
     async def _bound(self) -> None:
         """Wait until the run's shared writer exists (or the run ended before reaching it)."""

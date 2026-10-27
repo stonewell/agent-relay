@@ -52,6 +52,7 @@ from .store import (
 
 __all__ = [
     "LaunchIntent",
+    "RoundRecord",
     "SessionBusy",
     "SessionConflict",
     "SessionError",
@@ -61,6 +62,7 @@ __all__ = [
     "SessionStore",
     "linked_session",
     "protected_run_ids",
+    "round_state",
     "session_guard",
 ]
 
@@ -96,6 +98,17 @@ class LaunchIntent(SpecModel):
     state: Literal["pending", "linked"] = "pending"
 
 
+class RoundRecord(SpecModel):
+    """One approved execution round: a linked run, its plan revision and its pinned base."""
+
+    run_id: RunId
+    plan_revision: int = Field(ge=1)
+    state: Literal["active", "superseded"] = "active"
+    base: dict[str, Any] | None = None
+    checkpoint_id: str | None = None
+    """The checkpoint that superseded this round."""
+
+
 class SessionRecord(VersionedSpec):
     session_id: str
     created_at: str
@@ -107,6 +120,7 @@ class SessionRecord(VersionedSpec):
     plan_revision: int = Field(default=0, ge=0)
     linked_runs: list[RunId] = []
     checkpoints: list[str] = []
+    rounds: list[RoundRecord] = []
     delivery_policy: dict[str, Any] | None = None
     intent: LaunchIntent | None = None
 
@@ -376,8 +390,13 @@ class SessionOwner:
         explanation: str,
         parent: int | None = None,
         expected_revision: int | None = None,
+        base: dict[str, Any] | None = None,
     ) -> int:
-        """Persist an immutable plan revision and make it current; returns its number."""
+        """Persist an immutable plan revision and make it current; returns its number.
+
+        `base` names the explicit retained base (checkpoint or integration) the round starts
+        from; it is part of the digest the operator approves. None means the repository HEAD.
+        """
         with self._mutex:
             record = self._check_revision(expected_revision)
             if parent is not None and parent != record.plan_revision:
@@ -388,7 +407,8 @@ class SessionOwner:
                 "parent": record.plan_revision or None,
                 "explanation": explanation,
                 "graph": graph,
-                "digest": digest_of(graph),
+                "base": base,
+                "digest": digest_of({"graph": graph, "base": base}),
             }
             directory = self.store.dir / "plans"
             directory.mkdir(exist_ok=True)
@@ -498,12 +518,20 @@ class SessionOwner:
                 raise SessionConflict("the approved plan revision was superseded")
             store = self._attach_or_create(intent, config_hash)
             if intent.state != "linked":
+                plan = self.store.plan(intent.plan_revision)
 
                 def link(r: SessionRecord) -> None:
                     assert r.intent is not None
                     r.intent.state = "linked"
                     if intent.run_id not in r.linked_runs:
                         r.linked_runs.append(intent.run_id)
+                        r.rounds.append(
+                            RoundRecord(
+                                run_id=intent.run_id,
+                                plan_revision=intent.plan_revision,
+                                base=plan.get("base"),
+                            )
+                        )
 
                 self._update(link)
                 self.event(
@@ -538,6 +566,57 @@ class SessionOwner:
             path = self.store._record_path(subdir, name)  # pyright: ignore[reportPrivateUsage]
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write(path, json.dumps(data, indent=2) + "\n")
+
+    # --- checkpoint and revise ------------------------------------------------------------
+
+    def supersede_round(self, run_id: str, checkpoint_id: str) -> None:
+        """Mark a round superseded by a sealed checkpoint and reopen the gate (section 8.7).
+
+        The superseded run cannot resume through either front-end until it is explicitly
+        restored. Admission reopens here, in the same durable update, so a revised plan can be
+        approved; nothing dispatches until that approval.
+        """
+        with self._mutex:
+
+            def change(r: SessionRecord) -> None:
+                matches = [x for x in r.rounds if x.run_id == run_id]
+                if not matches:
+                    raise SessionConflict(f"run {run_id} is not a round of this session")
+                matches[0].state = "superseded"
+                matches[0].checkpoint_id = checkpoint_id
+                if checkpoint_id not in r.checkpoints:
+                    r.checkpoints.append(checkpoint_id)
+                r.admission = "open"
+
+            self._update(change)
+            self.event("plan.superseded", {"run_id": run_id, "checkpoint_id": checkpoint_id})
+            self.event("admission.resumed", {})
+
+    def restore_round(self, run_id: str) -> None:
+        """Explicitly restore a superseded round after revalidation (never implicit on reopen)."""
+        with self._mutex:
+            record = self.store.read()
+            matches = [x for x in record.rounds if x.run_id == run_id]
+            if not matches or matches[0].state != "superseded":
+                raise SessionConflict(f"run {run_id} is not a superseded round")
+            if any(x.state == "active" and x.run_id != run_id for x in record.rounds):
+                raise SessionConflict("another round is active; at most one graph runs per session")
+            self._update(lambda r: self._reactivate(r, run_id))
+            self.event("admission.paused", {"reason": "restore"})
+            self.event("admission.resumed", {"reason": "restore", "run_id": run_id})
+
+    @staticmethod
+    def _reactivate(record: SessionRecord, run_id: str) -> None:
+        for item in record.rounds:
+            if item.run_id == run_id:
+                item.state = "active"
+                item.checkpoint_id = None
+        record.admission = "open"
+
+    def register_checkpoint(self, checkpoint_id: str) -> None:
+        with self._mutex:
+            if checkpoint_id not in self.store.read().checkpoints:
+                self._update(lambda r: r.checkpoints.append(checkpoint_id))
 
     # --- owner commands -------------------------------------------------------------------
 
@@ -636,6 +715,18 @@ def session_guard(
         return
     with SessionOwner.acquire(repo_root, session_id):
         yield
+
+
+def round_state(repo_root: Path, run_id: str) -> str | None:
+    """`active`, `superseded` or None for a run that is not a round of any session."""
+    session_id = linked_session(repo_root, run_id)
+    if session_id is None:
+        return None
+    with contextlib.suppress(SessionError, OSError, ValueError):
+        for item in SessionStore.open(repo_root, session_id).read().rounds:
+            if item.run_id == run_id:
+                return item.state
+    return None
 
 
 def protected_run_ids(repo_root: Path) -> set[str]:
