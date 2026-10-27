@@ -1,0 +1,234 @@
+{
+  "$defs": {
+    "ManifestEntry": {
+      "additionalProperties": true,
+      "properties": {
+        "bytes": {
+          "default": 0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "content_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Content Sha256"
+        },
+        "derived_from": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Derived From",
+          "type": "array"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "estimated_tokens": {
+          "default": 0,
+          "title": "Estimated Tokens",
+          "type": "integer"
+        },
+        "included": {
+          "default": true,
+          "title": "Included",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "repo",
+            "artifact",
+            "result",
+            "operator",
+            "summary"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "lines": {
+          "anyOf": [
+            {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "integer"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lines"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        },
+        "omitted_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Omitted Reason"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "selection": {
+          "title": "Selection",
+          "type": "string"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "source_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Bytes"
+        },
+        "summarizer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Summarizer"
+        }
+      },
+      "required": [
+        "entry_id",
+        "kind",
+        "source",
+        "selection"
+      ],
+      "title": "ManifestEntry",
+      "type": "object"
+    },
+    "ManifestLimits": {
+      "additionalProperties": true,
+      "properties": {
+        "max_bytes": {
+          "minimum": 1,
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "max_estimated_tokens": {
+          "minimum": 1,
+          "title": "Max Estimated Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_bytes",
+        "max_estimated_tokens"
+      ],
+      "title": "ManifestLimits",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "entries": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ManifestEntry"
+      },
+      "title": "Entries",
+      "type": "array"
+    },
+    "estimated_tokens": {
+      "minimum": 0,
+      "title": "Estimated Tokens",
+      "type": "integer"
+    },
+    "limits": {
+      "$ref": "#/$defs/ManifestLimits"
+    },
+    "manifest_id": {
+      "title": "Manifest Id",
+      "type": "string"
+    },
+    "overhead_bytes": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Overhead Bytes",
+      "type": "integer"
+    },
+    "payload_bytes": {
+      "minimum": 0,
+      "title": "Payload Bytes",
+      "type": "integer"
+    },
+    "payload_sha256": {
+      "title": "Payload Sha256",
+      "type": "string"
+    },
+    "recipient": {
+      "title": "Recipient",
+      "type": "string"
+    },
+    "spec_version": {
+      "default": 1,
+      "title": "Spec Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "manifest_id",
+    "recipient",
+    "created_at",
+    "limits",
+    "payload_sha256",
+    "payload_bytes",
+    "estimated_tokens"
+  ],
+  "title": "ContextManifest",
+  "type": "object"
+}
