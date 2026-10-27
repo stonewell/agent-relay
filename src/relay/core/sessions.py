@@ -128,6 +128,15 @@ def _valid_id(session_id: str) -> str:
     return session_id
 
 
+_RECORD_DIRS = frozenset({"turns", "calls", "questions", "context"})
+
+
+def _record_dir(subdir: str) -> str:
+    if subdir not in _RECORD_DIRS:
+        raise SessionError(f"{subdir!r} is not a session record directory")
+    return subdir
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -231,6 +240,28 @@ class SessionStore:
         if not directory.is_dir():
             return []
         return [json.loads(read_text(p)) for p in sorted(directory.glob("*.json"))]
+
+    def read_record(self, subdir: str, name: str) -> dict[str, Any] | None:
+        """A durable JSON record under `<session>/<subdir>/<name>.json`, or None."""
+        path = self._record_path(subdir, name)
+        if not path.is_file():
+            return None
+        data: dict[str, Any] = json.loads(read_text(path))
+        return data
+
+    def list_records(self, subdir: str) -> list[dict[str, Any]]:
+        directory = self.dir / _record_dir(subdir)
+        if not directory.is_dir():
+            return []
+        found: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            found.append(json.loads(read_text(path)))
+        return found
+
+    def _record_path(self, subdir: str, name: str) -> Path:
+        if not name or any(c in name for c in "/\\:") or ".." in name:
+            raise SessionError(f"{name!r} is not a record name")
+        return self.dir / _record_dir(subdir) / f"{name}.json"
 
     def acquire_owner(self) -> SessionOwner:
         return SessionOwner.acquire(self.repo_root, self.session_id)
@@ -499,6 +530,14 @@ class SessionOwner:
         store = RunStore.create(self.store.repo_root, config_hash=config_hash, run_id=intent.run_id)
         store.update_run(lambda r: setattr(r, "session", link))
         return store
+
+    def write_record(self, subdir: str, name: str, data: dict[str, Any]) -> None:
+        """Atomically (over)write one of this owner's mutable records (turns, calls, questions)."""
+        with self._mutex:
+            self._require()
+            path = self.store._record_path(subdir, name)  # pyright: ignore[reportPrivateUsage]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(path, json.dumps(data, indent=2) + "\n")
 
     # --- owner commands -------------------------------------------------------------------
 
