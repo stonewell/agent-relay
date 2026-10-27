@@ -17,6 +17,7 @@ from .commands import clean as clean_command
 from .commands import doctor, result, routes, run, status
 from .commands import graph as graph_command
 from .commands import input as input_command
+from .commands import tui as tui_command
 from .errors import report_error
 from .exitcodes import Exit
 from .phases import COMMAND_PHASE, IMPLEMENTED, availability_error
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     input_command.add_parsers(commands)
     status.add_parser(commands)
     graph_command.add_parsers(commands)
+    tui_command.add_parser(commands)
     for name in COMMAND_PHASE:
         if name not in IMPLEMENTED:
             stub = commands.add_parser(name, add_help=False)
@@ -67,6 +69,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise
     if problem is not None:
         return report_error(problem, Exit.INVALID, as_json)
+    if args.command is None and not as_json and tui_command.interactive():
+        # Bare `relay` on a terminal opens the TUI; otherwise the usage error is unchanged.
+        args.command, args.session = "tui", None
     if args.command is None:
         if not as_json:
             parser.print_help(sys.stderr)
@@ -82,8 +87,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _dispatch(args: argparse.Namespace, repo_root: Path) -> int:
     if args.command in ("graph", "plan", "cancel"):
         return graph_command.run(args, repo_root)
+    if args.command == "resume" and args.session is not None:
+        if args.run_id is not None:
+            return input_command.session_conflict(args)
+        return tui_command.run(args, repo_root, command="resume --session")
     if args.command in ("reply", "resume"):
         return input_command.run(args, repo_root)
+    if args.command == "tui":
+        return tui_command.run(args, repo_root)
     if args.command == "agents":
         return agents_command.run(args, repo_root)
     if args.command == "apply":

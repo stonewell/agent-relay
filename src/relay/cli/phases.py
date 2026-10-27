@@ -19,6 +19,7 @@ COMMAND_PHASE: dict[str, int] = {
     "plan": 2,
     "graph": 2,
     "cancel": 2,
+    "tui": 2,
     "opencode-config": 3,
     "replay": 4,
 }
@@ -38,6 +39,7 @@ IMPLEMENTED = {
     "routes",
     "run",
     "status",
+    "tui",
 }
 """Commands whose handler exists in this build; grows with the phase 1 tasks."""
 

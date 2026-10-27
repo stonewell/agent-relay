@@ -42,15 +42,27 @@ def add_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser])
     reply.add_argument("--yes", action="store_true")
     reply.add_argument("--json", action="store_true")
     resume = subparsers.add_parser(
-        "resume", help="resume an interrupted or answered single-node run"
+        "resume", help="resume an interrupted or answered run, or reopen a session in the TUI"
     )
-    resume.add_argument("run_id")
+    resume.add_argument("run_id", nargs="?")
+    resume.add_argument(
+        "--session", metavar="SESSION", help="reopen a saved session in the TUI (no RUN)"
+    )
     resume.add_argument("--max-attempts", type=_positive_int)
     resume.add_argument("--non-interactive", action="store_true")
     resume.add_argument("--json", action="store_true")
 
 
+def session_conflict(args: argparse.Namespace) -> int:
+    """`relay resume RUN --session S`: a run and a session are mutually exclusive."""
+    return _error(
+        "relay resume: give either a run or --session, not both", 2, getattr(args, "json", False)
+    )
+
+
 def run(args: argparse.Namespace, repo_root: Path) -> int:
+    if args.command == "resume" and args.run_id is None:
+        return _error("relay resume: give a run, or --session SESSION to reopen one", 2, args.json)
     try:
         try:
             check_run_id(args.run_id)

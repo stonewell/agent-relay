@@ -204,6 +204,17 @@ Recovery and its process-identity safeguards are defined in
 its termination before retrying. Command flags and exit codes are in
 [section 14](docs/design.md#14-relay-cli).
 
+## Conversational interface
+
+On a terminal, bare `relay` (or `relay -C PATH tui`) opens the Textual interface: a
+conversation and composer, a task sidebar and an inspector. `relay tui --session S` or
+`relay resume --session S` reopens a saved session; it shows the recovered state and never
+dispatches anything until you choose to continue. Press F1 for the keys and Ctrl+P for the
+command palette. Planning needs a coordinator with a reviewed qualification record for your exact
+CLI version, OS and authentication mode (F9 lists them and explains unavailable ones); without
+one, saved sessions stay inspectable and the headless commands above work as before. The
+interaction rules are in [section 14.1](docs/design.md#141-conversational-terminal-interface-phase-2c).
+
 ## Configuration and troubleshooting
 
 | Reference | Where to look |
