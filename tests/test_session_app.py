@@ -853,6 +853,44 @@ def test_release_cancels_a_running_turn_before_giving_up_ownership(tmp_path: Pat
         host.close(svc.shutdown)
 
 
+def test_shutdown_in_the_call_record_gap_needs_no_reopen_to_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quit while the call record is being written, before the coordinator runs (task 2.29)."""
+    import threading
+    import time
+
+    repo = init_repo(tmp_path / "repo")
+    writing = threading.Event()
+    real = SessionOwner.write_record
+
+    def slow(self: SessionOwner, subdir: str, name: str, data: dict[str, Any]) -> None:
+        if subdir == "calls" and data.get("status") == "started" and not writing.is_set():
+            writing.set()
+            time.sleep(0.5)  # shutdown's cancellation arrives during this write
+        real(self, subdir, name, data)
+
+    monkeypatch.setattr(SessionOwner, "write_record", slow)
+    script = Scripted(proposal())
+    svc = make_service(repo, FakeAdapter(), script)
+    host = ServiceHost().start()
+    try:
+        host.submit(svc.start()).result(30)
+        sid = host.submit(svc.open(None)).result(30)
+        turn = host.submit(svc.submit("plan it"))
+        assert writing.wait(30)
+        host.submit(svc.shutdown()).result(30)
+        assert turn.cancelled() and script.steps  # the coordinator was never called
+        store = SessionStore(repo, sid)
+        assert [t["status"] for t in store.list_records("turns")] == ["interrupted"]
+        assert [c["status"] for c in store.list_records("calls")] == ["interrupted"]
+        assert plan_session_deletion(repo, sid).problems == ()
+        delete_session(repo, sid)  # straight after quitting: nothing was left `active`
+        assert sid not in SessionStore.list_sessions(repo)
+    finally:
+        host.close(svc.shutdown)
+
+
 @pytest.mark.parametrize("record", ["turn-blocked", "turn-active", "call-started"])
 def test_delete_refuses_unconfirmed_coordinator_work(tmp_path: Path, record: str) -> None:
     repo = init_repo(tmp_path / "repo")

@@ -35,7 +35,7 @@ from typing import Any, cast
 
 from .platform.procid import IdentityState, ProcessIdentity, check_identity, current_identity
 from .sessions import SessionBusy, SessionError, SessionOwner, linked_session, round_state
-from .store import RunStore, StoreError, locks_dir, read_text
+from .store import RunStore, StoreError, locks_dir, read_text, runs_dir, sweep_temp_files
 
 
 class OwnerState(Enum):
@@ -286,6 +286,12 @@ class RunLock:
                 session.close()
             raise
         lock._session = session  # pyright: ignore[reportPrivateUsage]
+        # The run's single writer is now this holder, so leftovers from a crashed writer can be
+        # swept; no observer path ever sweeps (`RunStore.open` does not).
+        run_dir = runs_dir(repo_root) / run_id
+        with contextlib.suppress(OSError):
+            if run_dir.is_dir():
+                sweep_temp_files(run_dir)
         return lock
 
     @classmethod

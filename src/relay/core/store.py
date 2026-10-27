@@ -100,7 +100,11 @@ def read_text(path: Path) -> str:
 
 
 def sweep_temp_files(directory: Path) -> int:
-    """Remove temp files left behind by a crashed writer; returns how many were removed."""
+    """Remove temp files left behind by a crashed writer; returns how many were removed.
+
+    Only the directory's owner may call this, after taking its lock and before it writes:
+    another writer's in-flight temp file looks exactly like a crash leftover.
+    """
     removed = 0
     for leftover in directory.glob(f"{_TEMP_PREFIX}*"):
         with contextlib.suppress(OSError):
@@ -170,10 +174,16 @@ class RunStore:
 
     @classmethod
     def open(cls, repo_root: Path, run_id: RunId) -> RunStore:
+        """A handle on an existing run. Opening never changes the run directory.
+
+        Leftover temp files are swept only by the run's owner, once it holds the run lock
+        (:meth:`relay.core.runlock.RunLock.acquire`). Sweeping on open would let an observer
+        (a projection, `status`, `apply`, `clean`, a session check) delete a live writer's
+        in-flight atomic write, so its rename fails (design section 6).
+        """
         store = cls(repo_root, run_id)
         if not store.run_dir.is_dir():
             raise StoreError(f"run {run_id} not found under {runs_dir(repo_root)}")
-        sweep_temp_files(store.run_dir)
         return store
 
     @staticmethod

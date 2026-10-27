@@ -1814,10 +1814,10 @@ def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _reader(repo_root: Path, run_id: str) -> RunStore:
-    """A read-only handle on a run store.
+    """A read-only handle on a run store that requires `run.json`.
 
-    `RunStore.open` sweeps leftover temp files, which would race the active writer's atomic
-    writes; projections and inspection must never do that.
+    Projections and inspection never sweep or write: that would race the active writer's
+    atomic writes (only the run-lock holder sweeps).
     """
     store = RunStore(repo_root, run_id)
     if not store.run_json.is_file():

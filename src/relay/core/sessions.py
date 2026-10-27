@@ -6,8 +6,9 @@ and the idempotent approval-to-run intent that admits at most one run per approv
 
 Rules enforced here:
 
-* Only the lock holder (:class:`SessionOwner`) writes session state; other processes may read
-  durable records through :class:`SessionStore` but cannot approve, answer or dispatch.
+* Only the lock holder (:class:`SessionOwner`) writes session state, and only it sweeps
+  leftover temp files (right after acquiring the lock); other processes may read durable
+  records through :class:`SessionStore` but cannot approve, answer or dispatch.
 * The lock object lives in `.agents/locks/`, outside the purgeable session directory, and is
   never replaced or unlinked, so its existence also reserves the session id for good.
 * Approval binds an exact plan revision and digest and carries an idempotency key and the
@@ -219,10 +220,14 @@ class SessionStore:
 
     @classmethod
     def open(cls, repo_root: Path, session_id: str) -> SessionStore:
+        """A read handle on an existing session. Opening never changes the session directory.
+
+        Leftover temp files are swept only by :meth:`SessionOwner.acquire` once the session
+        lock is held; an observer that swept would race the live owner's atomic writes.
+        """
         store = cls(repo_root, session_id)
         if not (store.dir / SESSION_JSON).is_file():
             raise SessionError(f"session {session_id} not found under {sessions_dir(repo_root)}")
-        sweep_temp_files(store.dir)
         return store
 
     @staticmethod
@@ -311,8 +316,8 @@ class SessionOwner:
         recover: bool = True,
     ) -> SessionOwner:
         """Take the session lock. `recover=False` inspects without changing any record."""
-        # Not `SessionStore.open`: sweeping temp files before holding the lock would race a
-        # live owner's atomic writes. Leftovers are swept once ownership is held.
+        # Sweeping temp files before holding the lock would race a live owner's atomic writes,
+        # so leftovers are swept only once ownership is held (below).
         store = SessionStore(repo_root, session_id)
         if not (store.dir / SESSION_JSON).is_file():
             raise SessionError(f"session {session_id} not found under {sessions_dir(repo_root)}")
@@ -740,11 +745,12 @@ class SessionOwner:
 
 
 def linked_session(repo_root: Path, run_id: str) -> str | None:
+    """The session a run is linked to, or None. Read-only: never sweeps or writes."""
     run_json = runs_dir(repo_root) / run_id / RUN_JSON
     if not run_json.is_file():
         return None
     try:
-        link = RunStore.open(repo_root, run_id).read_run().session
+        link = RunStore(repo_root, run_id).read_run().session
     except (StoreError, OSError, ValueError):
         return None
     return link.session_id if link else None
@@ -770,23 +776,26 @@ def session_guard(
 
 
 def round_state(repo_root: Path, run_id: str) -> str | None:
-    """`active`, `superseded` or None for a run that is not a round of any session."""
+    """`active`, `superseded` or None for a run that is not a round of any session (read-only)."""
     session_id = linked_session(repo_root, run_id)
     if session_id is None:
         return None
     with contextlib.suppress(SessionError, OSError, ValueError):
-        for item in SessionStore.open(repo_root, session_id).read().rounds:
+        for item in SessionStore(repo_root, session_id).read().rounds:
             if item.run_id == run_id:
                 return item.state
     return None
 
 
 def protected_run_ids(repo_root: Path) -> set[str]:
-    """Runs referenced by any session; `clean` must not purge them (session retention)."""
+    """Runs referenced by any session; `clean` must not purge them (session retention).
+
+    Read-only: live owners' sessions are read without sweeping their temp files.
+    """
     protected: set[str] = set()
     for session_id in SessionStore.list_sessions(repo_root):
         with contextlib.suppress(SessionError, OSError, ValueError):
-            record = SessionStore.open(repo_root, session_id).read()
+            record = SessionStore(repo_root, session_id).read()
             protected.update(record.linked_runs)
             if record.intent is not None:
                 protected.add(record.intent.run_id)
@@ -814,8 +823,7 @@ def _unconfirmed_execution(repo_root: Path, store: SessionStore) -> list[str]:
         if call.get("status") == "started":
             problems.append(f"coordinator call {call.get('call_id')} was never confirmed finished")
     for run_id in record.linked_runs:
-        # Not `RunStore.open`: no sweeping of another writer's temp files.
-        run_store = RunStore(repo_root, run_id)
+        run_store = RunStore(repo_root, run_id)  # read-only: no lock, no sweeping
         if not run_store.run_json.is_file():
             continue
         try:
@@ -1017,7 +1025,7 @@ def delete_session(
 
     from .run_purge import execute_run_purge, owner_blocker, plan_run_purge
 
-    # Not `SessionStore.open`: sweeping before the lock is held would race a live owner.
+    # Nothing is swept or written before the lock is held: that would race a live owner.
     store = SessionStore(repo_root, session_id)
     if not (store.dir / SESSION_JSON).is_file():
         raise SessionError(f"session {session_id} not found under {sessions_dir(repo_root)}")

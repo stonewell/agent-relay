@@ -369,6 +369,96 @@ def test_interrupted_turn_keeps_its_consumed_budget(repo: Path) -> None:
     run(scenario)
 
 
+CANCEL_POINTS = {
+    # (subdir or event, predicate on the written data): where the cancellation arrives
+    "turn-started-event": ("event", "turn.started"),
+    "context-selected-event": ("event", "context.selected"),
+    "call-record-written": ("calls", "started"),
+    "turn-record-before-call": ("turns", "with-call"),
+    "coordinator-started-event": ("event", "coordinator.started"),
+}
+
+
+@pytest.mark.parametrize("point", sorted(CANCEL_POINTS))
+def test_a_cancellation_at_any_durable_step_leaves_the_turn_interrupted(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    """The `_invoke` gap: a cancel after the call record is written but before the call runs.
+
+    The cancellation arrives while the durable write is still in flight (its thread sleeps),
+    so a plain `asyncio.to_thread` would let the write land after the `interrupted` record.
+    No reopen or `recover_turns` is needed afterwards, and the coordinator is never called.
+    """
+    import threading
+    import time
+
+    from relay.core.sessions import plan_session_deletion
+
+    async def scenario() -> None:
+        engine, owner, script = make(repo, Scripted(propose()))
+        loop = asyncio.get_running_loop()
+        kind, match = CANCEL_POINTS[point]
+        fired = threading.Event()
+        holder: list[asyncio.Task[Any]] = []
+
+        def hit() -> None:
+            if not fired.is_set():
+                fired.set()
+                loop.call_soon_threadsafe(holder[0].cancel)
+                time.sleep(0.3)  # the write is still in flight when the cancel is delivered
+
+        real_write, real_event = owner.write_record, owner.event
+
+        def write_record(subdir: str, name: str, data: dict[str, Any]) -> None:
+            if kind == subdir and (
+                (match == "started" and data.get("status") == "started")
+                or (match == "with-call" and data.get("calls"))
+            ):
+                hit()
+            real_write(subdir, name, data)
+
+        def event(type_: str, data: dict[str, Any] | None = None) -> None:
+            if kind == "event" and type_ == match:
+                hit()
+            real_event(type_, data)
+
+        monkeypatch.setattr(owner, "write_record", write_record)
+        monkeypatch.setattr(owner, "event", event)
+        holder.append(asyncio.ensure_future(engine.submit("go")))
+        with pytest.raises(asyncio.CancelledError):
+            await holder[0]
+        assert fired.is_set() and script.prompts == []  # cancelled before any coordinator call
+        turn = owner.store.read_record("turns", "t1")
+        assert turn is not None and turn["status"] == "interrupted"
+        assert all(c["status"] != "started" for c in owner.store.list_records("calls"))
+        owner.close()
+        problems = " ".join(plan_session_deletion(repo, owner.store.session_id).problems)
+        assert "coordinator" not in problems  # deletable without reopening first
+
+        reopened = SessionOwner.acquire(repo, owner.store.session_id)
+        engine.owner = reopened
+        result = await engine.resume_turn("t1")  # resumable, budget carried over
+        assert result.status == "awaiting_approval"
+        reopened.close()
+
+    run(scenario)
+
+
+def test_an_unexpected_coordinator_error_fails_the_turn_durably(repo: Path) -> None:
+    async def scenario() -> None:
+        engine, owner, _ = make(repo, Scripted(RuntimeError("profile changed underneath")))
+        with pytest.raises(RuntimeError, match="profile changed"):
+            await engine.submit("go")
+        turn = owner.store.read_record("turns", "t1")
+        assert turn is not None and turn["status"] == "failed"
+        assert "profile changed" in turn["outcome"]["error"]
+        call = owner.store.read_record("calls", "t1-c1")
+        assert call is not None and call["status"] == "failed"
+        owner.close()
+
+    run(scenario)
+
+
 def test_resume_cannot_reset_an_exhausted_budget(repo: Path) -> None:
     async def scenario() -> None:
         engine, owner, script = make(repo, Scripted(propose()), max_steps=2)

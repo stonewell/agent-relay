@@ -16,14 +16,15 @@ action recorded on the exact plan revision by the session owner, never derived f
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 from relay.adapters.coordination import CoordinatorCall, CoordinatorInvalid
 from relay.core.platform.proc import ProcessCancelled, cancel_processes_when, observe_processes
@@ -71,6 +72,8 @@ __all__ = [
     "recover_turns",
     "validate_plan",
 ]
+
+T = TypeVar("T")
 
 TurnStatus = Literal[
     "active",
@@ -225,6 +228,34 @@ def _now() -> str:
     return iso(datetime.now(UTC))
 
 
+async def _settled(function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Run blocking durable work in a thread; a cancellation is delivered only once it ended.
+
+    `asyncio.to_thread` cannot stop its thread, so a cancelled plain await would let this write
+    land *after* whatever the cancelled caller writes next (its `interrupted` record), or after
+    ownership was released. Here repeated cancellations wait for the thread, then re-raise.
+    """
+    future = asyncio.ensure_future(asyncio.to_thread(function, *args, **kwargs))
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.wait({future})  # never cancels `future` itself
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not future.cancelled():
+            future.exception()  # retrieved: the cancellation is what the caller handles
+        raise asyncio.CancelledError
+    return future.result()
+
+
+async def _drain(task: asyncio.Future[Any]) -> None:
+    """Wait until `task` ends, through repeated cancellation; only for handlers that re-raise."""
+    while not task.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({task})
+
+
 class PlanningEngine:
     """Runs coordinator turns for one session owner; every outcome is durable."""
 
@@ -240,9 +271,7 @@ class PlanningEngine:
 
     async def submit(self, text: str, *, provenance: str = "operator-tty") -> TurnResult:
         """Record an operator message and run a bounded coordination turn for it."""
-        message = await asyncio.to_thread(
-            self.owner.append_message, "operator", text, provenance=provenance
-        )
+        message = await _settled(self.owner.append_message, "operator", text, provenance=provenance)
         return await self._new_turn(message["message_id"], extra=[])
 
     async def answer(
@@ -264,11 +293,9 @@ class PlanningEngine:
         questions = [OpenQuestion.model_validate(q) for q in record["questions"]]
         resolved = _validate_answers(questions, answers)
         record.update(state="answered", answers_hash=digest_of(resolved))
-        await asyncio.to_thread(
-            self.owner.write_record, "questions", f"{question_revision}", record
-        )
+        await _settled(self.owner.write_record, "questions", f"{question_revision}", record)
         body = "\n".join(f"{q.id}: {resolved[q.id]}" for q in questions if q.id in resolved)
-        message = await asyncio.to_thread(
+        message = await _settled(
             self.owner.append_message,
             "operator",
             f"Answers to question set {question_revision}:\n{body}",
@@ -278,7 +305,7 @@ class PlanningEngine:
 
     async def review_round(self, store: RunStore) -> TurnResult:
         """Ask the coordinator to review a sealed round from its recorded evidence."""
-        record = await asyncio.to_thread(store.read_run)
+        record = await _settled(store.read_run)
         if record.state == "running":
             raise SessionError("a running round cannot be reviewed yet")
         extra: list[Item] = []
@@ -287,7 +314,7 @@ class PlanningEngine:
                 continue
             for name in ("status", "summary", "verification"):
                 extra.append(ResultFieldItem(store, node_id, name, selection="review-evidence"))
-        message = await asyncio.to_thread(
+        message = await _settled(
             self.owner.append_message,
             "operator",
             f"Review round {store.run_id} using the supplied evidence.",
@@ -309,8 +336,12 @@ class PlanningEngine:
             "calls": [],
             "started_at": _now(),
         }
-        await asyncio.to_thread(self.owner.write_record, "turns", turn_id, turn)
-        await asyncio.to_thread(self.owner.event, "turn.started", {"turn_id": turn_id})
+        try:
+            await _settled(self.owner.write_record, "turns", turn_id, turn)
+            await _settled(self.owner.event, "turn.started", {"turn_id": turn_id})
+        except asyncio.CancelledError:
+            await self._interrupt(turn)
+            raise
         return await self._drive(turn, list(extra))
 
     async def resume_turn(self, turn_id: str, *, extra: Sequence[Item] = ()) -> TurnResult:
@@ -321,10 +352,40 @@ class PlanningEngine:
         if turn["status"] != "interrupted":
             raise SessionError(f"turn {turn_id} is {turn['status']}, not interrupted")
         turn["status"] = "active"
-        await asyncio.to_thread(self.owner.write_record, "turns", turn_id, turn)
+        try:
+            await _settled(self.owner.write_record, "turns", turn_id, turn)
+        except asyncio.CancelledError:
+            await self._interrupt(turn)
+            raise
         return await self._drive(turn, list(extra))
 
     async def _drive(self, turn: dict[str, Any], extra: list[Item]) -> TurnResult:
+        """Run the turn's steps; however it ends, its record never stays `active`.
+
+        A cancellation (owner stop or shutdown) leaves it `interrupted`, resumable without a
+        reopen; an unexpected error leaves it `failed` with the error, then propagates.
+        """
+        try:
+            return await self._steps(turn, extra)
+        except asyncio.CancelledError:
+            await self._interrupt(turn)
+            raise
+        except Exception as exc:
+            if turn["status"] == "active":
+                error = f"{type(exc).__name__}: {exc}"
+                with contextlib.suppress(Exception):  # the original error is the one reported
+                    await self._finish(turn, TurnResult(turn["turn_id"], "failed", error=error))
+            raise
+
+    async def _interrupt(self, turn: dict[str, Any]) -> None:
+        """Record a cancelled turn as `interrupted`, unless it already reached an outcome."""
+        if turn["status"] != "active":
+            return
+        turn["status"] = "interrupted"
+        with contextlib.suppress(Exception):  # the cancellation is what the caller handles
+            await _settled(self.owner.write_record, "turns", turn["turn_id"], turn)
+
+    async def _steps(self, turn: dict[str, Any], extra: list[Item]) -> TurnResult:
         limits = self.setup.limits
         feedback: str | None = None
         try:
@@ -338,7 +399,7 @@ class PlanningEngine:
                 turn["steps_used"] += 1
                 call = await self._invoke(turn, prompt, manifest_digests, limits.max_duration_s)
                 turn["active_s"] += time.monotonic() - started
-                await asyncio.to_thread(self.owner.write_record, "turns", turn["turn_id"], turn)
+                await _settled(self.owner.write_record, "turns", turn["turn_id"], turn)
                 if isinstance(call, str):  # a validation problem to hand back for repair
                     self._spend_repair(turn)
                     feedback = call
@@ -372,8 +433,8 @@ class PlanningEngine:
             "question_revision": result.question_revision,
             "error": result.error,
         }
-        await asyncio.to_thread(self.owner.write_record, "turns", turn["turn_id"], turn)
-        await asyncio.to_thread(
+        await _settled(self.owner.write_record, "turns", turn["turn_id"], turn)
+        await _settled(
             self.owner.event,
             "turn.finished",
             {"turn_id": turn["turn_id"], "status": result.status, "steps": turn["steps_used"]},
@@ -443,7 +504,7 @@ class PlanningEngine:
             return INSTRUCTIONS + "\n" + built.payload, [manifest_digest(built.manifest)]
 
         try:
-            return await asyncio.to_thread(build)
+            return await _settled(build)
         except ContextError as exc:
             raise _TurnEnded("failed", f"context cannot be assembled: {exc}") from exc
 
@@ -470,15 +531,9 @@ class PlanningEngine:
             "started_at": _now(),
         }
         turn["calls"].append(call_id)
-        await asyncio.to_thread(self.owner.write_record, "calls", call_id, record)
-        await asyncio.to_thread(self.owner.write_record, "turns", turn["turn_id"], turn)
-        await asyncio.to_thread(
-            self.owner.event,
-            "coordinator.started",
-            {"turn_id": turn["turn_id"], "call_id": call_id},
-        )
         remaining = max(0.1, limit_s - turn["active_s"])
         cancel = threading.Event()
+        task: asyncio.Task[CoordinatorCall] | None = None
 
         def observe(phase: str, pid: int | None) -> None:
             if phase == "starting":
@@ -502,9 +557,19 @@ class PlanningEngine:
                     timeout_s=remaining,
                 )
 
-        task = asyncio.create_task(call())
         outcome: CoordinatorCall | str
+        # Everything from the first durable write on is inside this `try`, so a cancellation
+        # at any point (even before the process starts) ends the call and the turn
+        # `interrupted` instead of leaving them `started` and `active` until a reopen.
         try:
+            await _settled(self.owner.write_record, "calls", call_id, record)
+            await _settled(self.owner.write_record, "turns", turn["turn_id"], turn)
+            await _settled(
+                self.owner.event,
+                "coordinator.started",
+                {"turn_id": turn["turn_id"], "call_id": call_id},
+            )
+            task = asyncio.create_task(call())
             done, _ = await asyncio.wait({task}, timeout=remaining)
             if not done:  # duration limit: cancel and drain the active call
                 cancel.set()
@@ -522,6 +587,9 @@ class PlanningEngine:
             except ProcessCancelled as exc:
                 record["status"] = "failed"
                 raise _TurnEnded("failed", "the coordinator call was cancelled") from exc
+            except Exception:
+                record["status"] = "failed"  # for example an unavailable coordinator profile
+                raise
             else:
                 record["status"] = "finished"
                 record["action"] = outcome.response.response.action
@@ -529,17 +597,23 @@ class PlanningEngine:
                 record["tokens_in"] = outcome.tokens_in
                 record["tokens_out"] = outcome.tokens_out
         except asyncio.CancelledError:
-            # Owner shutdown: drain the process before surfacing the cancellation.
+            # Owner stop or shutdown: drain the process before surfacing the cancellation.
             cancel.set()
-            await asyncio.gather(task, return_exceptions=True)
+            if task is not None:
+                await _drain(task)
             record["status"] = "interrupted"
             turn["status"] = "interrupted"
-            self.owner.write_record("calls", call_id, record)
-            self.owner.write_record("turns", turn["turn_id"], turn)
+            with contextlib.suppress(Exception):  # the cancellation is what the caller handles
+                await _settled(self.owner.write_record, "calls", call_id, record)
+                await _settled(self.owner.write_record, "turns", turn["turn_id"], turn)
+            raise
+        except Exception:
+            if record["status"] == "started":  # a failed durable write before the call ran
+                record["status"] = "failed"
             raise
         finally:
-            await asyncio.to_thread(self.owner.write_record, "calls", call_id, record)
-            await asyncio.to_thread(
+            await _settled(self.owner.write_record, "calls", call_id, record)
+            await _settled(
                 self.owner.event,
                 "coordinator.finished",
                 {"turn_id": turn["turn_id"], "call_id": call_id, "status": record["status"]},
@@ -555,7 +629,7 @@ class PlanningEngine:
         turn_id = turn["turn_id"]
         if isinstance(action, AskUser):
             revision = len(self.owner.store.list_records("questions")) + 1
-            await asyncio.to_thread(
+            await _settled(
                 self.owner.write_record,
                 "questions",
                 f"{revision}",
@@ -566,7 +640,7 @@ class PlanningEngine:
                     "questions": [q.model_dump(mode="json") for q in action.questions],
                 },
             )
-            await asyncio.to_thread(
+            await _settled(
                 self.owner.append_message,
                 "coordinator",
                 "Questions:\n" + "\n".join(f"{q.id}: {q.text}" for q in action.questions),
@@ -599,7 +673,7 @@ class PlanningEngine:
                 )
             graph = action.graph.model_dump(mode="json", by_alias=True, exclude_unset=True)
             current = self.owner.record.plan_revision
-            revision = await asyncio.to_thread(
+            revision = await _settled(
                 self.owner.save_plan,
                 graph,
                 explanation=action.explanation
@@ -608,7 +682,7 @@ class PlanningEngine:
                 base=self.plan_base,
                 proposer=proposer_record(self.setup.qualification),
             )
-            await asyncio.to_thread(
+            await _settled(
                 self.owner.append_message,
                 "coordinator",
                 f"Proposed plan revision {revision}: {action.explanation}",
@@ -623,7 +697,7 @@ class PlanningEngine:
                 plan_digest=self.owner.store.plan(revision)["digest"],
             )
         if isinstance(action, Review):
-            await asyncio.to_thread(
+            await _settled(
                 self.owner.append_message,
                 "coordinator",
                 action.summary + "".join(f"\n[{f.severity}] {f.text}" for f in action.findings),
@@ -631,7 +705,7 @@ class PlanningEngine:
             )
             return TurnResult(turn_id, "finished", "review", action.summary)
         assert isinstance(action, Finish)
-        await asyncio.to_thread(
+        await _settled(
             self.owner.append_message, "coordinator", action.summary, provenance="coordinator"
         )
         return TurnResult(turn_id, "finished", "finish", action.summary)
@@ -667,7 +741,7 @@ class PlanningEngine:
                         )
                     )
                     continue
-                # Not `RunStore.open`: sweeping temp files would race a live run's writer.
+                # A read-only handle: a live run's writer may be mid-write.
                 store = RunStore(self.owner.store.repo_root, selection.run_id)
                 if not store.run_json.is_file():
                     raise StoreError(f"run {selection.run_id} not found")

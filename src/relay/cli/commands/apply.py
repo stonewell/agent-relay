@@ -119,17 +119,13 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         return _fail(_FORCE_UNSUPPORTED, Exit.INVALID, as_json)
 
     try:
-        store = RunStore.open(repo_root, run_id)
-        record = store.read_run()
+        store = RunStore.open(repo_root, run_id)  # read-only: never sweeps a live writer's files
+        store.read_run()
     except (StoreError, ValueError, OSError) as exc:
         return _fail(f"relay apply: {exc}", Exit.INVALID, as_json)
 
     op_id = secrets.token_hex(8)
-    try:
-        log = EventLog(store.events_path, owner_generation=record.owner_generation)
-    except (OSError, EventLogCorrupt) as exc:
-        return _fail(f"relay apply: cannot open the run event log: {exc}", Exit.FAILURE, as_json)
-
+    log = _RunLog(store)
     try:
         with session_guard(repo_root, run_id):
             return _apply(
@@ -143,8 +139,43 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
             )
     except SessionError as exc:
         return _fail(f"relay apply: {exc}", Exit.FAILURE, as_json)
+    except _LogUnavailable as exc:
+        return _fail(f"relay apply: {exc}", Exit.FAILURE, as_json)
     finally:
         log.close()
+
+
+class _LogUnavailable(RuntimeError):
+    """The run's event log cannot be opened; nothing has been changed yet."""
+
+
+class _RunLog:
+    """The run's event log, opened on its first event.
+
+    Opening an :class:`EventLog` repairs a torn trailing record (truncating it, or appending a
+    newline), which would corrupt the record a live writer is appending. So the log is opened
+    only once delivery got past its first checks: inside the session guard, for a run that
+    preparation found finished (headless) or whose session lock this command holds. A run
+    that is still running is refused before its log is touched.
+    """
+
+    def __init__(self, store: RunStore) -> None:
+        self._store = store
+        self._log: EventLog | None = None
+
+    def append(self, type_: str, data: dict[str, str]) -> None:
+        if self._log is None:
+            try:
+                generation = self._store.read_run().owner_generation
+                self._log = EventLog(self._store.events_path, owner_generation=generation)
+            except (OSError, ValueError, EventLogCorrupt) as exc:
+                raise _LogUnavailable(f"cannot open the run event log: {exc}") from exc
+        self._log.append(type_, data)
+
+    def close(self) -> None:
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
 
 # --- the delivery -----------------------------------------------------------------------------
@@ -158,7 +189,7 @@ def _apply(
     as_json: bool,
     *,
     assume_yes: bool,
-    log: EventLog,
+    log: _RunLog,
 ) -> int:
     try:
         prepared = prepare_run_delivery(repo_root, run_id, target=target)
@@ -325,7 +356,7 @@ def _confirmed(
     run_id: str,
     target: str | None,
     *,
-    log: EventLog,
+    log: _RunLog,
     op_id: str,
 ) -> bool:
     """Ask the operator to confirm, after verification and before any state changes.
@@ -491,5 +522,5 @@ def _fail(message: str, code: Exit, as_json: bool) -> int:
     return int(code)
 
 
-def _event(log: EventLog, type_: str, data: dict[str, str]) -> None:
+def _event(log: _RunLog, type_: str, data: dict[str, str]) -> None:
     log.append(type_, data)

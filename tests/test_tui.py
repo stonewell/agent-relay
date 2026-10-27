@@ -424,6 +424,37 @@ def test_resize_keeps_focus_draft_and_selection(repo: Path) -> None:
     drive(repo, svc, NARROW, body)
 
 
+def test_ctrl_c_never_quits_or_stops_execution(repo: Path) -> None:
+    """In a Windows console Ctrl+C reaches Textual as a key, not SIGINT (task 2.29).
+
+    It must neither quit nor stop a round: only Ctrl+Q (with confirmation while busy) or F8
+    do, and both drain execution before ownership is released.
+    """
+    adapter = FakeAdapter({"a": Scenario(hang=True)})
+    svc = service(repo, adapter, Scripted(plan(node("a"))))
+
+    async def body(app: RelayApp, pilot: Pilot[int]) -> None:
+        await send(pilot, "Add a")
+        await until(pilot, lambda: isinstance(app.screen, PlanScreen))
+        await press_button(pilot, "approve")
+        await until(pilot, lambda: node_state(app, "a") == "running")
+        await pilot.press("f3")  # outside the composer, where Ctrl+C is not copy
+        await pilot.press("ctrl+c")
+        await pilot.pause(0.5)
+        assert app.is_running and not isinstance(app.screen, ConfirmScreen)
+        view = app.view_state
+        assert view is not None and view.owned and view.round_running
+        assert node_state(app, "a") == "running"
+        await pilot.press("ctrl+q")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        await press_button(pilot, "confirm")
+        await until(pilot, lambda: app.projection == "Stopping" or not app.is_running)
+
+    drive(repo, svc, WIDE, body)
+    record = SessionStore.open(repo, SessionStore.list_sessions(repo)[0]).read()
+    assert RunStore.open(repo, record.rounds[0].run_id).read_run().state == "interrupted"
+
+
 def test_unavailable_coordinator_is_explained_not_fatal(repo: Path) -> None:
     svc = service(repo, FakeAdapter(), Scripted(), qualified=False)
 

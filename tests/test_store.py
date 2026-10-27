@@ -205,10 +205,16 @@ def test_crash_between_temp_write_and_rename_is_invisible_and_swept(tmp_path: Pa
     assert [p.name for p in tmp_path.iterdir()] == ["run.json"]
 
 
-def test_open_sweeps_leftover_temp_files(tmp_path: Path) -> None:
+def test_open_never_sweeps_and_the_run_lock_holder_does(tmp_path: Path) -> None:
+    """Opening is an observer path; only the owner sweeps, once it holds the run lock (TU2)."""
+    from relay.core.runlock import RunLock
+
     store = make(tmp_path)
-    (store.run_dir / ".tmp-run.json.1.x").write_text("junk")
+    leftover = store.run_dir / ".tmp-run.json.1.x"
+    leftover.write_text("junk")
     RunStore.open(tmp_path, store.run_id)
+    assert leftover.exists()  # could be a live writer's in-flight atomic write
+    RunLock.acquire(tmp_path, store.run_id).release()
     assert not list(store.run_dir.glob(".tmp-*"))
 
 

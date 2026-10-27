@@ -4,7 +4,9 @@ Prunes what relay owns for one run (or every run): registered node worktrees und
 worktree directory, the per-run scratch directory, and -- only with ``--purge-runs`` -- the run
 directory and the git refs under ``refs/relay/<run>/`` and ``refs/heads/relay/<run>/``.
 
-Safety rules:
+What is removed, in which order, and when a run is refused are the rules of
+:mod:`relay.core.run_purge`, shared with confirmed session deletion; this module selects runs,
+asks for confirmation and reports. In short:
 
 * Only worktrees git reports as registered and that live under the run's own worktree
   directory (or, for purge, under the run directory) are removed. The main worktree and any
@@ -12,7 +14,9 @@ Safety rules:
   again for each removal.
 * A live run is never cleaned. The phase 1 lock file is *inspected* only: ``clean`` never
   creates, replaces or unlinks a lock object (design section 6), so a purged run id stays
-  unusable while its lock object exists.
+  unusable while its lock object exists. Nothing is swept or written in a run it skips.
+* Refs go before the run record, and the record is kept when an earlier removal failed, so a
+  failed purge can be repeated.
 * ``--purge-runs`` is privileged (design section 8.6). Without ``--yes`` an interactive
   session is asked to confirm; a non-interactive session exits ``7`` and changes nothing. The
   exact confirming command is printed. ``--dry-run`` prints the plan and changes nothing.
@@ -23,14 +27,11 @@ Exit codes are those of design section 14.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import os
 import re
 import shlex
-import shutil
-import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,10 +39,19 @@ from typing import Any
 
 from relay.core import registry as registry_module
 from relay.core.registry import ConfigError, load_config
-from relay.core.runlock import OwnerState, inspect_owner
+from relay.core.run_purge import (
+    Removal,
+    RunPurge,
+    owner_state,
+    plan_run_purge,
+    purge_run,
+    registered_worktrees,
+    run_worktree_dir,
+)
+from relay.core.runlock import OwnerState
 from relay.core.sessions import protected_run_ids
 from relay.core.store import runs_dir
-from relay.core.worktree import WorktreeError, WorktreeManager
+from relay.core.worktree import WorktreeError
 
 from ..exitcodes import Exit
 from .inspect_common import (
@@ -55,9 +65,6 @@ from .inspect_common import (
 
 _DURATION_RE = re.compile(r"^(\d+)([smhdw])$")
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86_400, "w": 604_800}
-_SCRATCH = ".agents"
-_PROBE_NODE = "n1"
-"""A valid node id used only to derive the run's worktree directory without touching git."""
 
 
 class CleanError(RuntimeError):
@@ -69,26 +76,20 @@ class CleanError(RuntimeError):
 
 
 @dataclass
-class _Removal:
-    path: Path
-    candidate: bool = False
-    removed: bool = False
-    error: str | None = None
-
-
-@dataclass
 class _RunPlan:
     run_id: str
     state: str | None
     worktree_dir: Path
-    worktrees: list[_Removal] = field(default_factory=list[_Removal])
-    scratch: _Removal | None = None
-    run_dir: _Removal | None = None
+    worktrees: list[Removal] = field(default_factory=list[Removal])
+    scratch: Removal | None = None
+    run_dir: Removal | None = None
     refs: list[str] = field(default_factory=list[str])
     skipped: str | None = None
     active: bool = False
     error: str | None = None
     note: str | None = None
+    purge: RunPurge | None = None
+    """The shared removal plan (None when the run is skipped for its owner)."""
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:  # pyright: ignore[reportPrivateUsage]
@@ -139,15 +140,11 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
             as_json,
         )
 
-    if bool(args.purge_runs) and _has_destructive_work(plans):
-        if not bool(args.yes):
-            _print_summary(plans, repo_root, to_stderr=True)
-            if not _interactive() or not _confirmed():
-                message = _approval_message(args)
-                return _fail(message, Exit.APPROVAL_REQUIRED, as_json)
-        _execute(plans, repo_root, purge=True)
-    else:
-        _execute(plans, repo_root, purge=bool(args.purge_runs))
+    if bool(args.purge_runs) and _has_destructive_work(plans) and not bool(args.yes):
+        _print_summary(plans, repo_root, to_stderr=True)
+        if not _interactive() or not _confirmed():
+            return _fail(_approval_message(args), Exit.APPROVAL_REQUIRED, as_json)
+    _execute(plans, repo_root)
 
     _print_plan(plans, repo_root, as_json, dry_run=False)
     return int(Exit.FAILURE if any(plan.error for plan in plans) else Exit.OK)
@@ -165,6 +162,13 @@ def _plan(
     loaded = load_config(project_root=repo_root, user_config=registry_module.USER_CONFIG)
     plans: list[_RunPlan] = []
     retained = protected_run_ids(repo_root) if purge else set[str]()
+    listed: list[list[Path]] = []
+
+    def registered() -> list[Path]:
+        if not listed:  # listed once, and only when a run is not skipped for its owner
+            listed.append(registered_worktrees(repo_root))
+        return listed[0]
+
     for candidate in ids:
         if candidate in retained and run_id is not None:
             raise CleanError(
@@ -177,6 +181,7 @@ def _plan(
             candidate,
             loaded.config.paths.worktree_root,
             purge=purge and candidate not in retained,
+            registered=registered,
         )
         if candidate in retained:
             plan.note = (
@@ -205,11 +210,17 @@ def _selected_ids(repo_root: Path, run_id: str | None) -> list[str]:
     return sorted(child.name for child in parent.iterdir() if child.is_dir())
 
 
-def _plan_run(repo_root: Path, run_id: str, worktree_root: str, *, purge: bool) -> _RunPlan:
-    manager = WorktreeManager(repo_root, run_id, worktree_root=worktree_root)
-    # `node_path` is a pure path computation; the probe id is never created on disk. Its parent
-    # is exactly this run's directory in either the POSIX or the short Windows layout.
-    worktree_dir = manager.node_path(_PROBE_NODE).parent
+def _plan_run(
+    repo_root: Path,
+    run_id: str,
+    worktree_root: str,
+    *,
+    purge: bool,
+    registered: Callable[[], list[Path]],
+) -> _RunPlan:
+    # A pure path computation: exactly this run's directory in either the POSIX or the short
+    # Windows layout, without touching git or the disk.
+    worktree_dir = run_worktree_dir(repo_root, run_id, worktree_root)
     plan = _RunPlan(run_id=run_id, state=None, worktree_dir=worktree_dir)
 
     try:
@@ -221,7 +232,7 @@ def _plan_run(repo_root: Path, run_id: str, worktree_root: str, *, purge: bool) 
         if not purge:
             plan.error = str(exc)
 
-    owner = _owner_state(repo_root, run_id)
+    owner = owner_state(repo_root, run_id)
     if owner in (OwnerState.ALIVE, OwnerState.UNKNOWN):
         plan.active = True
         plan.skipped = (
@@ -229,29 +240,11 @@ def _plan_run(repo_root: Path, run_id: str, worktree_root: str, *, purge: bool) 
         )
         return plan
 
-    run_dir = run_directory(repo_root, run_id)
-    registered = _registered_worktrees(repo_root)
-    for path in registered:
-        if _is_under(path, worktree_dir):
-            plan.worktrees.append(_Removal(path=path))
-        elif purge and _is_under(path, run_dir):
-            # Capture candidates are created under the run directory, outside the worktree root.
-            plan.worktrees.append(_Removal(path=path, candidate=True))
-
-    scratch = repo_root / _SCRATCH / "scratch" / run_id
-    if scratch.is_dir():
-        plan.scratch = _Removal(path=scratch)
-    if purge:
-        plan.run_dir = _Removal(path=run_dir)
-        plan.refs = _run_refs(repo_root, run_id)
+    shared = plan_run_purge(repo_root, run_id, worktree_root, record=purge, registered=registered())
+    plan.purge = shared
+    plan.worktrees, plan.scratch, plan.run_dir = shared.worktrees, shared.scratch, shared.record
+    plan.refs = shared.refs
     return plan
-
-
-def _owner_state(repo_root: Path, run_id: str) -> OwnerState:
-    try:
-        return inspect_owner(repo_root, run_id).state
-    except OSError:
-        return OwnerState.UNKNOWN
 
 
 def _run_age(repo_root: Path, run_id: str) -> int | None:
@@ -296,108 +289,16 @@ def _format_duration(value: timedelta) -> str:
 # --- execution --------------------------------------------------------------------------------
 
 
-def _execute(plans: list[_RunPlan], repo_root: Path, *, purge: bool) -> None:
+def _execute(plans: list[_RunPlan], repo_root: Path) -> None:
     for plan in plans:
-        if plan.skipped is not None:
+        if plan.skipped is not None or plan.purge is None:
             continue
-        for removal in plan.worktrees:
-            _remove_worktree(repo_root, plan.run_id, removal, plan.worktree_dir)
-        if plan.scratch is not None:
-            _remove_tree(plan.scratch)
-        # Refs go before the run record: if a ref cannot be deleted, the record survives so the
-        # purge can be retried, and no completed run is left silently missing a ref.
-        for ref in plan.refs:
-            _remove_ref(repo_root, ref, plan)
-        if purge and plan.run_dir is not None:
-            _remove_tree(plan.run_dir)
-        _prune_empty(plan.worktree_dir)
-        if purge:
-            _git(repo_root, "worktree", "prune")
-
-
-def _remove_worktree(repo_root: Path, run_id: str, removal: _Removal, worktree_dir: Path) -> None:
-    try:
-        # The manager validates containment again. Node worktrees live under the run's worktree
-        # directory; capture candidates live under the run directory, outside the manager root.
-        if removal.candidate:
-            result = WorktreeManager(repo_root, run_id).decommission_candidate(removal.path)
-        else:
-            result = WorktreeManager(
-                repo_root, run_id, worktree_root=str(worktree_dir.parent)
-            ).decommission(removal.path)
-        removal.removed = result.removed
-    except (OSError, WorktreeError) as exc:
-        removal.error = str(exc)
-
-
-def _remove_tree(removal: _Removal) -> None:
-    try:
-        if removal.path.is_dir():
-            shutil.rmtree(removal.path)
-        elif removal.path.exists():
-            removal.path.unlink()
-        removal.removed = True
-    except OSError as exc:
-        removal.error = str(exc)
-
-
-def _remove_ref(repo_root: Path, ref: str, plan: _RunPlan) -> None:
-    proc = _git(repo_root, "update-ref", "-d", ref)
-    if proc is None:
-        plan.error = "git is not installed or not on PATH"
-    elif proc.returncode != 0:
-        plan.error = f"cannot delete {ref}: {proc.stderr.strip() or 'git update-ref failed'}"
-
-
-def _prune_empty(directory: Path) -> None:
-    with contextlib.suppress(OSError):
-        directory.rmdir()  # still contains retained worktrees or is already gone
-
-
-# --- refs and worktrees -----------------------------------------------------------------------
-
-
-def _run_refs(repo_root: Path, run_id: str) -> list[str]:
-    proc = _git(repo_root, "for-each-ref", "--format=%(refname)")
-    if proc is None or proc.returncode != 0:
-        return []
-    prefixes = (f"refs/relay/{run_id}/", f"refs/heads/relay/{run_id}/")
-    return [
-        line
-        for line in proc.stdout.splitlines()
-        if line in (f"refs/relay/{run_id}",) or line.startswith(prefixes)
-    ]
-
-
-def _registered_worktrees(repo_root: Path) -> list[Path]:
-    proc = _git(repo_root, "worktree", "list", "--porcelain")
-    if proc is None or proc.returncode != 0:
-        return []
-    paths: list[Path] = []
-    for line in proc.stdout.splitlines():
-        if line.startswith("worktree "):
-            paths.append(Path(line[len("worktree ") :]))
-    return paths
-
-
-def _is_under(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return True
-
-
-def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(repo_root), *args],
-            capture_output=True,
-            text=True,
-            env={**os.environ},
-        )
-    except FileNotFoundError:
-        return None
+        purge_run(repo_root, plan.purge)  # the shared rules; outcomes land in the removals
+        problems = list(plan.purge.ref_errors)
+        if plan.run_dir is not None and plan.run_dir.error is not None:
+            problems.append(f"run directory {plan.run_dir.error}")
+        if problems:
+            plan.error = "; ".join([plan.error, *problems] if plan.error else problems)
 
 
 # --- confirmation -----------------------------------------------------------------------------
@@ -517,7 +418,7 @@ def _summary_lines(plans: list[_RunPlan], repo_root: Path, *, dry_run: bool = Fa
     return lines
 
 
-def _removal_line(kind: str, removal: _Removal, repo_root: Path, *, dry_run: bool) -> str:
+def _removal_line(kind: str, removal: Removal, repo_root: Path, *, dry_run: bool) -> str:
     if removal.error is not None:
         status = f"failed: {removal.error}"
     elif dry_run:
@@ -550,7 +451,7 @@ def _plan_json(plan: _RunPlan, repo_root: Path, *, dry_run: bool) -> dict[str, A
 
 
 def _removal_json(
-    removal: _Removal | None, repo_root: Path, *, dry_run: bool
+    removal: Removal | None, repo_root: Path, *, dry_run: bool
 ) -> dict[str, Any] | None:
     if removal is None:
         return None
