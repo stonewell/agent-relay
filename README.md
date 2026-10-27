@@ -209,11 +209,42 @@ its termination before retrying. Command flags and exit codes are in
 On a terminal, bare `relay` (or `relay -C PATH tui`) opens the Textual interface: a
 conversation and composer, a task sidebar and an inspector. `relay tui --session S` or
 `relay resume --session S` reopens a saved session; it shows the recovered state and never
-dispatches anything until you choose to continue. Press F1 for the keys and Ctrl+P for the
-command palette. Planning needs a coordinator with a reviewed qualification record for your exact
-CLI version, OS and authentication mode (F9 lists them and explains unavailable ones); without
-one, saved sessions stay inspectable and the headless commands above work as before. The
-interaction rules are in [section 14.1](docs/design.md#141-conversational-terminal-interface-phase-2c).
+dispatches anything until you choose to continue. Without a terminal, `relay tui` exits 2 and
+the headless commands above are unchanged.
+
+```sh
+uv run relay -C ../relay-demo tui
+uv run relay -C ../relay-demo tui --session SESSION
+```
+
+A typical round: type a request in the composer and press Ctrl+S; answer the coordinator's
+questions; review the proposed plan (F5) and approve that revision; watch the tasks (F3) and
+inspect a task's exact handoff, files, diff, checks and logs (F4); answer a blocked task from
+the composer while the others keep running; then review and apply the cumulative delivery (F6),
+which prepares, verifies and asks for confirmation like `relay apply`. Sending a new request
+while a round runs starts **Checkpoint and revise**: admission pauses first, and you choose to
+let active work finish or cancel it; nothing replaces a running worker's prompt.
+
+| Key | Action |
+|---|---|
+| Ctrl+S | Send the composer (an answer to the open question, or a new request) |
+| Ctrl+T | Switch the composer between answering and a new request |
+| F1, Ctrl+P | Shortcut help, command palette (Continue round, Resume turn, Cancel task, ...) |
+| F2, F3, F4 | Conversation, tasks, inspector (separate views at 80×24) |
+| F5, F6 | Plan review and approval, delivery review and apply |
+| F7, F9 | Sessions (open, create, Ctrl+D to delete with confirmation), coordinator selection |
+| F8 | Stop: shows **Stopping** until workers and the coordinator have drained |
+| Ctrl+Q | Quit; while work runs it asks first, then drains before exiting (there is no detach) |
+
+Ctrl+C does not quit or stop anything (in a Windows console it reaches the interface as a key;
+in the composer it copies the selection). Interrupts while the interface drains on exit do not cut the drain
+short. A stopped round stays interrupted until you continue it explicitly.
+
+Planning needs a coordinator with a reviewed qualification record for your exact CLI version,
+OS and authentication mode (F9 lists them and explains unavailable ones); without one, saved
+sessions stay inspectable and the headless commands above work as before. The interface is
+accepted on Windows; Linux and macOS acceptance is still pending. The interaction rules are in
+[section 14.1](docs/design.md#141-conversational-terminal-interface-phase-2c).
 
 ## Configuration and troubleshooting
 

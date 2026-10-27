@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.33 |
-| `development-plan.md` | v0.15 |
+| `design.md` | v0.34 |
+| `development-plan.md` | v0.16 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.34 / plan v0.16: Windows acceptance and hardening of phase 2c (task 2.29): observer paths no longer sweep temporary files, coordinator turns are cancel-safe, and `relay clean` uses the shared purge rules; 2.29 is done for Windows and Linux/macOS stays with 2.33. The same version records the opt-in Cursor adapter (task 4.2) and its first doctor canaries (task 4.11). Details are recorded below.
 
 v0.33 / plan v0.15: Textual TUI over the phase-2c core (task 2.28); the 2.28 status row replaces its remaining-work entry. Details are recorded below.
 
@@ -565,7 +567,7 @@ This revision records local validation already performed; it does not claim a ne
 | ID / severity | Finding | Resolution |
 |---|---|---|
 | TU1 / P1 | `SessionOwner.acquire` swept the session directory's temporary files before taking the lock, so a second TUI opening a busy session could delete the live owner's in-flight atomic write. | Sweeping happens only after the lock is held. |
-| TU2 / P1 | `RunStore.open` sweeps temporary files, so projections that opened the active run on every refresh broke the writer's atomic `run.json` update (observed as a failed node). | The service reads runs through a non-sweeping handle. Other observer paths that call `RunStore.open` or `SessionStore.open` on an active run (for example `linked_session`, `round_state`, `protected_run_ids`) still sweep; they are left for review. |
+| TU2 / P1 | `RunStore.open` sweeps temporary files, so projections that opened the active run on every refresh broke the writer's atomic `run.json` update (observed as a failed node). | The service reads runs through a non-sweeping handle. Other observer paths that call `RunStore.open` or `SessionStore.open` on an active run (for example `linked_session`, `round_state`, `protected_run_ids`) still sweep; they are left for review. (Resolved in v0.34 as TU14.) |
 | TU3 / P2 | A read-only `git merge-base` started from the projection while workers were being spawned on Windows intermittently never returned in the Pilot walkthroughs (its output pipes stayed open). | Projection git queries use no stdin, a 30-second bound and a short cache; core `apply._run` now also uses no stdin and a 900-second bound (a timeout is a `GitApplyError`). The root cause was not isolated. |
 | TU4 / P2 | A quit-time shutdown and the host's final shutdown could overlap, so the second returned while the first was still draining and the loop stopped under it. | Shutdown is one shared operation and release is serialized. |
 | TU5 / P2 | After an owner crash `run.json` stays `running`, so `continue_round` refused the round and the TUI hid Continue. | A `running` round is continued when its run-lock owner is stale or absent; run recovery still proves old workers ended. The projection offers Continue for it. |
@@ -577,3 +579,34 @@ This revision records local validation already performed; it does not claim a ne
 | TU11 / P3 | Stop and quit could race (stop reacquiring after shutdown released); a failed cancellation skipped release; the host could stop its loop under a running controller. | Stop reacquires under the release lock and not once closing; release always runs; `ServiceHost.close` waits while `still_running` reports work. |
 | TU12 / P3 | A crash during deletion could strand records hidden from the session list. | `session.json` is removed last, so a partial deletion stays listed as deleting until finished. |
 | TU13 / P2 | Runs kept after deleting their session could not be applied or resumed headless, because `RunLock`, `session_guard` and `prepare_run_delivery` require the session. | Operator decision: deleting a session also deletes its runs (`core.run_purge`, the `clean --purge-runs` rules). Live or unverifiable runs and runs shared with another session refuse; undelivered rounds, or rounds whose applied state is unknown, need an explicit confirmation that lists them; the marker lists the runs so a crash resumes. User branches are never touched. |
+
+## Windows acceptance and hardening (design v0.34, plan v0.16)
+
+| What changed | Where |
+|---|---|
+| `RunStore.open` and `SessionStore.open` no longer sweep temporary files. Only owners sweep: `SessionOwner.acquire` after the session lock is held (as before) and `RunLock.acquire` after the run lock is held. Every reader, including modules that still call `open`, is therefore an observer that changes nothing. | Design 6; plan 2.29 |
+| Headless `relay apply` opens the run's event log on its first event, inside the session guard and after preparation found the run finished, instead of before any check. | Design 6, 14; plan 2.29 |
+| Coordinator turns are cancel-safe: every durable write of a turn completes before a cancellation is delivered, the call's `try` starts before its call record is written, and a cancelled turn ends `interrupted` (an unexpected error ends it `failed`). | Design 8.7; plan 2.29 |
+| `relay clean` plans and executes through `relay.core.run_purge`, the same rules confirmed session deletion uses. Its arguments, JSON fields and the exit codes of its successful, skipped, refused and approval-required outcomes are unchanged; only the failure cases of TU18 changed. | Design 6, 14; plan 2.29 |
+| Windows acceptance evidence: offline suite and Textual Pilot walkthroughs, plus a Pilot check that Ctrl+C (a key in a Windows console) neither quits nor stops a round. Live coordinator/worker canaries stay opt-in and were not run. | Design 16; plan 2.29 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| TU14 / P1 | Follow-up to TU2: `linked_session`, `round_state`, `protected_run_ids`, a refused `RunLock.acquire` contender, headless `apply` (through `core.apply` and `core.delivery`), `clean` and session checks all reached `RunStore.open` or `SessionStore.open`, which swept a live owner's in-flight `.tmp-*` writes. | Opening never sweeps; the lock holder sweeps once. `tests/test_observers.py` holds a live session owner and run lock with in-flight temp files and shows every observer call and headless command leaves them; the same tests fail against the previous code. |
+| TU15 / P2 | Headless `apply` opened the run's `EventLog` before the session guard and before knowing the run was finished. Opening repairs a torn tail, by truncating it or appending a newline, which corrupts a record a live writer is appending. | The log opens on first use, after the guard and after a running run has been refused; a refused `apply` on a live run leaves `events.jsonl` byte-identical. |
+| TU16 / P1 | `PlanningEngine._invoke` wrote the call record, the turn and `coordinator.started` before its `try`, so a cancellation there left the call `started` and the turn `active`; deletion then refused until the session was reopened. A cancellation during any `asyncio.to_thread` write could also let that write land after the `interrupted` record, or after ownership was released. | Writes go through a helper that delivers a cancellation only after the thread finishes; the `try` covers the call record; a cancelled turn ends `interrupted` at every durable step (turn start, context selection, call record, turn record, `coordinator.started`). A quit inside the gap leaves no deletion problem and the turn resumes with its budget. |
+| TU17 / P3 | An unexpected coordinator error (for example a profile that stopped matching between selection and call) left the turn `active` and the call `started` until a reopen. | The call and the turn end `failed` with the error, which still propagates to the caller. |
+| TU18 / P2 | `relay clean --purge-runs` kept its own copy of the purge rules. Unlike its comment, it deleted the run record even when deleting one of its refs had failed, its git calls had no stdin redirection or time bound, and a failed worktree or ref listing read as "nothing to remove". | `clean` uses `core.run_purge`: the record is kept (with `run_directory.error`) and the run reports an error (exit 1) when an earlier removal failed, git runs without stdin and with a bound, and a listing failure is reported (exit 2) rather than ignored. Session deletion attempts every removal of a run before reporting failures, and still keeps the record. |
+
+## Cursor adapter (design v0.34, plan v0.16)
+
+| What changed | Where |
+|---|---|
+| `relay.adapters.cursor.CursorAdapter` for `agent` 2026.10.22-27dcf5f: `-p --output-format json --trust` with the prompt (and the result schema, since no schema flag exists) on stdin, the JSON reply parsed from the envelope's `result`, `--resume <session_id>`, `CURSOR_API_KEY` or the account login, and the legacy `cursor-agent` alias when `agent` is absent. `full` maps to `--force`; `readonly` to `--mode plan`, mapped but not advertised; `workspace` fails closed. Reasoning effort is not mapped. Cursor stays opt-in, outside the default foreground registry, and is neither a phase-2c coordinator nor a TUI worker. | Design 4.3, 7.2, 7.3, 9.3; plan 4.2 |
+| Windows spawning: relay's outer `cmd.exe` disables delayed expansion, but Cursor's `agent.cmd` re-enables it and forwards `%*` through PowerShell 5.1, which drops double quotes and `!...!` spans from argv prose. The prompt therefore goes on stdin, which a shim-chain test shows is byte-exact; only short, character-checked tokens go on argv. | Design 7.2; plan 4.2 |
+| Doctor: `adapter.cursor.{version,auth,structured,session,quoting,needs_input}` and `permission.cursor.{readonly,workspace}`, present only with `agents.cursor.enabled: true` and bounded at 300 seconds per model call. One live run each on Windows 11 with an account login is recorded in `tests/fixtures/recorded/cursor_doctor_canaries.json`: the six adapter canaries passed, both permission canaries were `inconclusive` (`--sandbox enabled` is refused by the Windows CLI, which has no filesystem sandbox). | Design 9.3, 14; plan 4.11 |
+| Shared doctor change: the `needs_input` canary now validates a reply with each adapter's own result rule (nulls and empty `options` on free questions normalised, node id set by the orchestrator), which is slightly more lenient for Claude and Codex than the previous plain model validation; a passing session canary also reports `same_session_id` and `observed_fields`; canary specs and permission profiles carry a per-adapter call bound. | Design 7.3, 14; plan 4.11 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| CU1 / P3 | An `inconclusive` permission canary records only its classification, so the reason (for example the Windows CLI refusing `--sandbox enabled`) is not visible in the result. | Open follow-up under 4.11: keep the CLI exit code and a redacted first stderr line in the canary result. |

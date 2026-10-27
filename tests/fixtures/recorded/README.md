@@ -23,17 +23,21 @@ bare file names, following the sensitive-information rule in `AGENTS.md`.
 | `cursor_plain.json` | `agent -p --output-format json --mode plan --trust` (account login, no API key) |
 | `cursor_resume.json` | `--resume <session_id>` |
 | `cursor_prompt_needs_input.json` | ambiguous task, JSON shape requested in the prompt (no schema flag exists) |
+| `cursor_doctor_canaries.json` | `relay doctor --check <id> --json` results for `adapter.cursor.*` and `permission.cursor.*` (agent 2026.10.22-27dcf5f, Windows 11, account login, 2026-10-27; one observation each, check results only, no raw envelopes) |
 
 ## Consumers and refresh
 
-`tests/test_recorded_outputs.py` checks the captured envelopes and usage shapes. The Claude and
-Codex adapter tests exercise parsing and invocation construction separately. Cursor captures
-supply protocol evidence without implying an executable Cursor adapter is available.
+`tests/test_recorded_outputs.py` checks the captured envelopes and usage shapes. The Claude,
+Codex and Cursor adapter tests (`tests/test_claude_adapter.py`, `tests/test_codex_adapter.py`,
+`tests/test_cursor_adapter.py`) exercise parsing and invocation construction separately; the
+Cursor tests use the spike 0.11 captures as golden inputs and the doctor canary record as
+evidence. The Cursor adapter is opt-in (`agents.cursor.enabled: true`) and is not a phase-2c
+coordinator or TUI worker.
 
 Run the offline fixture checks from the repository root:
 
 ```sh
-uv run pytest -q tests/test_recorded_outputs.py tests/test_claude_adapter.py tests/test_codex_adapter.py -k "not live"
+uv run pytest -q tests/test_recorded_outputs.py tests/test_claude_adapter.py tests/test_codex_adapter.py tests/test_cursor_adapter.py -k "not live"
 ```
 
 Live validation and its opt-in procedure are defined in
