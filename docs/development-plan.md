@@ -157,7 +157,7 @@ Goal: a task graph runs in the foreground with isolation, merging, fallback and 
 | 2.9 | `input_key` computation, completed-node reuse and descendant invalidation, `node.reused/invalidated` events | P1 | L | 2.4 | 6, 8.2 | Snapshot/resume test area green |
 | 2.10 | Planner: template pipelines (bugfix, feature, refactor, upgrade) and user graph files; `relay plan`, `relay graph run` | P1 | M | 2.1 | 14, 17 | Templates produce valid graphs |
 | 2.11 | Foreground `relay resume` for graphs, `relay cancel` (Ctrl-C handling), `blocked` nodes reporting | P1 | M | 2.2, 2.9 | 8.2, 14 | Interrupted graph resumes reusing valid nodes |
-| 2.30 | Qualified `readonly` profile for read-access nodes: promote a profile into `probe().levels` per OS for at least one agent (for example Claude plan mode, Codex `-s read-only`) after the section 9.3 canary returns `enforced`; routing reports the unmet level otherwise | P0 | M | 0.12, 1.20 | 8.1, 9.3 | A review/research node of the example graph runs on Windows and Linux under `readonly`; unqualified OS/agent combinations still fail closed; required for **M3** sign-off |
+| 2.30 | Qualified `readonly` profile for read-access nodes: promote a profile into `probe().levels` per OS for at least one agent (for example Claude plan mode, Codex `-s read-only`) after the section 9.3 canary returns `enforced`; routing reports the unmet level otherwise | P0 | M | 0.12, 1.20 | 8.1, 9.3 | A review/research node of the example graph runs on Windows under `readonly`; unqualified OS/agent combinations (Linux/macOS until 2.33) still fail closed; the Windows run is required for **M3** sign-off |
 
 ## Phase 2b: Background supervisor (milestone M4)
 
@@ -174,7 +174,7 @@ Goal: detached per-run supervisor with correct ownership, IPC and crash recovery
 | 2.18 | `wait`, `status` and `cancel` front-end behaviour on IPC; `relay resume --max-attempts` | P1 | M | 2.14 | 8.6, 14 | Wait expiry returns actual state without cancelling |
 | 2.19 | Cross-platform reliability pass: Windows pipe ACLs, PID reuse, long socket paths, antivirus/locking surprises | P0 | M | 2.16 | 6, 8.6 | Phase 2b suite green on all supported OSes |
 
-**Exit criteria (M3):** M2 signed off; foreground graphs pass the graph, merge, snapshot/resume and overlap test areas on Windows and Linux. **Exit criteria (M4):** ownership and recovery test area (phase 2b part) green; a run started by one front-end process is inspected, answered and cancelled from another.
+**Exit criteria (M3):** M2 signed off; foreground graphs pass the graph, merge, snapshot/resume and overlap test areas on Windows and Linux (Linux `readonly` and macOS follow-up is 2.33, P2). **Exit criteria (M4):** ownership and recovery test area (phase 2b part) green; a run started by one front-end process is inspected, answered and cancelled from another.
 
 **Cut order:** 2.10 template breadth, 2.8 extras, then 2.18 polish. Never cut 2.15 or 2.16.
 
@@ -197,7 +197,8 @@ Phase 2c may start when its individual task prerequisites are complete, without 
 | 2.26 | Adapter progress stream, pipe draining and projection backpressure | P1 | M | 1.7, 2.22 | 7.1, 7.4, 11 | Slow UI cannot deadlock pipes, final parsing or cancellation; unsupported streams fall back to lifecycle phases; buffers, escaping and redaction stay bounded |
 | 2.27 | Shared cumulative-session delivery service | P0 | M | 2.25, 1.24 | 8.3, 10, 14.1 | CLI and TUI apply the same prepared tree with cumulative approved checks/scopes and explicit confirmation across rounds |
 | 2.28 | Textual TUI: launch, navigation, questions, plans, context and diff controls | P0 | L | 2.24, 2.25, 2.27 | 14.1, 15 | Keyboard-complete Pilot walkthroughs pass at 80×24 and 120 columns; reopened sessions recover interrupted state without background execution; headless CLI behavior remains compatible |
-| 2.29 | Cross-platform acceptance, hardening, documentation and release qualification | P1 | M | 2.28, 2.26 | 16, 17 | Windows/Linux offline and Pilot acceptance passes; qualified coordinator/worker CLI canaries are explicit opt-in release checks and are not run automatically |
+| 2.29 | Cross-platform acceptance, hardening, documentation and release qualification | P1 | M | 2.28, 2.26 | 16, 17 | Windows offline and Pilot acceptance passes; Linux/macOS acceptance is tracked by 2.33 and does not gate M8; qualified coordinator/worker CLI canaries are explicit opt-in release checks and are not run automatically |
+| 2.33 | Linux/macOS follow-up for phase 2c and M3: full offline and Pilot acceptance, `permission.<agent>.readonly` canaries and promotion in `READONLY_VERIFIED_PLATFORMS`, coordinator qualification records per OS and auth mode (including `api-key`), real-terminal smoke test of `relay tui` | P2 | M | 2.29, 2.30 | 9.3, 16, 17 | Linux (and macOS where available) offline/Pilot suites pass; each OS/agent/auth combination is qualified by reviewed canary evidence or stays unavailable (fail closed) |
 | 2.31 | **Spike D**: restricted coordinator profile feasibility for Claude and Codex (tool-free or read-only, context boundary, startup hooks/MCP, subscription vs API-key auth, per OS) | P0 | M | 2.20, 0.12 | 7.4, 9.3 | Go/no-go recorded per CLI/OS/auth mode; no-go means coordination stays unavailable there and 2.24 narrows to the qualifying modes |
 | 2.32 | Adapter `coordinate` capability and opt-in qualification canaries for qualifying modes, sharing invocation, supervision and validation with workers | P0 | L | 2.20, 2.31 | 5.6, 7.4 | Fake and recorded-output tests pass; canaries classify each profile `enforced`/`inconclusive`/etc.; unqualified profiles stay unavailable |
 
@@ -240,7 +241,7 @@ Goal: more agents, spawning, cost control and non-git workspaces. Tasks are inde
 | 4.7 | Shadow-git mode: baseline snapshot with exclusions, isolated store, non-git prompt/auto-init | P1 | L | M2 | 1, 6 | Runtime state excluded from the baseline; non-git run completes |
 | 4.8 | Shadow-git `apply`: three-way sync, conflict manifests, journal, crash recovery, target locks, symlink/junction checks | P1 | L | 4.7, M4 | 8.3 | Delivery test area (shadow-git part) green with crash injection |
 | 4.9 | `relay replay` and richer `explain` | P2 | S | M2 | 11, 14 | Timeline renders from events |
-| 4.10 | Permission profiles for more platforms (Windows filesystem-confining profile if spike 0.12 allowed it; macOS/Linux wrappers) | P1 | L | 0.12 | 9.3 | `doctor` canaries pass for each advertised level |
+| 4.10 | Permission profiles for more platforms (Windows filesystem-confining profile if spike 0.12 allowed it; macOS/Linux wrappers, lower priority) | P1 | L | 0.12 | 9.3 | `doctor` canaries pass for each advertised level |
 
 **Exit criteria (M6):** each task meets its done-when; phase 4 test areas green. Tasks may ship independently as minor releases. **Cut order:** 4.9, 4.6, 4.10 (platform by platform).
 
@@ -368,26 +369,28 @@ remain as defined above. Deferred MVP validation remains separate lower-priority
 **Before M3 sign-off (P0)**
 
 - **2.30 (in progress):** `readonly` is advertised for Claude and Codex on Windows only. Still
-  needed: run the `permission.<agent>.readonly` canaries on Linux and promote them in
-  `READONLY_VERIFIED_PLATFORMS` if they return `enforced`, then run a read-access node of the
-  example graph on both OSes. Extend the canaries to the subprocess and symlink cases of design
-  9.3 before treating the promotion as more than direct-write evidence.
+  needed for M3: run a read-access node of the example graph on Windows, and extend the canaries
+  to the subprocess and symlink cases of design 9.3 before treating the promotion as more than
+  direct-write evidence. The Linux canaries and promotion in `READONLY_VERIFIED_PLATFORMS` moved
+  to 2.33 (P2); Linux stays unadvertised, and so fails closed, until then.
 
 **Release gate for M8 (a reviewed decision, not code)**
 
-- **Coordinator qualification record:** `relay.core.coordinator.QUALIFICATIONS` is empty, so every
-  coordinator is unavailable. The opt-in canary `relay doctor --check coordinator.claude` returned
-  `enforced` once on Windows with Claude Code 2.1.310 and subscription auth. A record binds to the
-  exact CLI version, OS, auth mode and configuration digest, so it must be reviewed, repeated on
-  every supported OS and auth mode, and redone when the CLI version changes. Codex has no
-  qualifying profile (spike 2.31).
+- **Coordinator qualification record:** `relay.core.coordinator.QUALIFICATIONS` holds an
+  operator-directed record for Claude Code 2.1.311 on Windows with subscription auth (canary
+  `enforced`, one observation) and an unqualified Codex record (spike 2.31). A record binds to the
+  exact CLI version, OS, auth mode and configuration digest, so it is redone when the CLI version
+  changes. Windows is the supported release mode; other OS and auth-mode records are tracked by
+  2.33 (P2) and stay unavailable until then.
 
 **Phase 2c implementation (M8), remaining**
 
-1. **2.29 (P1):** cross-platform acceptance and release qualification, including Linux runs of
-   everything in 2.20 to 2.28 (the TUI Pilot walkthroughs included), the opt-in canaries and the
-   qualification record above. Review the observer paths that still sweep temporary files of an
-   active run or session (revision log TU2) as part of the hardening.
+1. **2.29 (P1):** Windows acceptance, hardening and release qualification. Review the observer
+   paths that still sweep temporary files of an active run or session (revision log TU2), the
+   `PlanningEngine._invoke` cancel gap, and move `relay clean --purge-runs` onto `core.run_purge`.
+2. **2.33 (P2, lower priority):** Linux/macOS acceptance, `readonly` promotion, per-OS coordinator
+   records and a real-terminal smoke test. A first Linux run (RHEL 8, Python 3.11) was started
+   during 2.29 and is not yet reviewed.
 
 Implemented and not repeated here: 2.20 contracts and matrix, 2.21 sessions and ownership, 2.22
 controller, 2.23 context broker, 2.24 planning loop, 2.25 checkpoints and retained bases, 2.26
