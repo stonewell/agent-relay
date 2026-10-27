@@ -168,6 +168,11 @@ def test_permission_profiles_register_paid_checks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     isolated(monkeypatch, tmp_path)
+    # Cursor is opt-in (disabled in the built-in defaults); its profiles need the agent.
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "agents.yaml").write_text(
+        "agents:\n  cursor:\n    enabled: true\n", encoding="utf-8"
+    )
     registry = default_registry(DoctorContext(repo_root=tmp_path))
     by_id = {c.id: c for c in registry}
     for candidate in PERMISSION_PROFILES:

@@ -362,10 +362,20 @@ def test_the_throwaway_directory_is_removed_afterwards(tmp_path: Path) -> None:
 # --- doctor integration: paid gating, ids, output shapes ----------------------------------------
 
 
+def opt_in_cursor(tmp: Path) -> None:
+    """Enable the opt-in Cursor agent (disabled in the built-in defaults) with a fake cmd."""
+    (tmp / ".agents").mkdir(exist_ok=True)
+    (tmp / ".agents" / "agents.yaml").write_text(
+        "agents:\n  cursor:\n    enabled: true\n    cmd: definitely-not-installed-xyz\n",
+        encoding="utf-8",
+    )
+
+
 def test_adapter_canaries_register_with_expected_ids_and_paid_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     isolated(monkeypatch, tmp_path)
+    opt_in_cursor(tmp_path)
     registry = default_registry(DoctorContext(repo_root=tmp_path))
     by_id = {c.id: c for c in registry}
     for candidate in ADAPTER_CANARY_SPECS:
@@ -375,10 +385,29 @@ def test_adapter_canaries_register_with_expected_ids_and_paid_flags(
             assert check.requires == ()
 
 
+def test_cursor_canaries_are_opt_in_with_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cursor is disabled in the built-in defaults, so its check set needs the opt-in."""
+    isolated(monkeypatch, tmp_path)
+    ids = {c.id for c in default_registry(DoctorContext(repo_root=tmp_path))}
+    assert not any(i.startswith("adapter.cursor.") for i in ids)
+    opt_in_cursor(tmp_path)
+    by_id = {c.id: c for c in default_registry(DoctorContext(repo_root=tmp_path))}
+    assert {f"adapter.cursor.{kind}" for kind in CANARY_KINDS} <= set(by_id)
+    # Cursor calls are slow (spike 0.11), so its paid checks get a longer bound.
+    assert (
+        by_id["adapter.cursor.structured"].timeout_s > by_id["adapter.claude.structured"].timeout_s
+    )
+    assert by_id["adapter.cursor.session"].timeout_s >= 2 * spec("cursor").timeout_s
+    assert by_id["adapter.cursor.version"].timeout_s == by_id["adapter.claude.version"].timeout_s
+
+
 def test_default_doctor_runs_no_paid_adapter_canaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     isolated(monkeypatch, tmp_path)
+    opt_in_cursor(tmp_path)
     ctx = DoctorContext(repo_root=tmp_path)
     report = asyncio.run(run_checks_default(ctx))
     ids = [c.id for c in report.checks]

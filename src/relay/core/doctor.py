@@ -339,6 +339,7 @@ class PermissionProfile:
     cmd: str
     prompt_via: Literal["stdin", "argv"]
     advertised: bool = False
+    timeout_s: float = CANARY_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -351,15 +352,37 @@ class PermissionCanaryResult:
     note: str
 
 
+# Cursor attempts can be slow even without edits (spike 0.11: 242 s for an ambiguous task),
+# so its canaries get a longer per-call bound than the default.
+CURSOR_CANARY_TIMEOUT_S = 300.0
+
 # The mapped restricted profiles from section 7.2 (Claude `--permission-mode plan`; Codex
-# `-s read-only`/`-s workspace-write`; Antigravity `--mode plan`/`--sandbox`). None are
-# advertised yet: every adapter's `probe()` stays at `full` until a canary passes.
+# `-s read-only`/`-s workspace-write`; Antigravity `--mode plan`/`--sandbox`; Cursor
+# `--mode plan` without `--force`, and the `--sandbox enabled` workspace candidate, which the
+# Windows CLI refuses: it has no filesystem sandbox there). None are advertised here:
+# promotion into `probe().levels` is a manual change (section 9.3).
 PERMISSION_PROFILES: tuple[PermissionProfile, ...] = (
     PermissionProfile("claude", "readonly", ("--permission-mode", "plan"), "claude", "stdin"),
     PermissionProfile("codex", "readonly", ("-s", "read-only"), "codex", "stdin"),
     PermissionProfile("codex", "workspace", ("-s", "workspace-write"), "codex", "stdin"),
     PermissionProfile("agy", "readonly", ("--mode", "plan"), "agy", "argv"),
     PermissionProfile("agy", "workspace", ("--sandbox",), "agy", "argv"),
+    PermissionProfile(
+        "cursor",
+        "readonly",
+        ("--mode", "plan"),
+        "agent",
+        "stdin",
+        timeout_s=CURSOR_CANARY_TIMEOUT_S,
+    ),
+    PermissionProfile(
+        "cursor",
+        "workspace",
+        ("--sandbox", "enabled", "--force"),
+        "agent",
+        "stdin",
+        timeout_s=CURSOR_CANARY_TIMEOUT_S,
+    ),
 )
 
 # Notes for the three outcomes produced by filesystem/output classification; the
@@ -394,8 +417,8 @@ def _canary_args(
 ) -> tuple[tuple[str, ...], str | None]:
     """The argv (after the resolved command) and stdin prompt for one canary run.
 
-    Mirrors each adapter's prompt channel (design section 7.2): Claude and Codex take the
-    prompt on stdin, Antigravity on argv.
+    Mirrors each adapter's prompt channel (design section 7.2): Claude, Codex and Cursor take
+    the prompt on stdin, Antigravity on argv.
     """
     flags = list(profile.flags)
     if profile.adapter == "claude":
@@ -406,6 +429,9 @@ def _canary_args(
     if profile.adapter == "agy":
         # This probe is plain prose; keep its argv form safe for Windows batch shims.
         return (("-p", prompt.replace("\n", " "), *flags), None)
+    if profile.adapter == "cursor":
+        # `--trust` is always passed by the adapter; prose never crosses the `.cmd` shim.
+        return (("-p", "--trust", *flags), prompt + "\n")
     raise AssertionError(f"unknown canary adapter {profile.adapter!r}")
 
 
@@ -543,7 +569,9 @@ def permission_canary_check(profile: PermissionProfile, cmd: str) -> Check:
     """
 
     async def run(_ctx: DoctorContext) -> CheckResult:
-        result = await asyncio.to_thread(run_permission_canary, cmd, profile)
+        result = await asyncio.to_thread(
+            run_permission_canary, cmd, profile, timeout_s=profile.timeout_s
+        )
         flags = " ".join(profile.flags)
         advertised = "advertised" if profile.advertised else "not advertised"
         summary = (
@@ -568,7 +596,7 @@ def permission_canary_check(profile: PermissionProfile, cmd: str) -> Check:
         f"{profile.adapter} {profile.level} permission profile",
         run,
         paid=True,
-        timeout_s=CANARY_TIMEOUT_S + 15.0,
+        timeout_s=profile.timeout_s + 15.0,
     )
 
 
@@ -674,13 +702,15 @@ _TIMEOUT_FOR: dict[str, float] = {
 class AdapterCanarySpec:
     """The per-adapter facts a canary verifies (design sections 7.2, 7.3)."""
 
-    adapter: str  # "claude" | "codex" | "agy"
+    adapter: str  # "claude" | "codex" | "agy" | "cursor"
     cmd: str
     prompt_via: Literal["stdin", "argv"]
     auth_keys: tuple[str, ...]
     auth_key_mode: str
     auth_no_key_mode: str
     session_field: str
+    timeout_s: float = CANARY_TIMEOUT_S
+    """The bound on one model call of a paid canary."""
 
 
 @dataclass(frozen=True)
@@ -705,8 +735,9 @@ class _CanaryPayload:
 
 
 # Claude `--bare` only with API-key auth; Codex key vs ChatGPT login; Antigravity
-# `GEMINI_API_KEY` vs keyring (design section 7.2). Legacy Gemini exposes no headless
-# session/resume, so it has no canary here (task 4.1 covers it once the adapter exposes it).
+# `GEMINI_API_KEY` vs keyring; Cursor `CURSOR_API_KEY` vs the stored account login (design
+# section 7.2). Legacy Gemini exposes no headless session/resume, so it has no canary here
+# (task 4.1 covers it once the adapter exposes it).
 ADAPTER_CANARY_SPECS: tuple[AdapterCanarySpec, ...] = (
     AdapterCanarySpec(
         "claude", "claude", "stdin", ("ANTHROPIC_API_KEY",), "api-key", "subscription", "session_id"
@@ -722,6 +753,16 @@ ADAPTER_CANARY_SPECS: tuple[AdapterCanarySpec, ...] = (
     ),
     AdapterCanarySpec(
         "agy", "agy", "argv", ("GEMINI_API_KEY",), "api-key", "keyring", "conversation_id"
+    ),
+    AdapterCanarySpec(
+        "cursor",
+        "agent",
+        "stdin",
+        ("CURSOR_API_KEY",),
+        "api-key",
+        "account-login",
+        "session_id",
+        timeout_s=CURSOR_CANARY_TIMEOUT_S,
     ),
 )
 
@@ -799,6 +840,17 @@ def _canary_invocation(
         if resume_session:
             args += ["--conversation", resume_session]
         return tuple(args), None, None
+    if spec.adapter == "cursor":
+        # No schema flag exists: the schema goes into the prompt, which goes on stdin (the
+        # adapter's channel; argv prose does not survive the Windows `.cmd` shim). Plan mode
+        # keeps these model-only probes from editing the disposable directory.
+        from relay.adapters.cursor import schema_instructions
+
+        args = ["-p", "--output-format", "json", "--trust", "--mode", "plan"]
+        if resume_session:
+            args += ["--resume", resume_session]
+        text = prompt if schema is None else prompt + schema_instructions(schema)
+        return tuple(args), text + "\n", None
     raise AssertionError(f"unknown canary adapter {spec.adapter!r}")
 
 
@@ -838,6 +890,31 @@ def _agy_canary_payload(proc: ProcessResult) -> _CanaryPayload:
         return _CanaryPayload(
             cast("dict[str, Any]", structured) if isinstance(structured, dict) else None,
             response if isinstance(response, str) else None,
+            session_id if isinstance(session_id, str) and session_id else None,
+            tuple(sorted(data)),
+        )
+    return _CanaryPayload(None, None, None, ())
+
+
+_FENCED = re.compile(r"\A```(?:json)?\s*\n(.*?)\n```\Z", re.DOTALL)
+
+
+def _cursor_canary_payload(proc: ProcessResult) -> _CanaryPayload:
+    """Cursor's JSON envelope: no native object; the reply text is `result` (spike 0.11)."""
+    for data in _json_objects(proc.stdout):
+        if data.get("type") != "result":
+            continue
+        result = data.get("result")
+        text: str | None = None
+        if isinstance(result, str):
+            text = result.strip()
+            fenced = _FENCED.match(text)
+            if fenced:
+                text = fenced.group(1)
+        session_id = data.get("session_id")
+        return _CanaryPayload(
+            None,
+            text,
             session_id if isinstance(session_id, str) and session_id else None,
             tuple(sorted(data)),
         )
@@ -896,6 +973,8 @@ def _extract_canary_payload(
         return _codex_canary_payload(proc, output_file)
     if spec.adapter == "agy":
         return _agy_canary_payload(proc)
+    if spec.adapter == "cursor":
+        return _cursor_canary_payload(proc)
     raise AssertionError(f"unknown canary adapter {spec.adapter!r}")
 
 
@@ -1163,6 +1242,8 @@ def run_session_canary(
                     "session_field": spec.session_field,
                     "resume_ok": True,
                     "context_confirmed": True,
+                    "same_session_id": payload2.session_id == session_id,
+                    "observed_fields": list(payload.fields),
                 },
             )
         if proc2.exit_code != 0:
@@ -1261,13 +1342,13 @@ def _dispatch_canary(
     if kind == "auth":
         return run_auth_canary(spec, parent_env=parent_env, agent_env=agent_env)
     if kind == "structured":
-        return run_structured_canary(spec)
+        return run_structured_canary(spec, timeout_s=spec.timeout_s)
     if kind == "needs_input":
-        return run_input_canary(spec)
+        return run_input_canary(spec, timeout_s=spec.timeout_s)
     if kind == "session":
-        return run_session_canary(spec)
+        return run_session_canary(spec, timeout_s=spec.timeout_s)
     if kind == "quoting":
-        return run_quote_canary(spec)
+        return run_quote_canary(spec, timeout_s=spec.timeout_s)
     raise AssertionError(f"unknown canary kind {kind!r}")
 
 
@@ -1295,8 +1376,16 @@ def adapter_canary_check(
         f"{spec.adapter} {kind} canary",
         run,
         paid=kind in _PAID_KINDS,
-        timeout_s=_TIMEOUT_FOR[kind],
+        timeout_s=_check_timeout(spec, kind),
     )
+
+
+def _check_timeout(spec: AdapterCanarySpec, kind: str) -> float:
+    """The doctor-level bound: the per-kind default, scaled for a slower adapter."""
+    if kind not in _PAID_KINDS or spec.timeout_s == CANARY_TIMEOUT_S:
+        return _TIMEOUT_FOR[kind]
+    calls = 2 if kind == "session" else 1
+    return calls * (spec.timeout_s + 15.0)
 
 
 def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
@@ -1338,6 +1427,8 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
         # quoting are `paid`. A disabled agent skips its canaries, and an adapter with no
         # agent entry (Antigravity) is probed with its default command so it reports
         # `unavailable`. Legacy Gemini has no headless session, so it is absent (task 4.1).
+        # Cursor is disabled in the built-in defaults (opt-in), so its check set appears once
+        # `agents.cursor.enabled: true` is configured; that alone does not make it routable.
         parent_env = dict(os.environ)
         for spec in ADAPTER_CANARY_SPECS:
             agent = loaded.config.agents.get(spec.adapter)
@@ -1356,7 +1447,7 @@ def run_input_canary(
     spec: AdapterCanarySpec, *, parent: Path | None = None, timeout_s: float = CANARY_TIMEOUT_S
 ) -> AdapterCanaryResult:
     """Observe typed clarification for a deliberately unspecified operator decision (8.2)."""
-    from relay.adapters.parsing import claude_schema, drop_nulls, strict_schema
+    from relay.adapters.parsing import claude_schema, strict_schema, validate_result
     from relay.core.specs import ResultSpec, schema_for
 
     base = Path(tempfile.mkdtemp(prefix="relay-input-canary-", dir=parent))
@@ -1364,7 +1455,8 @@ def run_input_canary(
         work = base / "work"
         work.mkdir()
         subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
-        schema = claude_schema() if spec.adapter == "claude" else schema_for(ResultSpec)
+        compact = spec.adapter in ("claude", "cursor")  # inline or in-prompt schema
+        schema = claude_schema() if compact else schema_for(ResultSpec)
         schema.pop("$schema", None)
         if spec.adapter == "codex":
             schema = strict_schema(schema)
@@ -1393,7 +1485,9 @@ def run_input_canary(
         if candidate is None and payload.text is not None:
             candidate = _try_json(payload.text)
         try:
-            result = ResultSpec.model_validate(drop_nulls(candidate))
+            # The adapters' own rule (section 5.4): nulls and empty `options` on free
+            # questions are normalised, and the node id is the orchestrator's.
+            result = validate_result(candidate, node_id="n1", agent=spec.adapter)
         except ValueError:
             return AdapterCanaryResult(
                 spec.adapter, "needs_input", "failed", "no valid typed clarification result", {}

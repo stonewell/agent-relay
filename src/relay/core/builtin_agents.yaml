@@ -94,7 +94,7 @@ agents:
       default: { model: fast }
 
   cursor:
-    enabled: false
-    cmd: agent
+    enabled: false               # opt-in; not in the default foreground adapter registry
+    cmd: agent                   # legacy alias cursor-agent is tried when `agent` is absent
     categories: [implement, refactor]
     models: { default: auto }
