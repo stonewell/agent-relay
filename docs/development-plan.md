@@ -232,6 +232,7 @@ Goal: more agents, spawning, cost control and non-git workspaces. Tasks are inde
 |---|---|---|---|---|---|---|
 | 4.1 | Antigravity CLI (`agy`) adapter and canaries, with legacy Gemini CLI behind the same adapter where installed (availability depends on plan) | P1 | M | M2 | 7.2, 7.3, 5.4, 9.4, 16 | Golden tests on the `agy` JSON envelope and `stream-json` result, structured output, and `conversation_id` resume; `probe()` skips cleanly when absent; doctor canaries; legacy Gemini checked only when installed |
 | 4.2 | Cursor adapter (`.cmd` shim handling, `--mode plan`, `--force`, sandbox canary) | P1 | M | M2 | 7.2 | Golden tests; `workspace` advertised only if the canary proves it |
+| 4.11 | Cursor adapter verification: live canaries on the pinned Cursor CLI (session id and resume, structured output, `--mode plan`/`--force` read-only and write behaviour, `.cmd` shim on Windows, sandbox/`workspace` claim), recorded outputs and a `doctor` check set | P1 | M | 4.2, 0.11 | 7.2, 7.3, 9.3 | Recorded-output and golden tests pass offline; opt-in live canaries classify each permission level `enforced`/`inconclusive`; `workspace` stays unadvertised without proof; Cursor is not offered as a phase-2c coordinator or TUI worker |
 | 4.3 | `spawn_requests`: validation, depth and node limits, no recursion, fresh-nodes-only mutation, events | P1 | M | M3 | 8.4 | Spawn test area green |
 | 4.4 | Pricing catalog and token normalization, settlement formula, `estimated`/`unknown` labels, doctor warnings | P0 | M | M3 | 8.5, 3 | Pricing tests green |
 | 4.5 | Reservations and admission control, advisory mode, `budget_exhausted` blocking, `relay resume --raise-budget`, status reporting | P0 | L | 4.4, M4 | 8.5 | Budget tests green including restart idempotency |
@@ -350,6 +351,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 2.25 | done | 2026-10-27 | `core.checkpoints` + `specs/checkpoint.py`: `SessionController.revise` closes the durable gate first, lets admitted work finish (bounded) or cancels it explicitly, leaves the run `interrupted` with reason `checkpoint`, seals only verified, dependency-closed outputs (result and artifact hashes, verification, exclusions with reasons) under `refs/relay-sessions/<sid>/checkpoints/<cid>`, marks the round superseded (reopens admission) so `RunLock` refuses it until `restore_round` revalidates and resumes it; conflicts keep separate source refs and a conflict manifest with no combined base; integration checks are append-only evidence and a checkpoint is deliverable only after a pass or an operator skip with a reason; `run_graph` takes a pinned `RetainedBase` (checkpoint or unapplied integration, validated for source identity, hashes, ancestry and availability) that never follows HEAD; plan digests now cover the base. Delivery across rounds belongs to 2.27 |
 | 2.26 | done | 2026-10-27 | `core.progress`: bounded lossy `ProgressChannel` (256 records, 8192-byte frames, oldest transient frames evicted or coalesced behind an explicit gap marker, lifecycle phases kept longest), terminal-escape/control/bidi stripping and secret redaction, `ClaudeStreamParser` and `CodexEventParser` (unknown events are display-only diagnostics), `stream_output` in the process supervisor (dedicated draining threads, full bounded capture independent of the sink, `OutputLimitExceeded` instead of truncation, cancellation and timeouts preserved), `ProgressCapable` adapter capability (Claude only with `stream_progress=True`; Codex uses its existing `--json` stream; others show lifecycle phases only), phase projection from `attempt.phase`, controller `progress` channel. Live check on Claude Code 2.1.310 (subscription auth): streaming with `--json-schema` still yields the final validated result; the opt-in test is `RELAY_LIVE=1 pytest tests/test_progress.py -k live`. Claude streaming stays off by default until a release canary qualifies it per version |
 | 2.27 | done | 2026-10-27 | `core.delivery` is the one service behind `relay apply <run>` and the future TUI: `prepare_run_delivery` / `prepare_checkpoint_delivery`, `verify_delivery`, `refresh_delivery` and `install_delivery`. A session-linked run resolves a cumulative `DeliveryPolicy` folded from the approved rounds (scopes and checks only accumulate; a narrower or `verify: none` later round removes nothing; the recorded policy must equal the fold or delivery is blocked), revalidates every carried checkpoint and unapplied integration (identity, hashes, lineage, ancestry, deliverability, intact refs) and fails closed, checks the whole baseline-to-delivered delta, and binds confirmation to a prepared-operation digest that includes the session revision and checkpoint evidence. `prepare_apply` gained `source_commit` and `baseline_commit`; verification and worktree install moved from the CLI into core with headless behaviour unchanged. The TUI consumes this service in 2.28; an explicit operator policy change that removes a requirement is not implemented |
+| 2.28 | done | 2026-10-27 | `relay.tui` (Textual `>=8.0,<9`, lazy import) over the in-process service `core.session_app.SessionApp`, which runs on its own loop thread (`ServiceHost`) so Textual workers only await it and close drains execution first. Bare `relay` on a terminal, `relay [-C PATH] tui [--session S]` and `relay resume --session S` (exclusive with a run); non-terminal `tui` exits 2, bare non-terminal `relay` keeps its usage error. Conversation and composer (answer vs steering), task sidebar, inspector (exact prompt, sources, files, diff, verification, logs), plan review with explicit approval of a revision, Checkpoint and revise (gate closes first; finish or cancel), Stop showing `Stopping` until drained, delivery review and apply through `core.delivery`, session picker with confirmed deletion, coordinator selector listing only qualified modes. Core additions: `SessionController.continue_round`, `planning.recover_turns`, `PlanningEngine.plan_base`, `sessions.delete_session`; `SessionOwner.acquire` no longer sweeps temp files before holding the lock. Keyboard-only Pilot walkthroughs at 80x24 and 120x40, CLI routing and a no-Textual headless check pass on Windows; Linux not run. Coordinator review after a round is explicit, not automatic. Independent review findings TU5–TU13 are fixed with regression tests; per the operator's decision (TU13), deleting a session also purges its runs under the `clean --purge-runs` rules, with explicit confirmation for undelivered rounds |
 | 2.30 | in progress | 2026-10-26 | `advertised_levels` promotes `readonly` for Claude and Codex on Windows only (`READONLY_VERIFIED_PLATFORMS`); Linux canary and an end-to-end read-node run on both OSes remain before done |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 
@@ -359,8 +361,8 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 ### Remaining work in order
 
 The status table above is the source for completed work and validation evidence. Phase 2a
-implementation is complete and the phase 2c foundations (2.20 to 2.27, plus spike 2.31 and task
-2.32) are implemented and tested on Windows. M3 and M8 sign-off, along with release exit gates,
+implementation is complete and phase 2c implementation (2.20 to 2.28, plus spike 2.31 and task
+2.32) is implemented and tested on Windows. M3 and M8 sign-off, along with release exit gates,
 remain as defined above. Deferred MVP validation remains separate lower-priority release closure.
 
 **Before M3 sign-off (P0)**
@@ -382,16 +384,15 @@ remain as defined above. Deferred MVP validation remains separate lower-priority
 
 **Phase 2c implementation (M8), remaining**
 
-1. **2.28 (P0):** Textual TUI over `SessionController`, `PlanningEngine`, the progress channel and
-   the delivery service (`core.delivery`); bare `relay`, `relay tui` and `resume --session`; keyboard-complete Pilot
-   walkthroughs at 80x24 and 120 columns. The core already has turn `recover`/`resume_turn` and
-   round `restore_round`; a command surface and session-reopen flow still need to be built on them.
-2. **2.29 (P1):** cross-platform acceptance and release qualification, including Linux runs of
-   everything in 2.20 to 2.27, the opt-in canaries and the qualification record above.
+1. **2.29 (P1):** cross-platform acceptance and release qualification, including Linux runs of
+   everything in 2.20 to 2.28 (the TUI Pilot walkthroughs included), the opt-in canaries and the
+   qualification record above. Review the observer paths that still sweep temporary files of an
+   active run or session (revision log TU2) as part of the hardening.
 
 Implemented and not repeated here: 2.20 contracts and matrix, 2.21 sessions and ownership, 2.22
 controller, 2.23 context broker, 2.24 planning loop, 2.25 checkpoints and retained bases, 2.26
-progress streaming, 2.27 cumulative delivery, 2.31 spike, 2.32 coordinate capability.
+progress streaming, 2.27 cumulative delivery, 2.28 Textual TUI, 2.31 spike, 2.32 coordinate
+capability.
 
 **Lower-priority MVP release closure (P1)**
 

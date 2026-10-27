@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.32 |
-| `development-plan.md` | v0.14 |
+| `design.md` | v0.33 |
+| `development-plan.md` | v0.15 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.33 / plan v0.15: Textual TUI over the phase-2c core (task 2.28); the 2.28 status row replaces its remaining-work entry. Details are recorded below.
 
 v0.32 / plan v0.14: shared cumulative-session delivery service (task 2.27); the 2.27 status row replaces its remaining-work entry. The table above had not followed the v0.31 foundations entry and now shows the current versions. Details are recorded below.
 
@@ -550,3 +552,28 @@ This revision records local validation already performed; it does not claim a ne
 |---|---|---|
 | CD1 / P1 | `relay apply <run>` on a session round verified only the last round's own policy, so a shortened follow-up (narrower scope, `verify: none`) could deliver a tree that no longer met earlier mandated checks. | Session-linked runs resolve the cumulative policy and check the whole baseline-to-delivered delta; earlier checks and restrictions stay required. |
 | CD2 / P2 | Dirty-edit recognition used the last round's retained base, which does not hold the user's original `--allow-dirty` snapshot after several rounds. | Session delivery passes the first round's base as the baseline. |
+
+## Textual TUI (design v0.33, plan v0.15)
+
+| What changed | Where |
+|---|---|
+| `relay.tui` (app, projection, widgets, screens) projects one in-process application service, `relay.core.session_app.SessionApp`, which composes the session owner, `PlanningEngine`, `SessionController` and the shared delivery service. The service runs on its own event-loop thread (`ServiceHost`); Textual workers only await it, and application close drains execution before ownership is released. | Design 14.1, 15; plan 2.28 |
+| Entry points: bare `relay` on a terminal, `relay tui`, `relay -C PATH tui`, `relay tui --session S` and `relay resume --session S` (exclusive with a run). A non-terminal `relay tui` is a usage error (exit 2); bare non-terminal `relay` keeps its usage error. Textual is imported only inside the `tui` launch. Textual (`>=8.0,<9`) is a runtime dependency. | Design 14, 14.1, 15; plan 2.28 |
+| Core additions for the command surface: `SessionController.continue_round` (explicit continuation of an interrupted, not superseded round), `planning.recover_turns` (turn recovery without a coordinator), `PlanningEngine.plan_base` (proposals against a checkpoint or unapplied integration, covered by the plan digest) and `sessions.delete_session` (confirmed deletion with a durable marker). | Design 6, 8.7; plan 2.28 |
+| The service finishes a settled round itself; coordinator review, continuing a round or turn, and restoring a superseded round are explicit. Approval of a plan proposed by a coordinator whose profile has since changed is refused. Checkpoint-and-revise runs the round's integration checks on the combined commit so the checkpoint can be carried into cumulative delivery. | Design 8.7, 14.1; plan 2.28 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| TU1 / P1 | `SessionOwner.acquire` swept the session directory's temporary files before taking the lock, so a second TUI opening a busy session could delete the live owner's in-flight atomic write. | Sweeping happens only after the lock is held. |
+| TU2 / P1 | `RunStore.open` sweeps temporary files, so projections that opened the active run on every refresh broke the writer's atomic `run.json` update (observed as a failed node). | The service reads runs through a non-sweeping handle. Other observer paths that call `RunStore.open` or `SessionStore.open` on an active run (for example `linked_session`, `round_state`, `protected_run_ids`) still sweep; they are left for review. |
+| TU3 / P2 | A read-only `git merge-base` started from the projection while workers were being spawned on Windows intermittently never returned in the Pilot walkthroughs (its output pipes stayed open). | Projection git queries use no stdin, a 30-second bound and a short cache; core `apply._run` now also uses no stdin and a 900-second bound (a timeout is a `GitApplyError`). The root cause was not isolated. |
+| TU4 / P2 | A quit-time shutdown and the host's final shutdown could overlap, so the second returned while the first was still draining and the loop stopped under it. | Shutdown is one shared operation and release is serialized. |
+| TU5 / P2 | After an owner crash `run.json` stays `running`, so `continue_round` refused the round and the TUI hid Continue. | A `running` round is continued when its run-lock owner is stale or absent; run recovery still proves old workers ended. The projection offers Continue for it. |
+| TU6 / P2 | Quitting during Apply could release ownership while the install thread still ran. | Apply is a tracked service operation; stop and shutdown wait for it, session switching refuses it, and quit counts it as busy. |
+| TU7 / P2 | Opening or deleting a session ignored a running coordinator turn, and release never cancelled it, so recovery could later block the turn on a live call. | Open and delete refuse while a turn runs, release cancels and drains a turn first, and deletion refuses active or blocked turns and `started` calls. |
+| TU8 / P2 | `delete_session` swept temporary files before holding the lock, and a refused deletion still ran recovery (state and revision changed) and left the event log open. | Deletion checks existence without sweeping, inspects through a no-recovery acquire, and closes the event log on every path. |
+| TU9 / P3 | Plan approval in the TUI trusted a turn-record proposer, failed open when it was missing and compared only agent and digest. | `save_plan` records the full proposing profile inside the plan digest; approval refuses a missing or different profile. |
+| TU10 / P3 | Coordinator answers and turn resumption were accepted while a round executed, and coordinator context reads opened live runs with a sweeping `RunStore.open`. | Both are refused while executing (the composer offers only node answers then), and context reads use a non-sweeping handle. |
+| TU11 / P3 | Stop and quit could race (stop reacquiring after shutdown released); a failed cancellation skipped release; the host could stop its loop under a running controller. | Stop reacquires under the release lock and not once closing; release always runs; `ServiceHost.close` waits while `still_running` reports work. |
+| TU12 / P3 | A crash during deletion could strand records hidden from the session list. | `session.json` is removed last, so a partial deletion stays listed as deleting until finished. |
+| TU13 / P2 | Runs kept after deleting their session could not be applied or resumed headless, because `RunLock`, `session_guard` and `prepare_run_delivery` require the session. | Operator decision: deleting a session also deletes its runs (`core.run_purge`, the `clean --purge-runs` rules). Live or unverifiable runs and runs shared with another session refuse; undelivered rounds, or rounds whose applied state is unknown, need an explicit confirmation that lists them; the marker lists the runs so a crash resumes. User branches are never touched. |
