@@ -500,6 +500,28 @@ class SessionOwner:
         store.update_run(lambda r: setattr(r, "session", link))
         return store
 
+    # --- owner commands -------------------------------------------------------------------
+
+    def record_command(self, command_id: str, content: dict[str, Any]) -> bool:
+        """Durably record an owner command once; True if new, False for an identical repeat.
+
+        A repeated id with different content raises :class:`SessionConflict` (section 8.7).
+        """
+        if not command_id or any(c in command_id for c in "/\\:") or ".." in command_id:
+            raise SessionConflict(f"{command_id!r} is not a valid command id")
+        with self._mutex:
+            self._require()
+            directory = self.store.dir / "commands"
+            directory.mkdir(exist_ok=True)
+            path = directory / f"{command_id}.json"
+            if path.is_file():
+                if json.loads(read_text(path))["content"] != content:
+                    raise SessionConflict(f"command id {command_id!r} reused with other content")
+                return False
+            record = {"command_id": command_id, "content": content}
+            atomic_write(path, json.dumps(record) + "\n")
+            return True
+
     # --- gate and recovery ----------------------------------------------------------------
 
     def close_admission(self) -> None:
@@ -531,6 +553,12 @@ class SessionOwner:
             self.event("session.interrupted", {})
         elif state == "idle":
             self._update(lambda r: setattr(r, "state", "active"))
+
+    def mark_interrupted(self) -> None:
+        """Record that a round was stopped before completion (section 8.7)."""
+        with self._mutex:
+            self._update(lambda r: setattr(r, "state", "interrupted"))
+            self.event("session.interrupted", {})
 
     def mark_active(self) -> None:
         """The operator explicitly continues a recovered session."""

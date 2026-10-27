@@ -39,6 +39,7 @@ def test_block_lists_every_runtime_subtree_but_not_git() -> None:
         "/.agents/worktrees/",
         "/.agents/shadow-git/",
         "/.agents/scratch/",
+        "/.agents/sessions/",
         "/.agents/apply/",
     ]
 

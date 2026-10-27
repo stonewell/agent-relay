@@ -114,3 +114,54 @@ def test_acceptance_scope_broadens_reservation() -> None:
     assert writers_overlap(left, right)
     right.access = "read"
     assert not writers_overlap(left, right)
+
+
+def test_requeue_reopens_only_dependents_blocked_solely_by_the_answered_node() -> None:
+    from relay.core.scheduler import SchedulerControl
+
+    async def run() -> None:
+        graph = Graph.model_validate(
+            {
+                "nodes": [
+                    {"id": "a", "category": "test", "goal": "t"},
+                    {"id": "x", "category": "test", "goal": "t"},
+                    {"id": "e", "category": "test", "goal": "t", "depends_on": ["a"]},
+                    {"id": "d", "category": "test", "goal": "t", "depends_on": ["a", "x"]},
+                ]
+            }
+        )
+        control = SchedulerControl()
+        control.hold(True)
+        asked = 0
+
+        async def execute(node: GraphNode, agent: str, event: threading.Event) -> Outcome:
+            nonlocal asked
+            if node.id == "x":
+                return Outcome("failed", 1, "boom")
+            if node.id == "a" and asked == 0:
+                asked += 1
+                return Outcome("blocked", 6, "needs_input")
+            return Outcome("done")
+
+        task = asyncio.create_task(
+            schedule(
+                graph,
+                concurrency=2,
+                capacities={"agent": 2},
+                choose=lambda n, load: "agent",
+                execute=execute,
+                transition=lambda key, outcome: None,
+                control=control,
+            )
+        )
+        await asyncio.sleep(0.5)  # quiescent: held open waiting for an answer
+        assert not task.done()
+        control.requeue("a")
+        await asyncio.sleep(0.5)
+        control.hold(False)
+        results = await asyncio.wait_for(task, timeout=5)
+        assert results["a"].state == "done" and results["e"].state == "done"
+        assert results["x"].state == "failed"
+        assert results["d"].state == "blocked"  # another failed dependency still blocks it
+
+    asyncio.run(run())

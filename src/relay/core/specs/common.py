@@ -49,6 +49,7 @@ RESERVED_ROOTS: tuple[tuple[str, ...], ...] = (
     (".agents", "worktrees"),
     (".agents", "shadow-git"),
     (".agents", "scratch"),
+    (".agents", "sessions"),
     (".agents", "apply"),
 )
 

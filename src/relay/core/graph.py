@@ -45,8 +45,9 @@ from .router import AgentDecision, route_agent
 from .run import _AttemptFailure, _AttemptRunner, _default_adapters, _probe  # pyright: ignore[reportPrivateUsage]
 from .runlock import RunLock
 from .runrecord import WorkerRecord
-from .scheduler import Outcome, schedule
+from .scheduler import Outcome, SchedulerControl, schedule
 from .scopes import writers_overlap
+from .sessions import SessionOwner
 from .snapshots import merge_snapshot
 from .specs import Graph, GraphNode, ResultSpec, TaskSpec, load_spec
 from .specs.common import PermissionLevel, normalize_repo_path
@@ -893,6 +894,9 @@ async def run_graph(
     max_attempts: int | None = None,
     concurrency: int | None = None,
     allow_dirty: bool = False,
+    store: RunStore | None = None,
+    session_owner: SessionOwner | None = None,
+    control: SchedulerControl | None = None,
 ) -> GraphResult:
     """Coordinate one foreground graph, with no detached supervisor or IPC."""
     if concurrency is not None and concurrency < 1:
@@ -928,12 +932,15 @@ async def run_graph(
             )
     available, levels = await _probe(config, registry)
     versions = {name: (await adapter.probe()).version for name, adapter in registry.items()}
-    store = (
-        RunStore(repo, resume_run)
-        if resume_run
-        else RunStore.create(repo, config_hash=config_hash, run_id=run_id)
+    if store is None:
+        store = (
+            RunStore(repo, resume_run)
+            if resume_run
+            else RunStore.create(repo, config_hash=config_hash, run_id=run_id)
+        )
+    lock = RunLock.acquire(
+        repo, store.run_id, takeover=resume_run is not None, session_owner=session_owner
     )
-    lock = RunLock.acquire(repo, store.run_id, takeover=resume_run is not None)
     events = EventLog(store.events_path)
     coordinator = Coordinator(
         repo, graph, config, store, events, registry, available, levels, versions
@@ -1012,6 +1019,8 @@ async def run_graph(
                 await asyncio.sleep(0.1)
 
         monitor = asyncio.create_task(watch_cancel())
+        if control is not None:
+            control.bind(store, events, coordinator.cancel, coordinator.cancelled_nodes)
         results = await _drain_on_cancel(
             schedule(
                 graph,
@@ -1026,6 +1035,7 @@ async def run_graph(
                 overlaps=writers_overlap,
                 cancellation=coordinator.cancel,
                 cancelled_nodes=coordinator.cancelled_nodes,
+                control=control,
             ),
             coordinator.cancel,
         )

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from relay.core.events import EventLog
+from relay.core.runrecord import RunRecord
 from relay.core.specs import load_spec
 from relay.core.specs.answers import AnswerValue, InputAnswers, Submission
 from relay.core.specs.result import ResultSpec
@@ -15,7 +16,12 @@ from relay.core.specs.task import TaskSpec
 from relay.core.store import RunStore
 
 
-def current_questions(store: RunStore, node_id: str) -> ResultSpec:
+def current_questions(store: RunStore, node_id: str, *, live: bool = False) -> ResultSpec:
+    """The node's pending question set.
+
+    A quiescent CLI reply requires a blocked run. A `live` caller is a session owner answering
+    while independent nodes still run (design 8.7), so eligibility is the node's own state.
+    """
     record = store.read_run()
     if node_id not in record.nodes:
         raise ValueError("unknown node")
@@ -23,7 +29,7 @@ def current_questions(store: RunStore, node_id: str) -> ResultSpec:
     waiting_run = record.state == "blocked" or (
         store.path("graph.marker").exists() and record.state == "failed"
     )
-    if not waiting_run or node.state != "blocked":
+    if not (waiting_run or live) or node.state != "blocked":
         raise ValueError("node is not waiting for input")
     result = load_spec(ResultSpec, store.node_dir(node_id) / "result.spec.yaml")
     if result.status != "needs_input":
@@ -55,10 +61,15 @@ def validate_answers(result: ResultSpec, answers: dict[str, AnswerValue]) -> Non
 
 
 def record_answers(
-    store: RunStore, node_id: str, submission: Submission, *, events: EventLog | None = None
+    store: RunStore,
+    node_id: str,
+    submission: Submission,
+    *,
+    events: EventLog | None = None,
+    live: bool = False,
 ) -> bool:
     """Caller holds the run lock; validate before appending to the atomic snapshot."""
-    result = current_questions(store, node_id)
+    result = current_questions(store, node_id, live=live)
     existing = read_answers(store.node_dir(node_id), node_id)
     for prior in existing.submissions:
         if prior.submission_id == submission.submission_id:
@@ -87,16 +98,19 @@ def record_answers(
             },
         )
     task = load_spec(TaskSpec, store.node_dir(node_id) / "task.spec.yaml")
-    record = store.read_run()
-    node = record.nodes[node_id]
-    if node.attempts >= (task.budget.max_attempts or 1):
-        node.blocked_reason = "attempts_exhausted"
-    elif (
-        task.budget.max_duration_s is not None
-        and node.active_duration_s >= task.budget.max_duration_s
-    ):
-        node.blocked_reason = "duration_exhausted"
-    store.write_run(record)
+
+    def limit(record: RunRecord) -> None:
+        # One locked read-modify-write: inline answers race worker threads on `run.json`.
+        node = record.nodes[node_id]
+        if node.attempts >= (task.budget.max_attempts or 1):
+            node.blocked_reason = "attempts_exhausted"
+        elif (
+            task.budget.max_duration_s is not None
+            and node.active_duration_s >= task.budget.max_duration_s
+        ):
+            node.blocked_reason = "duration_exhausted"
+
+    store.update_run(limit)
     return True
 
 
