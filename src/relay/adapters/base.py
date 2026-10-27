@@ -19,6 +19,7 @@ from relay.core.platform.proc import (
     resolve_command,
     run_process,
 )
+from relay.core.progress import ProgressParser
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
 from relay.core.store import replace_file
@@ -32,6 +33,7 @@ __all__ = [
     "RESULT_FILE",
     "READONLY_VERIFIED_PLATFORMS",
     "RunContext",
+    "ProgressCapable",
     "WorkerHandle",
     "advertised_levels",
     "archive_previous_result",
@@ -176,6 +178,19 @@ class ReuseFingerprint(Protocol):
     """Optional, pure capability; None means execution/auth state is uncomparable."""
 
     def reuse_fingerprint(self, task: TaskSpec) -> str | None: ...
+
+
+@runtime_checkable
+class ProgressCapable(Protocol):
+    """Optional capability: normalize this CLI's public stream into progress updates.
+
+    Returns None when streaming is not (or not yet) qualified for this adapter, in which case
+    only lifecycle phases are shown (design section 7.4). Structured-output parsing and the
+    streaming mode must qualify together: a streaming invocation still yields the final
+    validated result through `parse_result`.
+    """
+
+    def progress_parser(self) -> ProgressParser | None: ...
 
 
 def start_attempt(adapter: AgentAdapter, task: TaskSpec, ctx: RunContext) -> Invocation:

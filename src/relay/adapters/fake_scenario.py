@@ -39,5 +39,11 @@ class Scenario(BaseModel):
     echo_env: list[str] = []
     """Environment variable names whose values are recorded in the observation file."""
     usage: dict[str, int] = {}
+    stream_lines: list[str] = []
+    """Lines printed (and flushed) one by one before the result, `stream_delay_s` apart."""
+    stream_delay_s: float = Field(default=0.0, ge=0)
+    flood_lines: int = Field(default=0, ge=0)
+    """Extra lines of `flood_bytes` bytes written as fast as possible (pipe-pressure tests)."""
+    flood_bytes: int = Field(default=200, ge=1)
     malformed_result: bool = False
     """Emit a result that fails schema validation, to exercise the repair path."""

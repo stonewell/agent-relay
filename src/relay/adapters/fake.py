@@ -7,6 +7,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
+from relay.core.progress import ProgressParser, Update
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
 
@@ -32,6 +33,11 @@ def _as_list(scripted: Scripted) -> list[Scenario]:
     return [scripted] if isinstance(scripted, Scenario) else list(scripted)
 
 
+class _LineParser:
+    def feed(self, line: str) -> list[Update]:
+        return [("text", line)]
+
+
 class FakeAdapter:
     id = "fake"
 
@@ -42,7 +48,9 @@ class FakeAdapter:
         available: bool = True,
         levels: tuple[PermissionLevel, ...] = ("full", "workspace", "readonly"),
         version: str = "fake-1.0",
+        progress: bool = False,
     ) -> None:
+        self._progress = progress
         self._table: dict[str, list[Scenario]] = {}
         self._fn: ScenarioFn | None = None
         if callable(scenarios) and not isinstance(scenarios, Scenario):
@@ -72,6 +80,10 @@ class FakeAdapter:
         if not sequence:
             return Scenario()
         return sequence[min(ctx.attempt, len(sequence)) - 1]  # the last scenario repeats
+
+    def progress_parser(self) -> ProgressParser | None:
+        """Streaming test double: every stdout line is a text update."""
+        return _LineParser() if self._progress else None
 
     # --- AgentAdapter ---------------------------------------------------------------------
 

@@ -46,6 +46,7 @@ from relay.adapters.base import (
     AgentAdapter,
     CommandNotFound,
     ProcessResult,
+    ProgressCapable,
     RunContext,
     run_invocation,
     start_attempt,
@@ -67,8 +68,9 @@ from relay.core.gitbase import (
 from relay.core.gitexclude import ExcludeError, ensure_exclude_block
 from relay.core.model_router import NO_MODEL, ModelDecision, escalate, select_model
 from relay.core.permissions import decide, format_banner, resolve_level
-from relay.core.platform.proc import observe_processes
+from relay.core.platform.proc import observe_processes, stream_output
 from relay.core.platform.procid import process_identity
+from relay.core.progress import ProgressChannel, ProgressTap
 from relay.core.publish import (
     PublicationError,
     integration_branch,
@@ -262,6 +264,16 @@ class _AttemptRunner:
     resume_session: str | None = None
     question_revision: int = 0
     graph_mode: bool = False
+    progress: ProgressChannel | None = None
+    _tap: ProgressTap | None = None
+
+    def _phase(self, attempt: int, name: str) -> None:
+        """Durable phase event, plus the lossy public lifecycle projection (section 11)."""
+        self.events.append(
+            "attempt.phase", {"node_id": self.node_id, "attempt": attempt, "phase": name}
+        )
+        if self._tap is not None:
+            self._tap.phase(name)
 
     def _run_state(self, state: str) -> None:
         if not self.graph_mode:
@@ -342,10 +354,28 @@ class _AttemptRunner:
                 "cmd": invocation.cmd,
             },
         )
-        self.events.append(
-            "attempt.phase", {"node_id": self.node_id, "attempt": attempt, "phase": "agent"}
-        )
-        proc = run_invocation(invocation, timeout_s=_remaining_timeout(deadline))
+        if self.progress is not None:
+            parser = (
+                self.adapter.progress_parser()
+                if isinstance(self.adapter, ProgressCapable)
+                else None
+            )
+            self._tap = ProgressTap(
+                self.progress,
+                parser,
+                run_id=self.store.run_id,
+                node_id=self.node_id,
+                attempt=attempt,
+            )
+        self._phase(attempt, "agent")
+        # Streaming only changes what is *shown*: the whole output is still captured (bounded)
+        # and parsed for the final result exactly as before.
+        with (
+            stream_output(self._tap.feed)
+            if self._tap is not None and self._tap.streaming
+            else (contextlib.nullcontext())
+        ):
+            proc = run_invocation(invocation, timeout_s=_remaining_timeout(deadline))
         if proc.timed_out:
             return _AttemptFailure(
                 f"attempt {attempt}: the agent timed out", EXIT_FAILURE, retryable=False
@@ -430,9 +460,7 @@ class _AttemptRunner:
         node_id = self.node_id
         candidate_path: Path | None = None
         try:
-            self.events.append(
-                "attempt.phase", {"node_id": node_id, "attempt": attempt, "phase": "capture"}
-            )
+            self._phase(attempt, "capture")
             candidate_dir = self.store.path(f"{node_id}/candidate")
             capture = capture_changes(
                 self.worktree_path, self.base_commit, candidate_dir=candidate_dir
@@ -443,9 +471,7 @@ class _AttemptRunner:
                     "readonly node changed its input snapshot", EXIT_VERIFICATION_FAILED, False
                 )
 
-            self.events.append(
-                "attempt.phase", {"node_id": node_id, "attempt": attempt, "phase": "verify"}
-            )
+            self._phase(attempt, "verify")
             verification: VerifyResult | None = None
             if self.access != "read":
                 try:
@@ -486,9 +512,7 @@ class _AttemptRunner:
                     retryable=False,
                 )
 
-            self.events.append(
-                "attempt.phase", {"node_id": node_id, "attempt": attempt, "phase": "publish"}
-            )
+            self._phase(attempt, "publish")
             publication = publish(
                 self.repo_root,
                 self.store.run_id,

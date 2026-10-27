@@ -33,6 +33,7 @@ from typing import Any, Literal, cast
 from relay.core.coordinator import CoordinatorProfile, Qualification
 from relay.core.env import build_env
 from relay.core.platform.proc import CommandNotFound, ResolvedCommand, resolve_command, run_process
+from relay.core.progress import ClaudeStreamParser, ProgressParser
 from relay.core.registry import Agent
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
@@ -162,7 +163,9 @@ class ClaudeAdapter:
         *,
         cmd: str | None = None,
         parent_env: Mapping[str, str] | None = None,
+        stream_progress: bool = False,
     ) -> None:
+        self._stream_progress = stream_progress
         self._agent = agent
         self._cmd = cmd or agent.cmd
         self._parent_env: Mapping[str, str] = dict(os.environ) if parent_env is None else parent_env
@@ -220,6 +223,9 @@ class ClaudeAdapter:
             return None
         text = (result.stdout or result.stderr).strip()
         return text.splitlines()[0] if text else None
+
+    def progress_parser(self) -> ProgressParser | None:
+        return ClaudeStreamParser() if self._stream_progress else None
 
     # --- coordinator capability (design 5.6, 7.4) ------------------------------------
 
@@ -318,7 +324,17 @@ class ClaudeAdapter:
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
         parent = self._parent_env
-        args = ["-p", "--output-format", "json"]
+        # Streaming and structured output qualify together: the stream ends with the same
+        # `result` envelope, which `parse_result` already extracts line by line.
+        args = (
+            ["-p", "--output-format", "stream-json", "--verbose"]
+            if self._stream_progress
+            else [
+                "-p",
+                "--output-format",
+                "json",
+            ]
+        )
         args += ["--json-schema", json.dumps(self._result_schema(), separators=(",", ":"))]
         model = task.routing.model
         if model and model != "default":

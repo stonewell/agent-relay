@@ -37,6 +37,7 @@ from .model_router import ModelDecision, escalate, select_model
 from .permissions import decide, format_banner, resolve_level
 from .platform.proc import ProcessCancelled, cancel_processes_when, observe_processes
 from .platform.procid import process_identity
+from .progress import ProgressChannel
 from .publish import _ORCHESTRATOR_ENV as ORCHESTRATOR_ENV  # pyright: ignore[reportPrivateUsage]
 from .publish import _compare_and_swap as compare_and_swap  # pyright: ignore[reportPrivateUsage]
 from .publish import _git as git  # pyright: ignore[reportPrivateUsage]
@@ -241,6 +242,7 @@ class Coordinator:
         self.invalidated: set[str] = set()
         self.merge_lock = threading.Lock()
         self.max_attempts: int | None = None
+        self.progress: ProgressChannel | None = None
         self.agent_slots = {
             key: threading.BoundedSemaphore(agent.concurrency or config.defaults.concurrency)
             for key, agent in config.agents.items()
@@ -655,6 +657,7 @@ class Coordinator:
                     agent,
                     question_revision=old.question_revision,
                     graph_mode=True,
+                    progress=self.progress,
                 )
             runner.agent_name, runner.adapter, runner.timeout_s = (
                 agent,
@@ -854,6 +857,7 @@ class Coordinator:
             self.adapters[agent],
             agent,
             graph_mode=True,
+            progress=self.progress,
         )
         with self.agent_slots[agent]:
             outcome = asyncio.run(runner.run(1, None if model.model == "default" else model.model))
@@ -901,6 +905,7 @@ async def run_graph(
     session_owner: SessionOwner | None = None,
     control: SchedulerControl | None = None,
     retained_base: RetainedBase | None = None,
+    progress: ProgressChannel | None = None,
 ) -> GraphResult:
     """Coordinate one foreground graph, with no detached supervisor or IPC."""
     if concurrency is not None and concurrency < 1:
@@ -950,6 +955,7 @@ async def run_graph(
         repo, graph, config, store, events, registry, available, levels, versions
     )
     coordinator.max_attempts = max_attempts
+    coordinator.progress = progress
     monitor: asyncio.Task[None] | None = None
     results: dict[str, Outcome] = {}
     try:

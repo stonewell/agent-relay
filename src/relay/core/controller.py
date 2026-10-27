@@ -24,6 +24,7 @@ from relay.adapters.base import AgentAdapter
 from .answers import record_answers
 from .checkpoints import resolve_retained_base, seal_checkpoint
 from .graph import GraphResult, run_graph
+from .progress import ProgressChannel
 from .registry import Config
 from .scheduler import SchedulerControl
 from .sessions import SessionConflict, SessionError, SessionOwner
@@ -65,6 +66,7 @@ class SessionController:
         self._adapters = adapters
         self._concurrency = concurrency
         self._allow_dirty = allow_dirty
+        self.progress = ProgressChannel()
         self._control: SchedulerControl | None = None
         self._store: RunStore | None = None
         self._task: asyncio.Task[GraphResult] | None = None
@@ -125,6 +127,7 @@ class SessionController:
                 session_owner=self.owner,
                 control=control,
                 retained_base=retained_base,
+                progress=self.progress,
             )
         )
         await self._bound()

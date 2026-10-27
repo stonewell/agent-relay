@@ -34,6 +34,7 @@ from relay.core.platform.proc import (
     resolve_command,
     run_process,
 )
+from relay.core.progress import CodexEventParser, ProgressParser
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
 from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
@@ -100,6 +101,10 @@ class CodexAdapter:
         self._agent = agent
         # Default: what the canaries verified on this platform (task 2.30).
         self._levels = levels if levels is not None else advertised_levels(self.id)
+
+    def progress_parser(self) -> ProgressParser | None:
+        """`codex exec --json` is already a public JSONL stream; no invocation change needed."""
+        return CodexEventParser()
 
     # --- AgentAdapter ---------------------------------------------------------------------
 

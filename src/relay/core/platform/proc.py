@@ -29,6 +29,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -39,6 +40,17 @@ _CREATE_SUSPENDED = 0x00000004  # Windows: start the process with its main threa
 
 # `os.killpg` does not exist on Windows; fall back to killing the direct child.
 _killpg = getattr(os, "killpg", None)
+
+
+OutputSink = Callable[[str], None]
+"""Receives each stdout line while a process runs; it must not block (design section 11)."""
+
+MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+"""Default bound on captured output when streaming; exceeding it fails the attempt."""
+
+
+class OutputLimitExceeded(RuntimeError):
+    """Captured output passed its configured limit; the process tree was stopped."""
 
 
 class CommandNotFound(FileNotFoundError):
@@ -453,8 +465,23 @@ class SupervisedProcess:
         """Terminate the whole tree (TERM then KILL on POSIX; TerminateJobObject on Windows)."""
         self._kill_tree()
 
-    def run(self, stdin: str | None = None, timeout_s: float | None = None) -> ProcessResult:
-        """Drive the child to completion, capturing output and enforcing `timeout_s`."""
+    def run(
+        self,
+        stdin: str | None = None,
+        timeout_s: float | None = None,
+        *,
+        sink: OutputSink | None = None,
+        max_output_bytes: int = MAX_CAPTURE_BYTES,
+    ) -> ProcessResult:
+        """Drive the child to completion, capturing output and enforcing `timeout_s`.
+
+        With a `sink`, stdout is drained continuously on its own thread and every line is also
+        offered to the sink; capture and final parsing stay independent of whatever the sink
+        does (design section 11). Capture is bounded by `max_output_bytes`: exceeding it kills
+        the tree and raises :class:`OutputLimitExceeded` instead of truncating silently.
+        """
+        if sink is not None:
+            return _stream_run(self, stdin, timeout_s, sink, max_output_bytes)
         timed_out = False
         stdout = ""
         stderr = ""
@@ -497,6 +524,104 @@ class SupervisedProcess:
             duration_s=time.monotonic() - self._started,
             timed_out=timed_out,
         )
+
+
+def _stream_pump(
+    stream: TextIO,
+    chunks: list[str],
+    counter: list[int],
+    limit: int,
+    overflow: threading.Event,
+    kill: Callable[[], None],
+    forward: OutputSink | None,
+) -> None:
+    """Drain one pipe line by line: bounded capture first, best-effort forwarding second."""
+    with contextlib.suppress(OSError, ValueError):
+        for line in iter(stream.readline, ""):
+            counter[0] += len(line.encode("utf-8", errors="replace"))
+            if counter[0] > limit:
+                overflow.set()
+                kill()
+                return
+            chunks.append(line)
+            if forward is not None:
+                with contextlib.suppress(Exception):  # a bad sink must never stall draining
+                    forward(line)
+
+
+def _stream_run(
+    self: SupervisedProcess,
+    stdin: str | None,
+    timeout_s: float | None,
+    sink: OutputSink,
+    max_bytes: int,
+) -> ProcessResult:
+    popen = self._popen  # pyright: ignore[reportPrivateUsage]
+    out: list[str] = []
+    err: list[str] = []
+    out_size, err_size = [0], [0]
+    overflow = threading.Event()
+    assert popen.stdout is not None and popen.stderr is not None and popen.stdin is not None
+    stdin_pipe = popen.stdin
+
+    def feed() -> None:
+        with contextlib.suppress(OSError, ValueError):
+            if stdin is not None:
+                stdin_pipe.write(stdin)
+        with contextlib.suppress(OSError, ValueError):
+            stdin_pipe.close()
+
+    threads = [
+        threading.Thread(target=feed, daemon=True),
+        threading.Thread(
+            target=_stream_pump,
+            args=(popen.stdout, out, out_size, max_bytes, overflow, self.kill_tree, sink),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_stream_pump,
+            args=(popen.stderr, err, err_size, max_bytes, overflow, self.kill_tree, None),
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    cancellation = _CANCELLATION.get()
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+    timed_out = False
+    try:
+        while popen.poll() is None and not overflow.is_set():
+            if cancellation is not None and cancellation.is_set():
+                self.kill_tree()
+                raise ProcessCancelled("attempt cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                self.kill_tree()
+                break
+            time.sleep(0.02)
+    except BaseException:
+        self.kill_tree()
+        raise
+    finally:
+        popen.wait()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        if any(thread.is_alive() for thread in threads):
+            self.kill_tree()  # a descendant still holds a pipe open
+            for thread in threads:
+                thread.join(timeout=2.0)
+        self._close()  # pyright: ignore[reportPrivateUsage]
+    if overflow.is_set():
+        raise OutputLimitExceeded(
+            f"agent output exceeded the {max_bytes}-byte capture limit; the attempt was stopped"
+        )
+    return ProcessResult(
+        exit_code=None if timed_out else self.returncode,
+        stdout="".join(out),
+        stderr="".join(err),
+        duration_s=time.monotonic() - self._started,  # pyright: ignore[reportPrivateUsage]
+        timed_out=timed_out,
+    )
 
 
 def _spawn(
@@ -557,9 +682,26 @@ def _spawn(
 
 
 ProcessObserver = Callable[[str, int | None], None]
+_OUTPUT_SINK: ContextVar[tuple[OutputSink, int] | None] = ContextVar(
+    "relay_output_sink", default=None
+)
 _CANCELLATION: ContextVar[threading.Event | None] = ContextVar(
     "relay_process_cancellation", default=None
 )
+
+
+@contextlib.contextmanager
+def stream_output(sink: OutputSink, *, max_bytes: int = MAX_CAPTURE_BYTES) -> Generator[None]:
+    """Offer every stdout line of supervised processes in this context to `sink`.
+
+    The sink runs on the pipe-draining thread and must not block; its failures are ignored.
+    The full output is still captured (bounded by `max_bytes`) for result parsing.
+    """
+    token = _OUTPUT_SINK.set((sink, max_bytes))
+    try:
+        yield
+    finally:
+        _OUTPUT_SINK.reset(token)
 
 
 class ProcessCancelled(RuntimeError):
@@ -624,7 +766,10 @@ def run_process(
         process.run()
         raise
     try:
-        return process.run(stdin, timeout_s)
+        streaming = _OUTPUT_SINK.get()
+        if streaming is None:
+            return process.run(stdin, timeout_s)
+        return process.run(stdin, timeout_s, sink=streaming[0], max_output_bytes=streaming[1])
     finally:
         if observer is not None:
             observer("finished", process.pid)

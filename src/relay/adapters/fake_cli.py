@@ -78,6 +78,14 @@ def main(argv: list[str] | None = None) -> int:
     if scenario.commit is not None:
         _git_commit(cwd, scenario.commit)
 
+    for line in scenario.stream_lines:
+        print(line, flush=True)
+        if scenario.stream_delay_s:
+            time.sleep(scenario.stream_delay_s)
+    if scenario.flood_lines:
+        chunk = ("x" * (scenario.flood_bytes - 1)) + "\n"
+        sys.stdout.write(chunk * scenario.flood_lines)
+        sys.stdout.flush()
     if scenario.sleep_s:
         time.sleep(scenario.sleep_s)
     while scenario.hang:
