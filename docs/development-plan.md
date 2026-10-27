@@ -358,24 +358,44 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 ### Remaining work in order
 
 The status table above is the source for completed work and validation evidence. Phase 2a
-implementation is complete; phase 2c implementation can proceed when its task prerequisites are
-met. M3 and M8 sign-off, along with release exit gates, remain as defined above. Deferred MVP
-validation remains separate lower-priority release closure.
+implementation is complete and the phase 2c foundations (2.20 to 2.26, plus spike 2.31 and task
+2.32) are implemented and tested on Windows. M3 and M8 sign-off, along with release exit gates,
+remain as defined above. Deferred MVP validation remains separate lower-priority release closure.
 
 **Before M3 sign-off (P0)**
 
-- **0.12 then 2.30:** qualify a `readonly` profile so read-access nodes can run (design 9.3).
+- **2.30 (in progress):** `readonly` is advertised for Claude and Codex on Windows only. Still
+  needed: run the `permission.<agent>.readonly` canaries on Linux and promote them in
+  `READONLY_VERIFIED_PLATFORMS` if they return `enforced`, then run a read-access node of the
+  example graph on both OSes. Extend the canaries to the subprocess and symlink cases of design
+  9.3 before treating the promotion as more than direct-write evidence.
 
-**Phase 2c implementation (M8)**
+**Release gate for M8 (a reviewed decision, not code)**
 
-1. **2.20 (P0):** establish coordinator contracts and the capability qualification matrix. Then **2.31 and 2.32 (P0):** run the coordinator-profile spike and build the adapter `coordinate` capability before 2.24.
-2. **2.21 (P0):** add durable session ownership after 2.20 and the store, event and lock foundations.
-3. **2.22 and 2.23 (P0):** build the shared controller/mailbox and bounded context broker after 2.21.
-4. **2.24 and 2.25 (P0):** implement approved coordinator rounds and checkpointed follow-ups after 2.22/2.23; 2.25 also depends on 2.7.
-5. **2.26 (P1):** add progress streaming once 1.7 and 2.22 are complete; it does not block the P0 TUI, but is required by 2.29.
-6. **2.27 (P0):** deliver cumulative session application after 2.25 and 1.24.
-7. **2.28 (P0):** complete the interactive TUI after 2.24, 2.25 and 2.27; streaming is optional with lifecycle-phase fallback.
-8. **2.29 (P1):** close cross-platform acceptance and release qualification after 2.28 and 2.26.
+- **Coordinator qualification record:** `relay.core.coordinator.QUALIFICATIONS` is empty, so every
+  coordinator is unavailable. The opt-in canary `relay doctor --check coordinator.claude` returned
+  `enforced` once on Windows with Claude Code 2.1.310 and subscription auth. A record binds to the
+  exact CLI version, OS, auth mode and configuration digest, so it must be reviewed, repeated on
+  every supported OS and auth mode, and redone when the CLI version changes. Codex has no
+  qualifying profile (spike 2.31).
+
+**Phase 2c implementation (M8), remaining**
+
+1. **2.27 (P0):** shared cumulative-session delivery service so the CLI and TUI apply the same
+   prepared tree. Needs a delivery policy that only accumulates scopes and checks, validation of
+   every carried contribution, prepared-operation confirmation across rounds, and
+   `relay apply <run>` resolving a linked run's session policy. Builds on `core.apply` (refactor
+   `prepare_apply` to accept a source commit) and `core.checkpoints.is_deliverable`.
+2. **2.28 (P0):** Textual TUI over `SessionController`, `PlanningEngine`, the progress channel and
+   the delivery service; bare `relay`, `relay tui` and `resume --session`; keyboard-complete Pilot
+   walkthroughs at 80x24 and 120 columns. The core already has turn `recover`/`resume_turn` and
+   round `restore_round`; a command surface and session-reopen flow still need to be built on them.
+3. **2.29 (P1):** cross-platform acceptance and release qualification, including Linux runs of
+   everything in 2.20 to 2.26, the opt-in canaries and the qualification record above.
+
+Implemented and not repeated here: 2.20 contracts and matrix, 2.21 sessions and ownership, 2.22
+controller, 2.23 context broker, 2.24 planning loop, 2.25 checkpoints and retained bases, 2.26
+progress streaming, 2.31 spike, 2.32 coordinate capability.
 
 **Lower-priority MVP release closure (P1)**
 

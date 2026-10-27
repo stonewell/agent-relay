@@ -513,3 +513,24 @@ This revision records local validation already performed; it does not claim a ne
 | Added versioned conversation, coordination and handoff contracts; coordinator/progress capabilities; a session-owned foreground controller and Textual conversation/task/inspector UI. | Design sections 5.6, 6, 7.4, 8.7, 14.1 and 15 |
 | Added the phase-2c roadmap, test areas, capability qualification and open risks for approved interactive rounds, checkpoints and cumulative delivery. | Design sections 9–11 and 16–18 |
 | Added milestone M8 and phase-2c tasks 2.20–2.29, including the session-lock prerequisite and the separation of optional progress streaming from the P0 TUI; narrowed task 5.4 to the advanced provider-backed planner extension. | Development-plan milestones, phase 2c and tasks 2.20–2.29; task 5.4 |
+
+## Phase 2c foundations (design v0.31, plan v0.13)
+
+| What changed | Where |
+|---|---|
+| `readonly` is advertised per platform from canary evidence (Claude plan mode and Codex `-s read-only` enforced on Windows 11); `workspace` stays unadvertised; the Codex canary needed `--skip-git-repo-check`. | Design 9.3; plan 0.12, 2.30 |
+| Coordinator contract is a versioned object whose `response` field is the closed action union, exported as `schemas/coordinator-response.json`. An empty qualification matrix keeps coordination unavailable. Spike 2.31 found a Claude tool-free candidate and rejected Codex `-s read-only` (it reads outside the workspace). | Design 5.6, 7.4; plan 2.20, 2.31, 2.32 |
+| Sessions: permanent id reservation through the lock object, native-lock ownership, immutable plans and approvals, run id reserved inside the launch intent, linked-run guards in `RunLock`, `apply`, `cancel` and `clean --purge-runs`. `.agents/sessions/` is now a reserved runtime path and part of the exclude block. | Design 6; plan 2.21 |
+| Controller: owner commands with durable ids, live answers while independent nodes run, durable pause and drain, shutdown that drains before releasing ownership. | Design 8.7; plan 2.22 |
+| Context broker and manifests: pinned commits, hash-validated artifacts, budgets with explicit omissions, retained tamper-evident payloads. | Design 5.6, 9.4; plan 2.23 |
+| Planning loop: durable bounded turns, one repair, duration drain, independent plan validation, context requests only through the broker. Plan digests now cover the explicit base. | Design 5.6, 8.7; plan 2.24 |
+| Checkpoints: sealed dependency-closed manifests under `refs/relay-sessions/<sid>/checkpoints/<cid>`, sources retained under `.../checkpoint-sources/<cid>/<node>` (a ref cannot also be a directory), conflict manifests without a claimed base, append-only integration evidence gating delivery, superseded rounds blocked until restored, pinned checkpoint or integration bases for follow-ups. | Design 6, 8.7; plan 2.25 |
+| Progress: bounded lossy channel with gap markers, sanitization and redaction, Claude and Codex normalizers, streaming output sink with bounded capture. Claude streaming is opt-in until qualified per version. | Design 7.4, 11; plan 2.26 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| PC1 / P1 | `.agents/sessions/` was documented as reserved runtime state but missing from the reserved paths and the exclude block, so a session dirtied the user's tree and blocked the next run. | Added it to `RESERVED_ROOTS`, the single source for path filters and the exclude block. |
+| PC2 / P1 | Inline answers rewrote `run.json` outside the store lock and could lose a concurrent worker update. | Moved the limit adjustment into one locked `update_run`. |
+| PC3 / P2 | `drain` could report idle before a just-dispatched worker was counted. | The scheduler publishes its running count after dispatch and after each completion. |
+| PC4 / P2 | A checkpoint ref and its per-source refs collided in git's ref namespace. | Sources moved to `checkpoint-sources/`. |
+| PC5 / P2 | The coordinator's inline `--json-schema` was rejected by the CLI because of the OpenAPI `discriminator` keyword. | The adapter's compact schema drops it; the exported schema keeps it. |
