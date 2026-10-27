@@ -61,9 +61,44 @@ class Qualification:
     evidence: str  # the reviewed canary run or review that established it
 
 
-# Reviewed records only. Intentionally empty until spike 2.31 and the opt-in canaries of
-# task 2.32 produce evidence: with no record, every coordinator is unavailable.
-QUALIFICATIONS: tuple[Qualification, ...] = ()
+# Reviewed records only; with no matching record a coordinator is unavailable. A record binds
+# to the exact CLI version, OS, auth mode and digest, and is redone when any of them changes.
+QUALIFICATIONS: tuple[Qualification, ...] = (
+    Qualification(
+        profile=CoordinatorProfile(
+            agent="claude",
+            cli_version="2.1.311",
+            os="win32",
+            auth_mode="subscription",
+            config_digest="e2a8912cdaf30e6cd6952b12b877e64f295cb8dcb0362cc72728b6dcf1fb73ee",
+        ),
+        mode="tool-free",
+        status="qualified",
+        evidence=(
+            "`relay doctor --check coordinator.claude` returned enforced on Claude Code 2.1.311 "
+            "(2026-10-27; project hooks, MCP server and CLAUDE.md directive not honoured, secret "
+            "not read); also observed on 2.1.310 in spike 2.31; Windows 11 10.0.26100, "
+            "subscription auth, one observation each; operator-directed qualification"
+        ),
+    ),
+    # Codex has no coordinate capability, so no adapter produces a profile that could match
+    # this record yet; it documents the spike 2.31 no-go and the fail-closed outcome.
+    Qualification(
+        profile=CoordinatorProfile(
+            agent="codex",
+            cli_version="0.164.0",
+            os="win32",
+            auth_mode="unspecified",
+            config_digest="none",
+        ),
+        mode="read-only",
+        status="unqualified",
+        evidence=(
+            "spike 2.31: `-s read-only` read a file outside the workspace, so it cannot "
+            "enforce the context boundary; no tool-free flag found"
+        ),
+    ),
+)
 
 
 def qualification_for(
