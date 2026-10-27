@@ -31,7 +31,8 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -223,8 +224,17 @@ def prepare_apply(
     run_id: str,
     *,
     target: str | None = None,
+    source_commit: str | None = None,
+    baseline_commit: str | None = None,
 ) -> ApplyPlan:
     """Prepare delivery of a run into a branch, without changing the user's checkout.
+
+    ``source_commit`` delivers that commit instead of the run's own integration commit; the
+    shared session delivery service (task 2.27) uses it for a cumulative round or a sealed
+    checkpoint, and has already validated the commit. ``run_id`` then only names the operation
+    (merge message, events). ``baseline_commit`` replaces the run's recorded base when
+    recognizing pre-existing ``--allow-dirty`` state, because a session's original snapshot is
+    the first round's base, not the retained base of the last round.
 
     ``target`` is ``None`` for the currently checked-out branch (a detached HEAD is refused), a
     short branch name (``feature`` -> ``refs/heads/feature``), or a full ref under
@@ -241,9 +251,15 @@ def prepare_apply(
     concurrent edits.
     """
     _validate_run_id(run_id)
-    integration_commit = resolve_integration_commit(repo_root, run_id)
+    if source_commit is None:
+        integration_commit = resolve_integration_commit(repo_root, run_id)
+    else:
+        integration_commit = _require_commit(repo_root, source_commit, "delivery source commit")
     target_ref, target_tip, expected_old = _resolve_target(repo_root, target)
-    base_commit = _resolve_base_commit(repo_root, run_id, target_tip, integration_commit)
+    if baseline_commit is None:
+        base_commit = _resolve_base_commit(repo_root, run_id, target_tip, integration_commit)
+    else:
+        base_commit = _require_commit(repo_root, baseline_commit, "delivery baseline commit")
 
     if _is_ancestor(repo_root, integration_commit, target_tip):
         # The target already contains the run: there is nothing to deliver.
@@ -316,6 +332,61 @@ def commit_ref(repo_root: Path, plan: ApplyPlan) -> ApplyResult:
 
     observed = read_ref(repo_root, plan.target_ref)
     raise TargetMovedError(plan.target_ref, plan.expected_old, observed)
+
+
+def install_worktree(repo_root: Path, plan: ApplyPlan) -> bool:
+    """Install the delivered paths when the target is the current branch.
+
+    Only ``target_tip..prepared`` paths are restored, staged and written from the prepared
+    commit. Staged, unstaged and untracked user edits outside that delta are left exactly as
+    they are (design section 8.3). A new or non-current branch is never checked out. Returns
+    whether the working tree was updated.
+    """
+    proc = _run(repo_root, "symbolic-ref", "--quiet", "HEAD")
+    if proc.returncode != 0 or proc.stdout.strip() != plan.target_ref:
+        return False
+    if not plan.changed_paths:
+        return False
+    restore = _run(
+        repo_root,
+        "restore",
+        f"--source={plan.prepared_commit}",
+        "--staged",
+        "--worktree",
+        "--",
+        *plan.changed_paths,
+    )
+    if restore.returncode != 0:
+        raise GitApplyError(("restore", plan.prepared_commit), restore.stderr)
+    return True
+
+
+def changed_paths(repo_root: Path, old: str, new: str) -> tuple[str, ...]:
+    """Paths that differ between two commits (both sides of renames); see :func:`prepare_apply`."""
+    return _changed_paths(repo_root, old, new)
+
+
+def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    """True when ``ancestor`` is reachable from ``descendant`` (a commit is its own ancestor)."""
+    return _is_ancestor(repo_root, ancestor, descendant)
+
+
+@contextmanager
+def detached_checkout(repo_root: Path, commit: str) -> Generator[Path]:
+    """A disposable detached worktree at ``commit``, removed on every path.
+
+    Used to run verification against an exact prepared tree without touching the user's
+    checkout. Removal is best-effort and never masks the caller's failure.
+    """
+    with tempfile.TemporaryDirectory(prefix="relay-apply-verify-") as temp:
+        worktree = Path(temp) / "worktree"
+        make = _run(repo_root, "worktree", "add", "--detach", str(worktree), commit)
+        if make.returncode != 0:
+            raise GitApplyError(("worktree", "add", commit), make.stderr)
+        try:
+            yield worktree
+        finally:
+            _remove_worktree(repo_root, worktree)
 
 
 # --- run resolution ---------------------------------------------------------------------------

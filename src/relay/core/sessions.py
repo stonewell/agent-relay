@@ -618,6 +618,17 @@ class SessionOwner:
             if checkpoint_id not in self.store.read().checkpoints:
                 self._update(lambda r: r.checkpoints.append(checkpoint_id))
 
+    def set_delivery_policy(self, policy: dict[str, Any]) -> None:
+        """Record the cumulative delivery policy (section 10); identical values are a no-op.
+
+        The caller derives it from the approved rounds (`relay.core.delivery`); delivery
+        re-derives it and refuses a record that disagrees, so this is evidence, not authority.
+        """
+        with self._mutex:
+            if self.store.read().delivery_policy != policy:
+                self._update(lambda r: setattr(r, "delivery_policy", policy))
+                self.event("delivery.policy", {"rounds": list(policy.get("rounds", []))})
+
     # --- owner commands -------------------------------------------------------------------
 
     def record_command(self, command_id: str, content: dict[str, Any]) -> bool:

@@ -46,6 +46,7 @@ __all__ = [
     "load_checkpoint",
     "record_integration",
     "resolve_retained_base",
+    "round_base",
     "seal_checkpoint",
     "validate_checkpoint",
 ]
@@ -90,7 +91,8 @@ def _write_ref(repo: Path, ref: str, commit: str) -> None:
         raise CheckpointError(f"immutable checkpoint ref already exists or raced: {ref}")
 
 
-def _round_base(store: RunStore) -> str:
+def round_base(store: RunStore) -> str:
+    """The commit a round started from (its retained base, else the pinned HEAD)."""
     record = store.read_run()
     if record.base is not None and record.base.commit:
         return record.base.commit
@@ -126,7 +128,7 @@ def seal_checkpoint(
     session = owner.store.read()
     cid = f"c{len(session.checkpoints) + 1}"
     owner.event("checkpoint.started", {"checkpoint_id": cid, "run_id": store.run_id})
-    base = _round_base(store)
+    base = round_base(store)
     graph = record.graph
     depends = {n.id: list(n.depends_on) for n in graph.nodes} if graph is not None else {}
 

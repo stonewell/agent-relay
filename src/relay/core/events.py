@@ -95,6 +95,7 @@ CATALOG: dict[str, EventType] = {
     "checkpoint.started": _t(open=True),
     "checkpoint.sealed": _t(open=True),
     "checkpoint.conflicted": _t(open=True),
+    "delivery.policy": _t(open=True),
 }
 
 _FORBIDDEN_PAYLOAD = frozenset({"answers"})

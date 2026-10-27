@@ -23,6 +23,7 @@ from relay.adapters.base import AgentAdapter
 
 from .answers import record_answers
 from .checkpoints import resolve_retained_base, seal_checkpoint
+from .delivery import sync_delivery_policy
 from .graph import GraphResult, run_graph
 from .progress import ProgressChannel
 from .registry import Config
@@ -176,6 +177,7 @@ class SessionController:
             seal_checkpoint, self.owner, store, reason="revise", verify=verify
         )
         await asyncio.to_thread(self.owner.supersede_round, store.run_id, manifest.checkpoint_id)
+        await asyncio.to_thread(sync_delivery_policy, self.owner)
         self._task = self._control = self._store = None
         return manifest
 
@@ -206,7 +208,10 @@ class SessionController:
         """Stop holding the round open and wait for it to finish naturally."""
         task, control = self._require_round()
         control.hold(False)
-        return await task
+        result = await task
+        # Record the cumulative delivery policy now that this round's base and plan are durable.
+        await asyncio.to_thread(sync_delivery_policy, self.owner)
+        return result
 
     # --- owner commands ---------------------------------------------------------------------
 

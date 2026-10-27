@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.30 |
-| `development-plan.md` | v0.12 |
+| `design.md` | v0.32 |
+| `development-plan.md` | v0.14 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.32 / plan v0.14: shared cumulative-session delivery service (task 2.27); the 2.27 status row replaces its remaining-work entry. The table above had not followed the v0.31 foundations entry and now shows the current versions. Details are recorded below.
 
 v0.30 / plan v0.12: added the phase-2c foreground interactive coordinator and Textual TUI, with milestone M8 and implementation tasks 2.20–2.29; narrowed task 5.4 to the advanced provider-backed planner extension. Details are recorded below.
 
@@ -534,3 +536,17 @@ This revision records local validation already performed; it does not claim a ne
 | PC3 / P2 | `drain` could report idle before a just-dispatched worker was counted. | The scheduler publishes its running count after dispatch and after each completion. |
 | PC4 / P2 | A checkpoint ref and its per-source refs collided in git's ref namespace. | Sources moved to `checkpoint-sources/`. |
 | PC5 / P2 | The coordinator's inline `--json-schema` was rejected by the CLI because of the OpenAPI `discriminator` keyword. | The adapter's compact schema drops it; the exported schema keeps it. |
+
+## Cumulative session delivery (design v0.32, plan v0.14)
+
+| What changed | Where |
+|---|---|
+| One delivery service, `relay.core.delivery`, serves `relay apply <run>` and the future TUI: prepare, verify, revalidate and install through the same prepared tree. `prepare_apply` accepts an explicit source commit and baseline; verification and the working-tree install moved from the CLI into core. Headless runs keep their behaviour, events and messages. | Design 8.3, 10, 14; plan 2.27 |
+| Session delivery policy: folded from the approved graphs of the rounds up to the delivered one; scopes (union) and checks only accumulate, later opt-outs are recorded skips, and the session record's copy must equal the fold. | Design 10; plan 2.27 |
+| Carried contributions are revalidated before delivery (checkpoint deliverability, hashes, lineage and ancestry; integration branch and node output refs), failing closed with every problem listed. A sealed checkpoint can be delivered directly. | Design 8.7, 10; plan 2.27 |
+| Confirmation binds to a prepared-operation digest that includes the session revision, policy, carried identities and checkpoint evidence. New session event `delivery.policy`. | Design 10, 11; plan 2.27 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| CD1 / P1 | `relay apply <run>` on a session round verified only the last round's own policy, so a shortened follow-up (narrower scope, `verify: none`) could deliver a tree that no longer met earlier mandated checks. | Session-linked runs resolve the cumulative policy and check the whole baseline-to-delivered delta; earlier checks and restrictions stay required. |
+| CD2 / P2 | Dirty-edit recognition used the last round's retained base, which does not hold the user's original `--allow-dirty` snapshot after several rounds. | Session delivery passes the first round's base as the baseline. |

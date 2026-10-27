@@ -1,31 +1,40 @@
-"""`relay apply` (design sections 8.3, 8.6 and 14; task 1.24).
+"""`relay apply` (design sections 8.3, 8.6, 10 and 14; tasks 1.24 and 2.27).
 
-The privileged delivery step. It resolves the run's integration commit into a prepared target
-with :func:`relay.core.apply.prepare_apply`, runs the run's integration acceptance checks against
-the exact prepared tree in a disposable checkout (design section 10 item 4), asks for
-confirmation, installs the prepared commit with the compare-and-swap ref update of
-:func:`relay.core.apply.commit_ref`, and -- only when the target is the current branch -- updates
-the delivered paths in the working tree and index.
+The privileged delivery step. It prepares the delivery with the shared service
+:mod:`relay.core.delivery` (the same one the TUI uses): the run's integration commit becomes a
+prepared target through :func:`relay.core.apply.prepare_apply`, the integration acceptance checks
+run against the exact prepared tree in a disposable checkout (design section 10 item 4), the
+operator confirms, and the prepared commit is installed with the compare-and-swap ref update of
+:func:`relay.core.apply.commit_ref` -- and, only when the target is the current branch, the
+delivered paths are updated in the working tree and index.
+
+A run that belongs to a session resolves the session's cumulative delivery policy, revalidates
+every carried checkpoint and integration, and checks the whole session delta; it cannot bypass
+them by naming the last round (design section 10). A run with no session link behaves exactly as
+before.
 
 Order matters:
 
-1. Preparation never touches the user's checkout. A merge conflict, a dirty overlap or an
-   invalid run is refused before anything runs or changes (design section 8.3).
+1. Preparation never touches the user's checkout. A merge conflict, a dirty overlap, a blocked
+   session delivery or an invalid run is refused before anything runs or changes (design section
+   8.3).
 2. Integration verification runs on the prepared tree, not on the target tip, because target
    edits made after the run can regress a clean textual merge. Its commands are the run's
-   recorded graph ``integration_acceptance`` (or graph ``build``/``test``/``lint`` defaults);
-   when the run records none, the delivery proceeds and the verification outcome is reported as
-   ``not_run``. ``verify: none`` with its recorded reason is reported as ``skipped``. This
-   reuses :mod:`relay.core.verify`; there is no second verification engine. A failed check exits
+   recorded graph ``integration_acceptance`` (or graph ``build``/``test``/``lint`` defaults), or
+   the session's accumulated checks; when none are recorded, the delivery proceeds and the
+   verification outcome is reported as ``not_run``. ``verify: none`` with its recorded reason is
+   reported as ``skipped``. This reuses :mod:`relay.core.verify`; there is no second
+   verification engine. A failed check exits
    :attr:`relay.cli.exitcodes.Exit.VERIFICATION_FAILED` and changes nothing, even with
    ``--force``.
 3. Confirmation comes after verification. ``--yes`` bypasses the prompt (tests, automation);
    without it a non-interactive session is refused with exit 7 and the exact confirming command,
    and a declined prompt is the same. Exit 7 changes no state (design section 14).
-4. The plan is prepared again immediately before installation. A target or tip that changed while
-   the prompt was open invalidates the confirmation (exit 7); a dirty overlap found at that point
-   is the ordinary dirty-overlap abort. The compare-and-swap in :func:`commit_ref` guards the
-   remaining race. No user branch, HEAD, index or file is touched before that point.
+4. The operation is prepared again immediately before installation and compared by digest. A
+   target, session, policy, checkpoint or content change while the prompt was open invalidates
+   the confirmation (exit 7); a dirty overlap found at that point is the ordinary dirty-overlap
+   abort. The compare-and-swap in :func:`commit_ref` guards the remaining race. No user branch,
+   HEAD, index or file is touched before that point.
 5. After the ref moves, only the delivered paths are restored from the prepared commit
    (``git restore --source=... --staged --worktree -- <paths>``). Non-overlapping staged,
    unstaged and untracked user edits are preserved. A new or non-current ``--branch`` target is
@@ -41,44 +50,34 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import secrets
 import shlex
-import subprocess
 import sys
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from relay.core.apply import (
     ApplyError,
-    ApplyPlan,
     DirtyOverlapError,
-    GitApplyError,
     IntegrationMissingError,
     MergeConflictError,
     RunMissingError,
     RunNotDoneError,
     TargetMovedError,
     TargetRefError,
-    commit_ref,
-    prepare_apply,
 )
-from relay.core.capture import CaptureResult, Change, ChangeCounts
+from relay.core.delivery import (
+    ConfirmationInvalid,
+    DeliveryBlocked,
+    PreparedDelivery,
+    Verdict,
+    install_delivery,
+    prepare_run_delivery,
+    verify_delivery,
+)
 from relay.core.events import EventLog, EventLogCorrupt
 from relay.core.sessions import SessionError, session_guard
-from relay.core.specs.graph import Graph
-from relay.core.specs.task import Acceptance, Commands, TaskCore
 from relay.core.store import RunStore, StoreError
-from relay.core.verify import (
-    VerificationError,
-    VerifyResult,
-    effective_scope,
-    executable_commands,
-    scope_violations,
-    verify,
-)
 
 from ..exitcodes import Exit
 
@@ -141,7 +140,6 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
                 as_json,
                 assume_yes=bool(args.yes),
                 log=log,
-                graph=record.graph,
             )
     except SessionError as exc:
         return _fail(f"relay apply: {exc}", Exit.FAILURE, as_json)
@@ -161,10 +159,9 @@ def _apply(
     *,
     assume_yes: bool,
     log: EventLog,
-    graph: Graph | None,
 ) -> int:
     try:
-        plan = prepare_apply(repo_root, run_id, target=target)
+        prepared = prepare_run_delivery(repo_root, run_id, target=target)
     except (RunMissingError, RunNotDoneError, IntegrationMissingError, TargetRefError) as exc:
         return _fail(f"relay apply: {exc}", Exit.INVALID, as_json)
     except DirtyOverlapError as exc:
@@ -177,10 +174,16 @@ def _apply(
     except MergeConflictError as exc:
         _event(log, "apply.finished", {"op_id": op_id, "status": "refused", "error": str(exc)})
         return _fail(f"relay apply: {exc}", Exit.FAILURE, as_json)
+    except DeliveryBlocked as exc:
+        _event(log, "apply.finished", {"op_id": op_id, "status": "refused", "error": str(exc)})
+        lines = ["relay apply: delivery is blocked; nothing was changed"]
+        lines.extend(f"  {problem}" for problem in exc.problems)
+        return _fail("\n".join(lines), Exit.FAILURE, as_json)
     except ApplyError as exc:
         _event(log, "apply.finished", {"op_id": op_id, "status": "refused", "error": str(exc)})
         return _fail(f"relay apply: {exc}", Exit.FAILURE, as_json)
 
+    plan = prepared.plan
     _event(
         log,
         "apply.started",
@@ -191,7 +194,7 @@ def _apply(
     if plan.noop:
         _event(log, "apply.finished", {"op_id": op_id, "status": "applied"})
         _print_applied(
-            plan,
+            prepared,
             verify_outcome="not_run",
             checks=0,
             installed=False,
@@ -201,10 +204,11 @@ def _apply(
         )
         return int(Exit.OK)
 
+    def progress(step: str) -> None:
+        log.append("apply.progress", {"op_id": op_id, "step": step})
+
     try:
-        verdict = _verify_prepared(repo_root, plan, graph, log=log, op_id=op_id)
-    except VerificationError as exc:
-        verdict = _Verdict("failed", str(exc))
+        verdict = verify_delivery(repo_root, prepared, on_step=progress)
     except ApplyError as exc:
         _event(log, "apply.finished", {"op_id": op_id, "status": "failed", "error": str(exc)})
         return _fail(
@@ -225,57 +229,50 @@ def _apply(
         return _fail(_verification_failure(verdict), Exit.VERIFICATION_FAILED, as_json)
 
     if not as_json:
-        print(_summary(plan, verdict))
+        print(_summary(prepared, verdict))
 
     if assume_yes:
         _event(log, "apply.progress", {"op_id": op_id, "step": "confirmed"})
     elif not _confirmed(run_id, target, log=log, op_id=op_id):
         return _fail(_not_confirmed(run_id, target), Exit.APPROVAL_REQUIRED, as_json)
 
-    # Preparation and confirmation are invalidated by a changed target or index (8.3).
+    # Confirmation is bound to the prepared operation's digest. The service prepares the
+    # operation again immediately before installation; any difference (target, session, policy,
+    # carried checkpoints or content) invalidates it (design sections 8.3 and 10).
+    stage: list[str] = []
+
+    def note(step: str) -> None:
+        stage.append(step)
+        if step in ("ref-updated", "installed"):
+            log.append("apply.progress", {"op_id": op_id, "step": step})
+
     try:
-        refreshed = prepare_apply(repo_root, run_id, target=target)
-    except DirtyOverlapError as exc:
-        _event(
-            log,
-            "apply.finished",
-            {"op_id": op_id, "status": "refused", "error": str(exc)},
+        outcome = install_delivery(
+            repo_root, prepared, confirmed_digest=prepared.digest, on_step=note
         )
-        return _fail(
-            f"relay apply: the working tree or index changed while confirming: {exc}; "
-            "nothing was changed",
-            Exit.FAILURE,
-            as_json,
-        )
-    except (MergeConflictError, TargetRefError, ApplyError) as exc:
-        _event(
-            log,
-            "apply.finished",
-            {"op_id": op_id, "status": "refused", "error": str(exc)},
-        )
-        return _fail(
-            f"relay apply: preparing the delivery again failed: {exc}; nothing was changed",
-            Exit.FAILURE,
-            as_json,
-        )
-    if refreshed != plan:
-        message = (
-            "relay apply: the target or its tip changed while confirming, so the previous "
-            "confirmation no longer applies; nothing was changed"
-        )
+    except ConfirmationInvalid:
         _event(
             log,
             "apply.finished",
             {"op_id": op_id, "status": "refused", "error": "preparation invalidated"},
+        )
+        message = (
+            "relay apply: the target or its tip changed while confirming, so the previous "
+            "confirmation no longer applies; nothing was changed"
         )
         return _fail(
             f"{message}\nRe-run: {_confirmation_command(run_id, target)}",
             Exit.APPROVAL_REQUIRED,
             as_json,
         )
-
-    try:
-        result = commit_ref(repo_root, plan)
+    except DirtyOverlapError as exc:
+        _event(log, "apply.finished", {"op_id": op_id, "status": "refused", "error": str(exc)})
+        return _fail(
+            f"relay apply: the working tree or index changed while confirming: {exc}; "
+            "nothing was changed",
+            Exit.FAILURE,
+            as_json,
+        )
     except TargetMovedError as exc:
         _event(log, "apply.finished", {"op_id": op_id, "status": "refused", "error": str(exc)})
         return _fail(
@@ -285,145 +282,36 @@ def _apply(
             as_json,
         )
     except ApplyError as exc:
+        if "ref-updated" in stage:
+            _event(log, "apply.finished", {"op_id": op_id, "status": "failed", "error": str(exc)})
+            return _fail(
+                f"relay apply: the branch {plan.target_ref} now points at "
+                f"{plan.prepared_commit}, but the working tree update failed: {exc}. "
+                "Resolve the working tree and re-run.",
+                Exit.FAILURE,
+                as_json,
+            )
         _event(log, "apply.finished", {"op_id": op_id, "status": "refused", "error": str(exc)})
-        return _fail(f"relay apply: {exc}; nothing was changed", Exit.FAILURE, as_json)
-
-    _event(log, "apply.progress", {"op_id": op_id, "step": "ref-updated"})
-
-    try:
-        installed = _install_worktree(repo_root, plan)
-    except ApplyError as exc:
-        _event(log, "apply.finished", {"op_id": op_id, "status": "failed", "error": str(exc)})
+        if "revalidated" in stage:
+            return _fail(f"relay apply: {exc}; nothing was changed", Exit.FAILURE, as_json)
         return _fail(
-            f"relay apply: the branch {plan.target_ref} now points at {plan.prepared_commit}, "
-            f"but the working tree update failed: {exc}. Resolve the working tree and re-run.",
+            f"relay apply: preparing the delivery again failed: {exc}; nothing was changed",
             Exit.FAILURE,
             as_json,
         )
 
-    _event(log, "apply.progress", {"op_id": op_id, "step": "installed"})
     _event(log, "apply.finished", {"op_id": op_id, "status": "applied"})
     _print_applied(
-        plan,
+        prepared,
         verify_outcome=verdict.outcome,
         checks=verdict.checks,
-        installed=installed,
+        installed=outcome.installed,
         as_json=as_json,
-        ref_updated=result.changed,
+        ref_updated=outcome.result.changed,
         run_id=run_id,
         op_id=op_id,
     )
     return int(Exit.OK)
-
-
-# --- integration verification ----------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Verdict:
-    """The outcome of running the run's integration acceptance on the prepared tree."""
-
-    outcome: VerificationOutcome
-    detail: str
-    checks: int = 0
-    result: VerifyResult | None = None
-
-
-def _verify_prepared(
-    repo_root: Path,
-    plan: ApplyPlan,
-    graph: Graph | None,
-    *,
-    log: EventLog,
-    op_id: str,
-) -> _Verdict:
-    """Run integration acceptance against the prepared tree (design section 10 item 4).
-
-    Commands come from the run's recorded graph: executable ``integration_acceptance`` entries
-    win, otherwise graph ``build``/``test``/``lint`` defaults. Without a recorded graph there is
-    nothing to run and the delivery proceeds with the outcome reported as ``not_run``; the run
-    itself was already verified when it completed. A run whose graph opts out with
-    ``verify: none`` is reported as ``skipped`` with its recorded reason.
-    """
-    task = _integration_task(graph)
-    if task is None:
-        log.append("apply.progress", {"op_id": op_id, "step": "verification-not-recorded"})
-        return _Verdict("not_run", "no integration acceptance commands are recorded for this run")
-
-    changes = tuple(Change(path=path, status="modified") for path in plan.changed_paths)
-
-    if task.verify == "default" and not executable_commands(task):
-        # Scope checks are acceptance entries of their own and apply even when no command is
-        # configured (design section 10 item 3); run them before deciding there is nothing else.
-        violations = scope_violations(changes, effective_scope(task))
-        if violations:
-            log.append("apply.progress", {"op_id": op_id, "step": "verification-failed"})
-            return _Verdict(
-                "failed",
-                "scope: " + ", ".join(violations) + " outside the integration scope",
-                1,
-            )
-        log.append("apply.progress", {"op_id": op_id, "step": "verification-not-configured"})
-        return _Verdict("not_run", "the run records no executable integration checks")
-
-    with tempfile.TemporaryDirectory(prefix="relay-apply-verify-") as temp:
-        worktree = Path(temp) / "worktree"
-        _worktree_add(repo_root, worktree, plan.prepared_commit)
-        try:
-            capture = CaptureResult(
-                input_commit=plan.target_tip,
-                candidate_tree=plan.prepared_tree,
-                candidate_commit=plan.prepared_commit,
-                candidate_path=worktree,
-                changes=changes,
-                counts=ChangeCounts(modified=len(changes)),
-            )
-            result = verify(capture, task)
-        finally:
-            _worktree_remove(repo_root, worktree)
-
-    step = (
-        "verification-skipped" if result.outcome == "skipped" else f"verification-{result.outcome}"
-    )
-    log.append("apply.progress", {"op_id": op_id, "step": step})
-    if result.outcome == "failed":
-        failed = [check.name for check in result.checks if check.status in ("failed", "timed_out")]
-        return _Verdict(
-            "failed",
-            ", ".join(failed) or "verification failed",
-            len(result.checks),
-            result,
-        )
-    if result.outcome == "skipped":
-        return _Verdict(
-            "skipped",
-            f"verify: none ({result.skip_reason or 'no reason recorded'})",
-            len(result.checks),
-            result,
-        )
-    return _Verdict("passed", "passed", len(result.checks), result)
-
-
-def _integration_task(graph: Graph | None) -> TaskCore | None:
-    """The integration verification policy recorded with the run, or None.
-
-    ``integration_acceptance`` and ``commands`` are graph-level in the design; a run without a
-    recorded graph has no authorized integration commands to run at apply time.
-    """
-    if graph is None:
-        return None
-    acceptance: list[Acceptance] = list(graph.integration_acceptance)
-    commands: Commands | None = graph.commands
-    if not acceptance and commands is None and graph.verify != "none":
-        return None
-    return TaskCore(
-        category="implement",
-        goal="integration acceptance",
-        acceptance=acceptance,
-        commands=commands,
-        verify=graph.verify,
-        verification_skip_reason=graph.verification_skip_reason,
-    )
 
 
 # --- confirmation -----------------------------------------------------------------------------
@@ -478,47 +366,11 @@ def _confirmation_command(run_id: str, target: str | None) -> str:
     return shlex.join(parts)
 
 
-# --- installation -----------------------------------------------------------------------------
-
-
-def _install_worktree(repo_root: Path, plan: ApplyPlan) -> bool:
-    """Install the delivered paths when the target is the current branch.
-
-    Only ``target_tip..prepared`` paths are restored, staged and written from the prepared
-    commit. Staged, unstaged and untracked user edits outside that delta are left exactly as
-    they are (design section 8.3). A new or non-current branch is never checked out.
-    """
-    current = _current_branch(repo_root)
-    if current != plan.target_ref:
-        return False
-    if not plan.changed_paths:
-        return False
-    paths = list(plan.changed_paths)
-    proc = _git(
-        repo_root,
-        "restore",
-        f"--source={plan.prepared_commit}",
-        "--staged",
-        "--worktree",
-        "--",
-        *paths,
-    )
-    if proc.returncode != 0:
-        raise GitApplyError(("restore", plan.prepared_commit), proc.stderr)
-    return True
-
-
-def _current_branch(repo_root: Path) -> str | None:
-    proc = _git(repo_root, "symbolic-ref", "--quiet", "HEAD")
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip()
-
-
 # --- output -----------------------------------------------------------------------------------
 
 
-def _mode(plan: ApplyPlan) -> Literal["noop", "fast-forward", "merge"]:
+def _mode(prepared: PreparedDelivery) -> Literal["noop", "fast-forward", "merge"]:
+    plan = prepared.plan
     if plan.noop:
         return "noop"
     if plan.prepared_commit == plan.integration_commit:
@@ -526,7 +378,7 @@ def _mode(plan: ApplyPlan) -> Literal["noop", "fast-forward", "merge"]:
     return "merge"
 
 
-def _verification_text(verdict: _Verdict) -> str:
+def _verification_text(verdict: Verdict) -> str:
     if verdict.outcome == "passed":
         return f"passed ({verdict.checks} check(s))"
     if verdict.outcome == "skipped":
@@ -536,11 +388,12 @@ def _verification_text(verdict: _Verdict) -> str:
     return f"not run ({verdict.detail})"
 
 
-def _summary(plan: ApplyPlan, verdict: _Verdict) -> str:
+def _summary(prepared: PreparedDelivery, verdict: Verdict) -> str:
+    plan = prepared.plan
     lines = [
         f"apply run {plan.run_id} to {plan.target_ref}",
         f"  target tip: {plan.target_tip[:12]}",
-        f"  prepared commit: {plan.prepared_commit[:12]} ({_mode(plan)})",
+        f"  prepared commit: {plan.prepared_commit[:12]} ({_mode(prepared)})",
         f"  integration commit: {plan.integration_commit[:12]}",
         f"  changed paths: {len(plan.changed_paths)}",
     ]
@@ -548,12 +401,17 @@ def _summary(plan: ApplyPlan, verdict: _Verdict) -> str:
         lines.append(f"    {path}")
     if len(plan.changed_paths) > 20:
         lines.append(f"    ... and {len(plan.changed_paths) - 20} more")
+    if prepared.session_id is not None:
+        lines.append(f"  session: {prepared.session_id}")
+        lines.append(f"  carried contributions: {len(prepared.carried)}")
+        lines.append(f"  session delta: {len(prepared.cumulative_paths)} path(s) from the baseline")
+        lines.append(f"  delivery digest: {prepared.digest[:16]}")
     lines.append(f"  verification: {_verification_text(verdict)}")
     return "\n".join(lines)
 
 
 def _print_applied(
-    plan: ApplyPlan,
+    prepared: PreparedDelivery,
     *,
     verify_outcome: VerificationOutcome,
     checks: int,
@@ -563,6 +421,7 @@ def _print_applied(
     run_id: str | None = None,
     op_id: str | None = None,
 ) -> None:
+    plan = prepared.plan
     if as_json:
         payload: dict[str, Any] = {
             "status": "applied",
@@ -572,12 +431,19 @@ def _print_applied(
             "target_tip": plan.target_tip,
             "integration_commit": plan.integration_commit,
             "prepared_commit": plan.prepared_commit,
-            "mode": _mode(plan),
+            "mode": _mode(prepared),
             "changed_paths": list(plan.changed_paths),
             "verification": {"outcome": verify_outcome, "checks": checks},
             "ref_updated": ref_updated,
             "worktree_installed": installed,
         }
+        if prepared.session_id is not None:
+            payload["session_id"] = prepared.session_id
+            payload["delivery_digest"] = prepared.digest
+            payload["carried"] = [
+                {"kind": item.kind, "ref": item.ref, "commit": item.commit}
+                for item in prepared.carried
+            ]
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     if plan.noop:
@@ -585,7 +451,7 @@ def _print_applied(
         return
     print(
         f"applied run {plan.run_id} to {plan.target_ref} ({plan.prepared_commit[:12]}, "
-        f"{_mode(plan)})"
+        f"{_mode(prepared)})"
     )
     print(f"  changed paths: {len(plan.changed_paths)}")
     print(f"  verification: {verify_outcome} ({checks} check(s))")
@@ -596,7 +462,7 @@ def _print_applied(
     )
 
 
-def _verification_failure(verdict: _Verdict) -> str:
+def _verification_failure(verdict: Verdict) -> str:
     lines = [
         f"relay apply: integration verification failed ({verdict.detail}); nothing was changed"
     ]
@@ -625,33 +491,5 @@ def _fail(message: str, code: Exit, as_json: bool) -> int:
     return int(code)
 
 
-# --- subprocess helpers -----------------------------------------------------------------------
-
-
 def _event(log: EventLog, type_: str, data: dict[str, str]) -> None:
     log.append(type_, data)
-
-
-def _worktree_add(repo_root: Path, worktree: Path, commit: str) -> None:
-    proc = _git(repo_root, "worktree", "add", "--detach", str(worktree), commit)
-    if proc.returncode != 0:
-        raise GitApplyError(("worktree", "add", commit), proc.stderr)
-
-
-def _worktree_remove(repo_root: Path, worktree: Path) -> None:
-    """Best-effort removal; never masks the verification failure that is being reported."""
-    _git(repo_root, "worktree", "remove", "--force", str(worktree))
-    _git(repo_root, "worktree", "prune")
-
-
-def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run one git command with an explicit argument list (never a shell)."""
-    try:
-        return subprocess.run(
-            ["git", "-C", str(repo_root), *args],
-            capture_output=True,
-            text=True,
-            env={**os.environ},
-        )
-    except FileNotFoundError as exc:
-        raise GitApplyError(args, "git is not installed or not on PATH") from exc

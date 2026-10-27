@@ -349,6 +349,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 | 2.24 | done | 2026-10-27 | `core.planning.PlanningEngine`: turns with durable step and active-time consumption (default 6 steps, 300s; each call and each context action is a step, waiting for the operator is not counted), one schema-repair follow-up then a clear failure, duration limit that cancels and drains the call, typed clarification as a new continuation turn with session-scoped question revisions, context requests served only through the broker from the pinned base commit or session-linked runs, independent plan validation (graph, no verification opt-out, executable checks, routing eligibility including `readonly` levels) with revisions saved immutably and approval left to the owner, review of a sealed round from recorded evidence, call records with profile, prompt and manifest hashes and process markers, recovery that proves old coordinator processes ended and never repeats a call. Needs a qualified record to run against a real CLI (`QUALIFICATIONS` is still empty); a `plan`/`ask` CLI surface arrives with the TUI (2.28) |
 | 2.25 | done | 2026-10-27 | `core.checkpoints` + `specs/checkpoint.py`: `SessionController.revise` closes the durable gate first, lets admitted work finish (bounded) or cancels it explicitly, leaves the run `interrupted` with reason `checkpoint`, seals only verified, dependency-closed outputs (result and artifact hashes, verification, exclusions with reasons) under `refs/relay-sessions/<sid>/checkpoints/<cid>`, marks the round superseded (reopens admission) so `RunLock` refuses it until `restore_round` revalidates and resumes it; conflicts keep separate source refs and a conflict manifest with no combined base; integration checks are append-only evidence and a checkpoint is deliverable only after a pass or an operator skip with a reason; `run_graph` takes a pinned `RetainedBase` (checkpoint or unapplied integration, validated for source identity, hashes, ancestry and availability) that never follows HEAD; plan digests now cover the base. Delivery across rounds belongs to 2.27 |
 | 2.26 | done | 2026-10-27 | `core.progress`: bounded lossy `ProgressChannel` (256 records, 8192-byte frames, oldest transient frames evicted or coalesced behind an explicit gap marker, lifecycle phases kept longest), terminal-escape/control/bidi stripping and secret redaction, `ClaudeStreamParser` and `CodexEventParser` (unknown events are display-only diagnostics), `stream_output` in the process supervisor (dedicated draining threads, full bounded capture independent of the sink, `OutputLimitExceeded` instead of truncation, cancellation and timeouts preserved), `ProgressCapable` adapter capability (Claude only with `stream_progress=True`; Codex uses its existing `--json` stream; others show lifecycle phases only), phase projection from `attempt.phase`, controller `progress` channel. Live check on Claude Code 2.1.310 (subscription auth): streaming with `--json-schema` still yields the final validated result; the opt-in test is `RELAY_LIVE=1 pytest tests/test_progress.py -k live`. Claude streaming stays off by default until a release canary qualifies it per version |
+| 2.27 | done | 2026-10-27 | `core.delivery` is the one service behind `relay apply <run>` and the future TUI: `prepare_run_delivery` / `prepare_checkpoint_delivery`, `verify_delivery`, `refresh_delivery` and `install_delivery`. A session-linked run resolves a cumulative `DeliveryPolicy` folded from the approved rounds (scopes and checks only accumulate; a narrower or `verify: none` later round removes nothing; the recorded policy must equal the fold or delivery is blocked), revalidates every carried checkpoint and unapplied integration (identity, hashes, lineage, ancestry, deliverability, intact refs) and fails closed, checks the whole baseline-to-delivered delta, and binds confirmation to a prepared-operation digest that includes the session revision and checkpoint evidence. `prepare_apply` gained `source_commit` and `baseline_commit`; verification and worktree install moved from the CLI into core with headless behaviour unchanged. The TUI consumes this service in 2.28; an explicit operator policy change that removes a requirement is not implemented |
 | 2.30 | in progress | 2026-10-26 | `advertised_levels` promotes `readonly` for Claude and Codex on Windows only (`READONLY_VERIFIED_PLATFORMS`); Linux canary and an end-to-end read-node run on both OSes remain before done |
 | 4.1 | in progress | 2026-10-22 | Adapter code complete, 36 tests; real `agy` canaries and live verification pending |
 
@@ -358,7 +359,7 @@ Only tasks that are not `todo` are listed. Status values: `in progress`, `done`,
 ### Remaining work in order
 
 The status table above is the source for completed work and validation evidence. Phase 2a
-implementation is complete and the phase 2c foundations (2.20 to 2.26, plus spike 2.31 and task
+implementation is complete and the phase 2c foundations (2.20 to 2.27, plus spike 2.31 and task
 2.32) are implemented and tested on Windows. M3 and M8 sign-off, along with release exit gates,
 remain as defined above. Deferred MVP validation remains separate lower-priority release closure.
 
@@ -381,21 +382,16 @@ remain as defined above. Deferred MVP validation remains separate lower-priority
 
 **Phase 2c implementation (M8), remaining**
 
-1. **2.27 (P0):** shared cumulative-session delivery service so the CLI and TUI apply the same
-   prepared tree. Needs a delivery policy that only accumulates scopes and checks, validation of
-   every carried contribution, prepared-operation confirmation across rounds, and
-   `relay apply <run>` resolving a linked run's session policy. Builds on `core.apply` (refactor
-   `prepare_apply` to accept a source commit) and `core.checkpoints.is_deliverable`.
-2. **2.28 (P0):** Textual TUI over `SessionController`, `PlanningEngine`, the progress channel and
-   the delivery service; bare `relay`, `relay tui` and `resume --session`; keyboard-complete Pilot
+1. **2.28 (P0):** Textual TUI over `SessionController`, `PlanningEngine`, the progress channel and
+   the delivery service (`core.delivery`); bare `relay`, `relay tui` and `resume --session`; keyboard-complete Pilot
    walkthroughs at 80x24 and 120 columns. The core already has turn `recover`/`resume_turn` and
    round `restore_round`; a command surface and session-reopen flow still need to be built on them.
-3. **2.29 (P1):** cross-platform acceptance and release qualification, including Linux runs of
-   everything in 2.20 to 2.26, the opt-in canaries and the qualification record above.
+2. **2.29 (P1):** cross-platform acceptance and release qualification, including Linux runs of
+   everything in 2.20 to 2.27, the opt-in canaries and the qualification record above.
 
 Implemented and not repeated here: 2.20 contracts and matrix, 2.21 sessions and ownership, 2.22
 controller, 2.23 context broker, 2.24 planning loop, 2.25 checkpoints and retained bases, 2.26
-progress streaming, 2.31 spike, 2.32 coordinate capability.
+progress streaming, 2.27 cumulative delivery, 2.31 spike, 2.32 coordinate capability.
 
 **Lower-priority MVP release closure (P1)**
 
