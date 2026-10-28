@@ -103,8 +103,22 @@ class PlanScreen(_Modal):
                 )
                 yield Button(label, id="approve", variant="success", disabled=blocked, compact=True)
 
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("up", "scroll('up')", show=False),
+        Binding("down", "scroll('down')", show=False),
+        Binding("pageup", "scroll('page_up')", show=False),
+        Binding("pagedown", "scroll('page_down')", show=False),
+    ]
+
     def on_mount(self) -> None:
-        self.query_one("#plan-body").focus()
+        # Enter must act on the visible control: focus Approve when it can be pressed.
+        approve = self.query_one("#approve", Button)
+        (self.query_one("#close", Button) if approve.disabled else approve).focus()
+
+    def action_scroll(self, direction: str) -> None:
+        body = self.query_one("#plan-body", VerticalScroll)
+        getattr(body, f"scroll_{direction}")(animate=False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "approve":

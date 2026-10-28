@@ -369,6 +369,8 @@ def test_choice_question_is_answered_from_a_list(repo: Path, custom: bool) -> No
             await pilot.press("down")  # redis -> lru
         await pilot.press("ctrl+s")
         await until(pilot, lambda: isinstance(app.screen, PlanScreen))
+        await pilot.press("enter")  # Approve is focused: Enter approves the revision
+        await until(pilot, lambda: node_state(app, "a") == "running")
         await pilot.press("ctrl+q")
 
     drive(repo, svc, WIDE, body)
