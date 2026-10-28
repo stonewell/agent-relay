@@ -51,6 +51,7 @@ from relay.core.doctor import (
     run_structured_canary,
 )
 from relay.core.env import CompleteEnv
+from relay.core.permissions import UnsupportedPermissionLevel, decide, resolve_level
 from relay.core.registry import Agent, load_config
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
@@ -183,12 +184,33 @@ def test_full_maps_to_force_and_trust(tmp_path: Path) -> None:
     assert "--mode" not in inv.args
 
 
-def test_readonly_maps_to_plan_mode_without_force(tmp_path: Path) -> None:
-    adapter = CursorAdapter(agent(), parent_env={})
+def test_readonly_maps_to_plan_mode_without_force_or_trust(tmp_path: Path) -> None:
+    # Only reachable once `readonly` is advertised; `--trust` would mark an untrusted repo
+    # as trusted, so a read-only run never passes it.
+    adapter = CursorAdapter(agent(), parent_env={}, levels=("full", "readonly"))
     inv = adapter.build_invocation(spec(), ctx(tmp_path, permission="readonly"))
     assert inv.args[inv.args.index("--mode") + 1] == "plan"
     assert "--force" not in inv.args and "--yolo" not in inv.args
+    assert "--trust" not in inv.args
     assert inv.stdin  # stdin carries the prompt and is closed after it, never a TTY
+
+
+def test_unadvertised_readonly_is_refused_by_build_invocation(tmp_path: Path) -> None:
+    adapter = CursorAdapter(agent(), parent_env={})
+    assert "readonly" not in advertised_levels("cursor")
+    with pytest.raises(PermissionUnsupported, match="not advertised"):
+        adapter.build_invocation(spec(), ctx(tmp_path, permission="readonly"))
+
+
+def test_permission_resolution_cannot_select_cursor_readonly() -> None:
+    """The gate callers use: a readonly decision is unsupported for Cursor's honest levels."""
+    probe = asyncio.run(CursorAdapter(agent(), parent_env={}).probe())
+    decision = decide("cursor", probe.levels, resolve_level(planner_read_only=True))
+    assert decision.effective == "readonly" and decision.supported is False
+    with pytest.raises(UnsupportedPermissionLevel):
+        decision.require_supported()
+    assert not decide("cursor", probe.levels, resolve_level(cli="workspace")).supported
+    assert decide("cursor", probe.levels, resolve_level()).supported
 
 
 def test_workspace_fails_closed(tmp_path: Path) -> None:
@@ -200,10 +222,19 @@ def test_workspace_fails_closed(tmp_path: Path) -> None:
 def test_probe_advertises_only_canary_verified_levels() -> None:
     adapter = CursorAdapter(agent(), cmd=sys.executable, parent_env=dict(os.environ))
     probe = asyncio.run(adapter.probe())
-    assert probe.available is True
+    # `python --version` is not a Cursor version, so the generic command is not Cursor.
+    assert probe.available is False
     assert probe.levels == advertised_levels("cursor") == ("full",)
     assert "workspace" not in probe.levels
     assert any("does not look like a Cursor CLI version" in n for n in probe.notes)
+
+
+def test_probe_is_available_for_a_cursor_shaped_version(tmp_path: Path) -> None:
+    _fake_executable(tmp_path, "agent")
+    probe = asyncio.run(CursorAdapter(agent(), parent_env=_path_env(tmp_path)).probe())
+    assert probe.available is True
+    assert probe.version == "2026.10.22-test"
+    assert not any("does not look like" in n for n in probe.notes)
 
 
 def test_probe_unavailable_when_command_missing() -> None:
@@ -264,6 +295,32 @@ def test_agent_wins_over_the_alias_and_explicit_commands_are_kept(tmp_path: Path
     assert CursorAdapter(agent(), parent_env=_path_env(tmp_path)).command() == "agent"
     explicit = CursorAdapter(agent(cmd="my-cursor"), parent_env=_path_env(tmp_path))
     assert explicit.command() == "my-cursor"
+
+
+def test_doctor_resolves_the_legacy_alias_like_the_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake_executable(bin_dir, LEGACY_COMMAND)
+    monkeypatch.setattr(registry_module, "USER_CONFIG", tmp_path / "none.yaml")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    (tmp_path / ".agents").mkdir()
+    config = tmp_path / ".agents" / "agents.yaml"
+
+    def checks(yaml: str) -> dict[str, Any]:
+        config.write_text(yaml, encoding="utf-8")
+        return {c.id: c for c in default_registry(DoctorContext(repo_root=tmp_path))}
+
+    by_id = checks("agents:\n  cursor:\n    enabled: true\n")
+    ctx_ = DoctorContext(repo_root=tmp_path)
+    cli = asyncio.run(by_id["agent.cursor.cli"].run(ctx_))
+    assert cli.status != "unsupported", cli
+    version = asyncio.run(by_id["adapter.cursor.version"].run(ctx_))
+    assert version.status == "pass", version
+    # An explicitly configured command is never replaced by the alias.
+    explicit = checks("agents:\n  cursor:\n    enabled: true\n    cmd: my-cursor\n")
+    assert asyncio.run(explicit["agent.cursor.cli"].run(ctx_)).status == "unsupported"
 
 
 # --- resume ---------------------------------------------------------------------------------

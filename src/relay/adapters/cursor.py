@@ -4,8 +4,9 @@ Task 4.2. Translates a task spec into an ``agent -p`` invocation and parses the 
 back into a result spec.
 
 Invocation shape:
-- ``-p --output-format json --trust``. ``--trust`` accepts the (relay-created) worktree as
-  a trusted workspace, so a headless run never stops at a trust prompt. The working
+- ``-p --output-format json`` plus ``--trust`` for ``full`` only. ``--trust`` records the
+  (relay-created) worktree as a trusted workspace so a headless run never stops at a trust
+  prompt; it is withheld from ``readonly`` (see ``_trust_args``). The working
   directory is the process cwd (the node worktree), which is Cursor's default workspace.
 - The prompt is piped on **stdin**, never placed on argv. With no positional prompt and a
   non-TTY stdin, ``agent`` reads and trims stdin as the prompt (``src/commands/build-prompt``
@@ -21,9 +22,10 @@ Invocation shape:
 - ``--model <id>`` when the routed model is not the ``default`` sentinel. Reasoning effort
   has no verified mapping (Cursor uses bracket overrides such as ``model[effort=high]`` on
   some models), so ``routing.effort`` is not passed **[verify]**.
-- Permission mapping (design 7.2 / 9.3): ``full`` -> ``--force`` (``--trust`` is always
-  passed); ``readonly`` -> ``--mode plan`` without ``--force``, mapped but advertised only
-  where :data:`relay.adapters.base.READONLY_VERIFIED_PLATFORMS` lists Cursor; ``workspace``
+- Permission mapping (design 7.2 / 9.3): ``full`` -> ``--force`` (``--trust`` is passed for
+  ``full`` only, see ``_trust_args``); ``readonly`` -> ``--mode plan`` without ``--force``,
+  mapped but advertised only where :data:`relay.adapters.base.READONLY_VERIFIED_PLATFORMS`
+  lists Cursor (``build_invocation`` refuses an unadvertised level); ``workspace``
   fails closed. On Windows the 2026.10.22 CLI reports its sandbox helper as "proxy-only, no
   filesystem sandbox" and exits when ``--sandbox enabled`` is requested, so the candidate
   cannot confine writes there; it is unverified elsewhere. The 2026-10-27 doctor canaries
@@ -90,6 +92,7 @@ __all__ = [
     "LEGACY_COMMAND",
     "PermissionUnsupported",
     "ResultInvalid",
+    "resolve_cursor_command",
     "result_instructions",
     "schema_instructions",
 ]
@@ -117,6 +120,24 @@ _PERMISSION_FLAGS: dict[PermissionLevel, tuple[str, ...]] = {
     "full": ("--force",),
     "readonly": ("--mode", "plan"),
 }
+
+
+def resolve_cursor_command(cmd: str, env: Mapping[str, str]) -> str:
+    """The Cursor command to launch for the configured `cmd` (shared with ``relay doctor``).
+
+    The legacy ``cursor-agent`` alias is tried only when `cmd` is the built-in ``agent`` name
+    and it does not resolve; an explicitly configured command is never replaced. When neither
+    resolves, `cmd` is returned and launching it reports the missing executable.
+    """
+    if cmd != DEFAULT_COMMAND:
+        return cmd
+    for candidate in (DEFAULT_COMMAND, LEGACY_COMMAND):
+        try:
+            resolve_command(candidate, (), env=env)
+        except CommandNotFound:
+            continue
+        return candidate
+    return cmd
 
 
 class PermissionUnsupported(ValueError):
@@ -235,16 +256,7 @@ class CursorAdapter:
         command is never replaced. When neither resolves, the configured command is returned
         and launching it reports the missing executable.
         """
-        lookup = env if env is not None else self._env()
-        if self._cmd != DEFAULT_COMMAND:
-            return self._cmd
-        for candidate in (DEFAULT_COMMAND, LEGACY_COMMAND):
-            try:
-                resolve_command(candidate, (), env=lookup)
-            except CommandNotFound:
-                continue
-            return candidate
-        return self._cmd
+        return resolve_cursor_command(self._cmd, env if env is not None else self._env())
 
     def _env(self) -> dict[str, str]:
         return build_env(
@@ -268,8 +280,15 @@ class CursorAdapter:
         version = await asyncio.to_thread(self._run_version, resolved, env)
         if version is None:
             notes = (*notes, "--version produced no output")
-        elif not _CURSOR_VERSION.search(version):
-            notes = (*notes, "--version output does not look like a Cursor CLI version")
+            return Probe(available=False, levels=self._levels, notes=notes)
+        if not _CURSOR_VERSION.search(version):
+            # `agent` is a generic name: another tool may own it.
+            notes = (
+                *notes,
+                f"--version output {version!r} does not look like a Cursor CLI version; "
+                f"`{cmd}` is probably not the Cursor CLI",
+            )
+            return Probe(available=False, version=version, levels=self._levels, notes=notes)
         return Probe(available=True, version=version, levels=self._levels, notes=notes)
 
     @staticmethod
@@ -281,7 +300,9 @@ class CursorAdapter:
         return text.splitlines()[0] if text else None
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
-        args = ["-p", "--output-format", "json", "--trust"]
+        args = ["-p", "--output-format", "json"]
+        # `--trust` is never passed for `readonly`; see `_trust_args`.
+        args += self._trust_args(ctx.permission)
         model = task.routing.model
         if model and model != _DEFAULT_MODEL:
             args += ["--model", _safe_token("model", model)]
@@ -298,7 +319,32 @@ class CursorAdapter:
             stdin=task_prompt(task) + result_instructions() + "\n",
         )
 
+    @staticmethod
+    def _trust_args(permission: PermissionLevel) -> list[str]:
+        """``--trust`` only for ``full``.
+
+        Evidence (CLI 2026.10.22, ``agent --help`` and the installed bundle): ``--trust``
+        writes a persistent per-directory trust marker (``trustMethod: cli-flag``) and
+        skips the "Workspace Trust Required" prompt, which warns that "Cursor Agent can
+        execute code and access files in this directory" and, when the workspace configures
+        MCP servers, that trusting also enables them. The trust record also gates project
+        code such as ``.cursor/worktrees.json`` setup scripts. Without ``--trust``,
+        ``--yolo`` or ``--force`` a headless run in an untrusted directory exits with that
+        error. A read-only run therefore does not trust the repository: it fails closed
+        instead of letting an untrusted repo's project config run. ``full`` already grants
+        ``--force``, so trusting adds nothing it does not already accept.
+        """
+        return ["--trust"] if permission == "full" else []
+
     def _permission_args(self, permission: PermissionLevel) -> list[str]:
+        # Defence in depth: `readonly` is mapped for the doctor canary, but is runnable only
+        # once promoted into the advertised levels, even if a caller skipped the gate.
+        if permission not in self._levels:
+            raise PermissionUnsupported(
+                f"permission level {permission!r} is not advertised for Cursor "
+                f"(advertised: {', '.join(self._levels) or 'none'}); refusing to run unconfined "
+                "(design section 9.3)"
+            )
         flags = _PERMISSION_FLAGS.get(permission)
         if flags is None:
             raise PermissionUnsupported(

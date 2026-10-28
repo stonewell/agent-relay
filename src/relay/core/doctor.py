@@ -21,7 +21,7 @@ from typing import Any, Literal, cast
 from . import registry as registry_module
 from .gitexclude import check_exclude_block
 from .platform.proc import CommandNotFound, ProcessResult, resolve_command, run_process
-from .registry import ConfigError, LoadedConfig, load_config
+from .registry import Agent, ConfigError, LoadedConfig, load_config
 from .specs.common import PermissionLevel
 
 Status = Literal["pass", "warn", "fail", "unsupported", "skipped"]
@@ -430,7 +430,8 @@ def _canary_args(
         # This probe is plain prose; keep its argv form safe for Windows batch shims.
         return (("-p", prompt.replace("\n", " "), *flags), None)
     if profile.adapter == "cursor":
-        # `--trust` is always passed by the adapter; prose never crosses the `.cmd` shim.
+        # The canary runs in a disposable directory, so it needs `--trust` to skip the trust
+        # prompt; the adapter passes `--trust` for `full` only. Prose never crosses the shim.
         return (("-p", "--trust", *flags), prompt + "\n")
     raise AssertionError(f"unknown canary adapter {profile.adapter!r}")
 
@@ -1388,6 +1389,19 @@ def _check_timeout(spec: AdapterCanarySpec, kind: str) -> float:
     return calls * (spec.timeout_s + 15.0)
 
 
+def _effective_cmd(name: str, agent: Agent) -> str:
+    """The command doctor probes for an agent entry; Cursor resolves like its adapter does.
+
+    Cursor's generic built-in ``agent`` falls back to the legacy ``cursor-agent`` alias when
+    ``agent`` is absent; an explicitly configured command is never replaced.
+    """
+    if name != "cursor":
+        return agent.cmd
+    from relay.adapters.cursor import resolve_cursor_command
+
+    return resolve_cursor_command(agent.cmd, {**os.environ, **agent.env})
+
+
 def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
     """The built-in checks. Agent checks are added from the configuration if it loads."""
     registry = CheckRegistry()
@@ -1405,7 +1419,7 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
             return registry  # the `config` check reports the problem
         for name, agent in loaded.config.agents.items():
             if agent.enabled:
-                registry.register(agent_cli_check(name, agent.cmd))
+                registry.register(agent_cli_check(name, _effective_cmd(name, agent)))
         # Permission canaries are `paid` and run only with `--paid` or an explicit `--check`,
         # so the default doctor never launches a paid agent. Each mapped profile (section 7.2)
         # gets one check; a disabled agent skips its profiles, and an adapter with no agent
@@ -1416,7 +1430,7 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
             if agent is not None:
                 if not agent.enabled:
                     continue
-                cmd = agent.cmd
+                cmd = _effective_cmd(profile.adapter, agent)
             registry.register(permission_canary_check(profile, cmd))
         claude_agent = loaded.config.agents.get("claude")
         if claude_agent is None or claude_agent.enabled:
@@ -1434,7 +1448,11 @@ def default_registry(ctx: DoctorContext | None = None) -> CheckRegistry:
             agent = loaded.config.agents.get(spec.adapter)
             if agent is not None and not agent.enabled:
                 continue
-            resolved = replace(spec, cmd=agent.cmd) if agent is not None else spec
+            resolved = (
+                replace(spec, cmd=_effective_cmd(spec.adapter, agent))
+                if agent is not None
+                else spec
+            )
             agent_env = dict(agent.env) if agent is not None else {}
             for kind in CANARY_KINDS:
                 registry.register(
