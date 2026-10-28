@@ -12,10 +12,9 @@ import contextlib
 import subprocess
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
-from typing import Any, ClassVar, TypeVar
+from typing import Any, TypeVar
 
 from textual.app import App, ComposeResult, SystemCommand
-from textual.binding import Binding, BindingType
 from textual.containers import Horizontal
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
@@ -30,6 +29,7 @@ from relay.core.session_app import (
 )
 from relay.core.sessions import SessionDeletionPlan
 
+from . import keys
 from .projection import Action, ComposerMode, composer_mode, pending_actions, project
 from .screens import (
     AnswerScreen,
@@ -92,22 +92,6 @@ class RelayApp(App[int]):
 
     CSS = CSS
     TITLE = "relay"
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+q", "quit", "Quit", priority=True),
-        Binding("ctrl+s", "send", "Send"),
-        # TextArea binds some function keys (F6, F7) itself, so the app's keys take priority;
-        # `check_action` disables them while a dialog is open.
-        Binding("ctrl+t", "toggle_mode", "Answer/request", priority=True),
-        Binding("f1", "help", "Help", priority=True),
-        Binding("f2", "view('conversation')", "Chat", priority=True),
-        Binding("f3", "view('tasks')", "Tasks", priority=True),
-        Binding("f4", "view('inspector')", "Inspect", priority=True),
-        Binding("f5", "plan", "Plan", priority=True),
-        Binding("f6", "deliver", "Deliver", priority=True),
-        Binding("f7", "sessions", "Sessions", priority=True),
-        Binding("f8", "stop", "Stop", priority=True),
-        Binding("f9", "coordinator", "Coordinator", priority=True),
-    ]
 
     def __init__(
         self,
@@ -118,6 +102,11 @@ class RelayApp(App[int]):
         poll_s: float = 0.2,
     ) -> None:
         super().__init__()
+        # Shortcuts come from `tui.keys` (core/keymap.py defaults). They are priority bindings
+        # because TextArea owns some keys itself; `check_action` disables them in dialogs.
+        keys.configure(service.config.tui.keys)
+        for chord, action, description in keys.bindings():
+            self._bindings.bind(chord, action, description, priority=True)  # pyright: ignore[reportPrivateUsage]
         self.host = host
         self.service = service
         self.view_state: SessionView | None = None
@@ -148,7 +137,9 @@ class RelayApp(App[int]):
         yield Footer()
 
     async def on_mount(self) -> None:
-        self.query_one("#conversation", Conversation).border_title = "Conversation (F2)"
+        self.query_one(
+            "#conversation", Conversation
+        ).border_title = f"Conversation{keys.hint('view_conversation')}"
         self.query_one("#composer", TextArea).border_title = "Composer"
         self._layout(self.size.width)
         for action_id in ACTION_IDS:
@@ -181,6 +172,13 @@ class RelayApp(App[int]):
         for name in VIEWS:
             self.query_one(f"#{name}").display = not narrow or name == self.current_view
 
+    def action_next_view(self) -> None:
+        """Move to the next pane in on-screen order (tasks, conversation, inspector), wrapping."""
+        order = ("tasks", "conversation", "inspector")
+        current = self._pane_of(self.focused) or self.current_view
+        index = order.index(current) if current in order else -1
+        self.action_view(order[(index + 1) % len(order)])
+
     def action_view(self, name: str) -> None:
         self.current_view = name
         self._layout(self.size.width)
@@ -189,7 +187,17 @@ class RelayApp(App[int]):
     # --- actions availability -------------------------------------------------------------------
 
     _MAIN_ONLY = frozenset(
-        {"send", "toggle_mode", "view", "plan", "deliver", "sessions", "stop", "coordinator"}
+        {
+            "send",
+            "toggle_mode",
+            "view",
+            "next_view",
+            "plan",
+            "deliver",
+            "sessions",
+            "stop",
+            "coordinator",
+        }
     )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -201,12 +209,36 @@ class RelayApp(App[int]):
     def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
         yield from super().get_system_commands(screen)  # pyright: ignore[reportUnknownMemberType]
         commands: list[tuple[str, str, Callable[[], Any]]] = [
-            ("Send composer", "Answer, steer or send a request (Ctrl+S)", self.action_send),
-            ("Review plan", "Review the pending plan and approve it (F5)", self.action_plan),
-            ("Review delivery", "Prepare, verify and apply delivery (F6)", self.action_deliver),
-            ("Sessions", "Open, create or delete sessions (F7)", self.action_sessions),
-            ("Stop execution", "Cancel and drain active work (F8)", self.action_stop),
-            ("Select coordinator", "Qualified coordinator modes (F9)", self.action_coordinator),
+            (
+                "Send composer",
+                f"Answer, steer or send a request{keys.hint('send')}",
+                self.action_send,
+            ),
+            (
+                "Review plan",
+                f"Review the pending plan and approve it{keys.hint('plan')}",
+                self.action_plan,
+            ),
+            (
+                "Review delivery",
+                f"Prepare, verify and apply delivery{keys.hint('deliver')}",
+                self.action_deliver,
+            ),
+            (
+                "Sessions",
+                f"Open, create or delete sessions{keys.hint('sessions')}",
+                self.action_sessions,
+            ),
+            (
+                "Stop execution",
+                f"Cancel and drain active work{keys.hint('stop')}",
+                self.action_stop,
+            ),
+            (
+                "Select coordinator",
+                f"Qualified coordinator modes{keys.hint('coordinator')}",
+                self.action_coordinator,
+            ),
             ("Continue round", "Explicitly continue an interrupted round", self.action_continue),
             ("Resume turn", "Continue an interrupted coordinator turn", self.action_resume_turn),
             ("Restore round", "Restore the superseded round", self.action_restore),
@@ -215,10 +247,15 @@ class RelayApp(App[int]):
             ("Resume admission", "Reopen the gate", self.action_resume_admission),
             ("Cancel task", "Cancel the selected task", self.action_cancel_task),
             ("Cancel round", "Cancel the whole round and wait for it", self.action_cancel_round),
-            ("Show conversation", "F2", lambda: self.action_view("conversation")),
-            ("Show tasks", "F3", lambda: self.action_view("tasks")),
-            ("Show inspector", "F4", lambda: self.action_view("inspector")),
-            ("Shortcut help", "F1", self.action_help),
+            (
+                "Show conversation",
+                keys.label("view_conversation"),
+                lambda: self.action_view("conversation"),
+            ),
+            ("Show tasks", keys.label("view_tasks"), lambda: self.action_view("tasks")),
+            ("Show inspector", keys.label("view_inspector"), lambda: self.action_view("inspector")),
+            ("Next view", keys.label("next_view"), self.action_next_view),
+            ("Shortcut help", keys.label("help"), self.action_help),
         ]
         for title, help_text, callback in commands:
             yield SystemCommand(title, help_text, callback)
@@ -391,7 +428,9 @@ class RelayApp(App[int]):
     def _turn_done(self, result: TurnResult) -> None:
         self._clear_composer()
         if result.status == "awaiting_approval" and result.plan_revision is not None:
-            self.note(f"plan revision {result.plan_revision} proposed; review it (F5)")
+            self.note(
+                f"plan revision {result.plan_revision} proposed; review it{keys.hint('plan')}"
+            )
             self.action_plan()
         elif result.status == "awaiting_answers":
             self.note("the coordinator asked questions; answer them in the composer")
@@ -492,8 +531,8 @@ class RelayApp(App[int]):
             if verb == "open":
                 if busy and session_id != (view.session_id if view else None):
                     self.note(
-                        "stop execution (F8) before switching sessions; inspecting tasks does "
-                        "not need that",
+                        f"stop execution{keys.hint('stop')} before switching sessions; "
+                        "inspecting tasks does not need that",
                         error=True,
                     )
                     return
@@ -655,7 +694,7 @@ class RelayApp(App[int]):
     def action_cancel_task(self) -> None:
         node_id = self.query_one("#tasks", TaskList).selected
         if node_id is None:
-            self.note("select a task first (F3)")
+            self.note(f"select a task first{keys.hint('next_view')}")
             return
         self._op(f"cancel {node_id}", lambda: self.host.call(self.service.cancel_node(node_id)))
 

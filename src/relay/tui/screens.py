@@ -25,6 +25,7 @@ from relay.core.session_app import (
     SessionSummary,
 )
 
+from . import keys
 from .widgets import render_delivery, render_plan
 
 if TYPE_CHECKING:
@@ -361,26 +362,39 @@ class DeliveryScreen(_Modal):
             self.dismiss(self.result)
 
 
-HELP = """\
-Keyboard (everything works without a mouse; Tab/Shift+Tab move focus)
-  Ctrl+S   send the composer: answer the active question, steer, or a new request
-  Ctrl+T   switch the composer between answering and a new/steering request
-  F1       this help          Ctrl+P  command palette (every action is listed)
-  F2       conversation       F3      tasks             F4  inspector
-  F5       review the pending plan and approve it explicitly
-  F6       review and apply delivery (shared delivery service)
-  F7       sessions (open, new, Ctrl+D delete)
-  F8       stop execution (drains active work; shows Stopping)
-  F9       coordinator selection (only qualified modes)
-  Ctrl+Q   quit (stops and drains first; there is no detach)
-Typing or moving around never changes execution.
-"""
+_HELP_ROWS = (
+    ("send", "send the composer: answer the active question, steer, or a new request"),
+    ("toggle_mode", "switch the composer between answering and a new/steering request"),
+    ("next_view", "next view: tasks, conversation, inspector"),
+    ("view_conversation", "conversation"),
+    ("view_tasks", "tasks"),
+    ("view_inspector", "inspector"),
+    ("plan", "review the pending plan and approve it explicitly"),
+    ("deliver", "review and apply delivery (shared delivery service)"),
+    ("sessions", "sessions (open, new, Ctrl+D delete)"),
+    ("stop", "stop execution (drains active work; shows Stopping)"),
+    ("coordinator", "coordinator selection (only qualified modes)"),
+    ("help", "this help"),
+    ("quit", "quit (stops and drains first; there is no detach)"),
+)
+
+
+def help_text() -> str:
+    """Shortcut help for the effective key map; unbound actions are listed as palette-only."""
+    bound = [f"  {keys.label(a):<9}{text}" for a, text in _HELP_ROWS if keys.label(a)]
+    palette = [text.split(" (")[0] for a, text in _HELP_ROWS if not keys.label(a)]
+    lines = ["Keyboard (everything works without a mouse; Tab/Shift+Tab move focus)", *bound]
+    lines.append("  Ctrl+P   command palette: every action is listed, bound or not")
+    if palette:
+        lines.append("  Palette only: " + "; ".join(palette))
+    lines.append("Remap under tui.keys in agents.yaml. Typing or moving never changes execution.")
+    return "\n".join(lines) + "\n"
 
 
 class HelpScreen(_Modal):
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
-            yield Static(HELP, markup=False)
+            yield Static(help_text(), markup=False)
             yield Button("Close", id="close", compact=True)
 
     def on_mount(self) -> None:

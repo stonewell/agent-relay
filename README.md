@@ -218,23 +218,40 @@ uv run relay -C ../relay-demo tui --session SESSION
 ```
 
 A typical round: type a request in the composer and press Ctrl+S; answer the coordinator's
-questions; review the proposed plan (F5) and approve that revision; watch the tasks (F3) and
-inspect a task's exact handoff, files, diff, checks and logs (F4); answer a blocked task from
-the composer while the others keep running; then review and apply the cumulative delivery (F6),
-which prepares, verifies and asks for confirmation like `relay apply`. Sending a new request
+questions; review the proposed plan (Ctrl+R) and approve that revision; watch the tasks and
+inspect a task's exact handoff, files, diff, checks and logs (Ctrl+N moves between the task list,
+conversation and inspector); answer a blocked task from the composer while the others keep
+running; then review and apply the cumulative delivery (Ctrl+P, "Review delivery"), which
+prepares, verifies and asks for confirmation like `relay apply`. Sending a new request
 while a round runs starts **Checkpoint and revise**: admission pauses first, and you choose to
 let active work finish or cancel it; nothing replaces a running worker's prompt.
 
-| Key | Action |
+| Key (default) | Action |
 |---|---|
 | Ctrl+S | Send the composer (an answer to the open question, or a new request) |
 | Ctrl+T | Switch the composer between answering and a new request |
-| F1, Ctrl+P | Shortcut help, command palette (Continue round, Resume turn, Cancel task, ...) |
-| F2, F3, F4 | Conversation, tasks, inspector (separate views at 80×24) |
-| F5, F6 | Plan review and approval, delivery review and apply |
-| F7, F9 | Sessions (open, create, Ctrl+D to delete with confirmation), coordinator selection |
-| F8 | Stop: shows **Stopping** until workers and the coordinator have drained |
+| Ctrl+N | Next pane: tasks, conversation, inspector (one pane at a time at 80×24) |
+| Ctrl+R | Plan review and approval |
+| Ctrl+G | Stop: shows **Stopping** until workers and the coordinator have drained |
+| F1 | Shortcut help |
+| Ctrl+P | Command palette: every action, bound or not (delivery, sessions, coordinator, Continue round, Cancel task, ...) |
 | Ctrl+Q | Quit; while work runs it asks first, then drains before exiting (there is no detach) |
+
+Delivery review, sessions (Ctrl+D deletes, with confirmation), coordinator selection and direct
+pane keys have no default key; they are in the palette and the contextual action buttons. Remap
+any of them, or unbind one with an empty string, under `tui.keys` in `agents.yaml`:
+
+```yaml
+tui:
+  keys:
+    stop: ctrl+g              # actions: quit send toggle_mode help next_view plan deliver
+    deliver: ctrl+l           #   sessions stop coordinator view_conversation view_tasks view_inspector
+    view_tasks: f3            # one key, or "ctrl+o,f3" for alternatives; "" unbinds
+```
+
+Keys are lowercase names such as `ctrl+r` or `f3`; Enter, Tab, Escape, Ctrl+C and Ctrl+P are
+reserved, and two actions cannot share a key. The composer is a text editor, so keys it uses for
+editing (Ctrl+A, E, K, U, W, D, X, V, Z, Y) are best left alone.
 
 Ctrl+C does not quit or stop anything (in a Windows console it reaches the interface as a key;
 in the composer it copies the selection). Interrupts while the interface drains on exit do not cut the drain

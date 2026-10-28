@@ -14,6 +14,7 @@ from typing import Any, Literal, TypeVar, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from .keymap import effective_keys
 from .predicates import Predicate, parse_when
 from .specs.common import PermissionLevel
 from .yamlio import load_yaml
@@ -88,6 +89,17 @@ class CoordinationConfig(_Strict):
     context_max_estimated_tokens: int | None = Field(default=None, ge=1)
 
 
+class TuiConfig(_Strict):
+    """Terminal UI settings; `keys` maps an action to a key (or `a,b` alternatives, or "")."""
+
+    keys: dict[str, str] = {}
+
+    @model_validator(mode="after")
+    def _check_keys(self) -> TuiConfig:
+        effective_keys(self.keys)
+        return self
+
+
 class Risk(_Strict):
     paths: list[str] = []
 
@@ -139,6 +151,7 @@ class Config(_Strict):
     defaults: Defaults = Defaults()
     route_log: RouteLogConfig = RouteLogConfig()
     coordination: CoordinationConfig = CoordinationConfig()
+    tui: TuiConfig = TuiConfig()
     risk: Risk = Risk()
     paths: Paths = Paths()
     routes: Routes = Routes()

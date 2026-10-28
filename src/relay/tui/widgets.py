@@ -19,6 +19,7 @@ from relay.core.session_app import (
     SessionView,
 )
 
+from . import keys
 from .projection import node_label
 
 __all__ = [
@@ -140,7 +141,11 @@ class Conversation(VerticalScroll):
             text = message.content
             classes = "message " + message.author
             if message.author == "coordinator" and text.startswith("Proposed plan revision"):
-                text = "PLAN CARD - " + text + "\n(F5 reviews the plan; approval is explicit)"
+                text = (
+                    "PLAN CARD - "
+                    + text
+                    + f"\n(review the plan{keys.hint('plan')}; approval is explicit)"
+                )
                 classes += " plan-card"
             elif message.author == "coordinator" and text.startswith("Questions:"):
                 classes += " question-card"
@@ -156,7 +161,7 @@ class Conversation(VerticalScroll):
             live.append(
                 f"PENDING PLAN revision {plan.revision}: {plan.explanation}"
                 + (f"\nChange summary: {plan.change_summary}" if plan.change_summary else "")
-                + "\nNothing runs until you approve this revision (F5)."
+                + f"\nNothing runs until you approve this revision{keys.hint('plan')}."
             )
         if view.recovery:
             live.append("RECOVERY REQUIRED:\n" + "\n".join(f"  - {r}" for r in view.recovery))
@@ -189,7 +194,7 @@ class TaskList(OptionList):
 
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id, markup=False)
-        self.border_title = "Tasks (F3)"
+        self.border_title = f"Tasks{keys.hint('view_tasks')}"
         self._ids: tuple[str, ...] = ()
 
     @property
@@ -218,7 +223,7 @@ class Inspector(VerticalScroll):
 
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
-        self.border_title = "Inspector (F4)"
+        self.border_title = f"Inspector{keys.hint('view_inspector')}"
         self._body = Static("Select a task to inspect its handoff.", markup=False)
 
     def on_mount(self) -> None:
@@ -236,7 +241,7 @@ class Inspector(VerticalScroll):
         lines.append(
             "Coordinator: "
             + (f"{coordinator.agent} ({coordinator.mode}, model {coordinator.model})"
-               if coordinator else "unavailable (F9 explains)")
+               if coordinator else "unavailable (select a coordinator for details)")
         )  # fmt: skip
         lines.append(f"Next base: {view.base.label}")
         if view.base.primary_unchanged:

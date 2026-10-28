@@ -29,14 +29,17 @@ from relay.core.session_app import CoordinatorBackend, ServiceHost, SessionApp  
 from relay.core.sessions import SessionStore  # noqa: E402
 from relay.core.specs import CoordinatorResponse  # noqa: E402
 from relay.core.store import RunStore  # noqa: E402
+from relay.tui import keys  # noqa: E402
 from relay.tui.app import RelayApp  # noqa: E402
 from relay.tui.screens import (  # noqa: E402
     ConfirmScreen,
     CoordinatorScreen,
     DeliveryScreen,
+    HelpScreen,
     PlanScreen,
     ReviseScreen,
     SessionsScreen,
+    help_text,
 )
 
 PROFILE = CoordinatorProfile("claude", "9.9.9", "test", "subscription", "digest")
@@ -47,10 +50,24 @@ NARROW = (80, 24)
 WIDE = (120, 40)
 
 
-def config() -> Config:
+# The walkthroughs drive the TUI with these function keys; they also exercise `tui.keys`.
+# The shipped defaults are covered by the `test_default_*` tests below.
+LEGACY_KEYS = {
+    "view_conversation": "f2",
+    "view_tasks": "f3",
+    "view_inspector": "f4",
+    "deliver": "f6",
+    "sessions": "f7",
+    "stop": "f8",
+    "coordinator": "f9",
+}
+
+
+def config(keys: dict[str, str] | None = None) -> Config:
     return validate_merged(
         {
             "version": 1,
+            "tui": {"keys": LEGACY_KEYS if keys is None else keys},
             "defaults": {"concurrency": 3, "fallback": ["claude", "codex"]},
             "agents": {
                 key: {"cmd": "fake", "concurrency": 3, "models": {"balanced": "default"}}
@@ -111,6 +128,7 @@ def service(
     script: Scripted | None,
     *,
     qualified: bool = True,
+    keys: dict[str, str] | None = None,
 ) -> SessionApp:
     backends = {
         "claude": CoordinatorBackend("claude", PROFILE, script),
@@ -118,7 +136,7 @@ def service(
     }
     return SessionApp(
         repo,
-        config=config(),
+        config=config(keys),
         adapters={"claude": adapter, "codex": adapter},
         coordinators=backends,
         records=(QUAL,) if qualified else (),
@@ -511,3 +529,48 @@ def test_session_picker_switches_and_deletes_with_confirmation(repo: Path) -> No
 
     drive(repo, svc, NARROW, body)
     assert old not in SessionStore.list_sessions(repo)
+
+
+# --- shortcut configuration ----------------------------------------------------------------------
+
+
+def test_default_keys_use_one_function_key_and_a_few_chords(repo: Path) -> None:
+    svc = service(repo, FakeAdapter(), Scripted(), keys={})
+
+    async def body(app: RelayApp, pilot: Pilot[int]) -> None:
+        bound = {action for _, action, _ in keys.bindings()}
+        assert bound == {"quit", "send", "toggle_mode", "help", "next_view", "plan", "stop"}
+        assert all(chord == "f1" or chord.startswith("ctrl+") for chord, _, _ in keys.bindings())
+        # Ctrl+N walks tasks -> conversation -> inspector -> tasks.
+        order = ["tasks", "conversation", "inspector"]
+        app.action_view("tasks")
+        seen: list[str | None] = []
+        for _ in range(4):
+            await pilot.press("ctrl+n")
+            seen.append(app._pane_of(app.focused))  # pyright: ignore[reportPrivateUsage]
+        assert seen == ["conversation", "inspector", "tasks", "conversation"]
+        assert set(seen) <= set(order)
+        await pilot.press("f1")
+        await until(pilot, lambda: isinstance(app.screen, HelpScreen))
+        text = help_text()
+        assert "Ctrl+R" in text and "Ctrl+G" in text and "F2" not in text
+        assert "Palette only:" in text
+
+    drive(repo, svc, WIDE, body)
+
+
+def test_unbound_actions_stay_reachable_from_the_palette(repo: Path) -> None:
+    svc = service(repo, FakeAdapter(), Scripted(), keys={"stop": ""})
+
+    async def body(app: RelayApp, pilot: Pilot[int]) -> None:
+        assert "stop" not in {a for _, a, _ in keys.bindings()}
+        titles = {c.title for c in app.get_system_commands(app.screen)}  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        assert {"Stop execution", "Sessions", "Review delivery", "Select coordinator"} <= titles
+
+    drive(repo, svc, WIDE, body)
+
+
+def test_bad_key_configuration_is_rejected() -> None:
+    for bad in ({"nope": "ctrl+x"}, {"stop": "Ctrl R"}, {"stop": "enter"}, {"stop": "ctrl+r"}):
+        with pytest.raises(Exception, match="tui key|unknown"):
+            config(bad)

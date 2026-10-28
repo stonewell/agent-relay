@@ -12,6 +12,8 @@ from typing import Literal
 
 from relay.core.session_app import NodeView, QuestionSetView, SessionView
 
+from . import keys
+
 __all__ = [
     "Action",
     "ComposerMode",
@@ -82,7 +84,9 @@ def project(view: SessionView | None, *, stopping: bool = False) -> Projection:
     if stopping or view.stopping:
         return Projection("Stopping", "cancelling and draining active work; wait")
     if view.session_id is None:
-        return Projection("No session", "type a request to start one, or F7 for saved sessions")
+        return Projection(
+            "No session", f"type a request to start one, or open saved sessions{_via('sessions')}"
+        )
     if view.checkpointing:
         return Projection("Checkpointing", "admission paused; " + _counts(view))
     if view.coordinating:
@@ -96,13 +100,26 @@ def project(view: SessionView | None, *, stopping: bool = False) -> Projection:
         return Projection("Awaiting answers", "the coordinator asked questions")
     if view.pending_plan is not None:
         return Projection(
-            "Awaiting plan approval", f"plan revision {view.pending_plan.revision} (F5 to review)"
+            "Awaiting plan approval",
+            f"plan revision {view.pending_plan.revision} (review{_via('plan')})",
         )
     if view.recovery:
         return Projection("Interrupted", view.recovery[0])
     if view.deliverable is not None:
-        return Projection("Ready for review/delivery", f"{view.deliverable} (F6 to review)")
+        return Projection(
+            "Ready for review/delivery", f"{view.deliverable} (review{_via('deliver')})"
+        )
     return Projection("Idle", "")
+
+
+def _key(action: str) -> str:
+    return keys.label(action) or action.replace("_", " ")
+
+
+def _via(action: str) -> str:
+    """` with Ctrl+R` for a bound action, "" when only the palette/buttons reach it."""
+    text = keys.label(action)
+    return f" with {text}" if text else ""
 
 
 @dataclass(frozen=True)
@@ -128,9 +145,13 @@ def composer_mode(
     if view is None or view.session_id is None:
         if view is not None and view.coordinator is None:
             return ComposerMode(
-                "request", "New request: coordination unavailable (F9 explains); F7 opens sessions"
+                "request",
+                "New request: coordination unavailable (select a coordinator for details); "
+                f"sessions{_via('sessions')}",
             )
-        return ComposerMode("request", "New request (Ctrl+S sends; starts a new session)")
+        return ComposerMode(
+            "request", f"New request ({keys.label('send') or 'send'} sends; starts a new session)"
+        )
     sets = _open_sets(view)
     if sets and not prefer_request:
         chosen = next((q for q in sets if q.node_id is not None and q.node_id == selected), None)
@@ -141,20 +162,27 @@ def composer_mode(
         first = target.questions[0].text if target.questions else ""
         more = f" (+{len(target.questions) - 1} more)" if len(target.questions) > 1 else ""
         return ComposerMode(
-            "answer", f"Answer {who}: {first}{more} | Ctrl+S answers, Ctrl+T new request", target
+            "answer",
+            f"Answer {who}: {first}{more} | "
+            f"{_key('send')} answers, {_key('toggle_mode')} new request",
+            target,
         )
     if view.round_running:
         return ComposerMode(
             "steer",
-            "Steering request: Checkpoint and revise (Ctrl+S pauses admission and asks how "
-            "to settle active work)",
+            f"Steering request: Checkpoint and revise ({_key('send')} pauses admission "
+            "and asks how to settle active work)",
         )
     who = view.coordinator.agent if view.coordinator else None
     if who is None:
         return ComposerMode(
-            "request", "New request: coordination unavailable (F9 explains); inspection still works"
+            "request",
+            "New request: coordination unavailable (select a coordinator for details); "
+            "inspection still works",
         )
-    return ComposerMode("request", f"New request to the {who} coordinator (Ctrl+S sends)")
+    return ComposerMode(
+        "request", f"New request to the {who} coordinator ({keys.label('send') or 'send'} sends)"
+    )
 
 
 @dataclass(frozen=True)
@@ -166,12 +194,17 @@ class Action:
 def pending_actions(view: SessionView | None) -> list[Action]:
     """The visible, focusable controls for what the operator can do next."""
     if view is None or view.session_id is None:
-        return [Action("sessions", "Sessions (F7)"), Action("coordinator", "Coordinator (F9)")]
+        return [
+            Action("sessions", f"Sessions{keys.hint('sessions')}"),
+            Action("coordinator", f"Coordinator{keys.hint('coordinator')}"),
+        ]
     actions: list[Action] = []
     if view.pending_plan is not None and not view.round_running:
-        actions.append(Action("plan", f"Review plan r{view.pending_plan.revision} (F5)"))
+        actions.append(
+            Action("plan", f"Review plan r{view.pending_plan.revision}{keys.hint('plan')}")
+        )
     if view.round_running or view.coordinating or view.checkpointing:
-        actions.append(Action("stop", "Stop (F8)"))
+        actions.append(Action("stop", f"Stop{keys.hint('stop')}"))
     if not view.round_running:
         if any(
             r.round_state == "active" and r.run_state in ("interrupted", "running")
@@ -182,7 +215,7 @@ def pending_actions(view: SessionView | None) -> list[Action]:
         if interrupted:
             actions.append(Action("resume-turn", f"Resume turn {interrupted[-1].turn_id}"))
         if view.deliverable is not None:
-            actions.append(Action("deliver", "Review delivery (F6)"))
+            actions.append(Action("deliver", f"Review delivery{keys.hint('deliver')}"))
     if view.coordinator is None:
-        actions.append(Action("coordinator", "Coordinator unavailable (F9)"))
+        actions.append(Action("coordinator", f"Coordinator unavailable{keys.hint('coordinator')}"))
     return actions
