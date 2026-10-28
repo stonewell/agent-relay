@@ -5,6 +5,27 @@ defaults:
   timeout_s: 1800
   fallback: [codex, claude]
 
+routes:
+  rules:
+    # Risky paths (auth, migrations, CI, infra) go to Claude first; priority beats the rules below.
+    - id: route-risk-claude
+      priority: 10
+      when: { risk: [elevated] }
+      prefer: [claude, codex]
+    # Reading, planning, reviewing: Claude. Overrides the built-in gemini research rule (gemini is disabled here).
+    - id: route-research-gemini
+      when: { category: [codebase-research] }
+      prefer: [claude]
+    - id: route-review-claude
+      when: { category: [review, architecture, debug] }
+      prefer: [claude]
+    # Feature, bug, test, migration work: Codex (built-in route-bugfix-codex / route-impl-codex), Claude as backup.
+    # Mechanical edits and docs: Cursor, then Codex / Claude.
+    - id: route-refactor-cursor
+      when: { category: [refactor, docs-for-code] }
+      prefer: [cursor, codex, claude]
+  default: score
+
 agents:
   claude:
     enabled: true
@@ -19,5 +40,7 @@ agents:
   gemini:
     enabled: false
   cursor:
-    enabled: false # Pending adapter integration
+    enabled: true # No foreground adapter is registered yet, so routing skips it until one is
     cmd: agent
+    categories: [refactor, docs-for-code]
+    concurrency: 1
