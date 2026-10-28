@@ -387,14 +387,16 @@ class ContextBroker:
             digest = _sha256(read.content)
             block = _render(read, digest)
             block_bytes = len(block.encode("utf-8"))
-            if (
-                used + block_bytes > limits.context_max_bytes
-                or _tokens(used + block_bytes) > limits.context_max_estimated_tokens
+            max_bytes = limits.context_max_bytes
+            max_tokens = limits.context_max_estimated_tokens
+            if (max_bytes is not None and used + block_bytes > max_bytes) or (
+                max_tokens is not None and _tokens(used + block_bytes) > max_tokens
             ):
                 if required:
+                    remaining = "0" if max_bytes is None else str(max_bytes - used)
                     raise ContextBudgetExceeded(
                         f"{read.source} needs {block_bytes} bytes but only "
-                        f"{limits.context_max_bytes - used} remain; narrow the selection "
+                        f"{remaining} remain; narrow the selection "
                         "(line ranges or fewer items)"
                     )
                 entries.append(

@@ -18,8 +18,8 @@ EntryKind = Literal["repo", "artifact", "result", "operator", "summary"]
 
 
 class ManifestLimits(SpecModel):
-    max_bytes: int = Field(ge=1)
-    max_estimated_tokens: int = Field(ge=1)
+    max_bytes: int | None = Field(default=None, ge=1)
+    max_estimated_tokens: int | None = Field(default=None, ge=1)
 
 
 class ManifestEntry(SpecModel):

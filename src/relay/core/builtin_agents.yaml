@@ -12,6 +12,11 @@ route_log:
   include_goal: true
   title_max_chars: 120
 
+coordination:                    # per-turn coordinator limits (design section 5.6)
+  max_steps: 10                  # each coordinator call or context request costs one step
+  max_duration_s: 300
+  # context_max_bytes / context_max_estimated_tokens: unset = no relay-side cap, the agent decides
+
 risk:
   paths:
     - "**/auth/**"

@@ -498,7 +498,7 @@ class SessionApp:
             dict(coordinators) if coordinators is not None else None
         )
         self._records = records
-        self._limits = limits or CoordinationLimits()
+        self._limits = limits or CoordinationLimits(**config.coordination.model_dump())
         self._concurrency = concurrency
         self._poll_s = poll_s
         self._choice: str | None = None

@@ -29,15 +29,19 @@ Status = Literal["qualified", "unqualified"]
 
 @dataclass(frozen=True)
 class CoordinationLimits:
-    """Per-turn limits (section 5.6); every value is a positive integer."""
+    """Per-turn limits (section 5.6): positive integers; the context limits may be None (no cap)."""
 
-    max_steps: int = 6
+    max_steps: int = 10
     max_duration_s: int = 300
-    context_max_bytes: int = 131072
-    context_max_estimated_tokens: int = 16000
+    context_max_bytes: int | None = (
+        None  # None: no relay-side cap; the agent enforces its own window
+    )
+    context_max_estimated_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
+            if value is None and name.startswith("context_"):
+                continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"coordination {name} must be a positive integer, got {value!r}")
 

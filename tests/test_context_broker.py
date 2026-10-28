@@ -192,7 +192,7 @@ def test_estimates_are_labelled_estimates(repo: Path) -> None:
     result = broker(repo).assemble([TextItem("n", "abcd" * 100)], recipient="c", overhead_bytes=40)
     manifest = result.manifest
     assert manifest.estimated_tokens == -(-(manifest.payload_bytes + 40) // 4)
-    assert manifest.limits.max_bytes == 131072 and manifest.limits.max_estimated_tokens == 16000
+    assert manifest.limits.max_bytes is None and manifest.limits.max_estimated_tokens is None
 
 
 # --- summaries and provenance ------------------------------------------------------------------

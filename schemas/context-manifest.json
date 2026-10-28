@@ -150,20 +150,32 @@
       "additionalProperties": true,
       "properties": {
         "max_bytes": {
-          "minimum": 1,
-          "title": "Max Bytes",
-          "type": "integer"
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Bytes"
         },
         "max_estimated_tokens": {
-          "minimum": 1,
-          "title": "Max Estimated Tokens",
-          "type": "integer"
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Estimated Tokens"
         }
       },
-      "required": [
-        "max_bytes",
-        "max_estimated_tokens"
-      ],
       "title": "ManifestLimits",
       "type": "object"
     }

@@ -170,8 +170,30 @@ def test_schema_is_exported_with_an_object_root() -> None:
 
 def test_limit_defaults_match_the_design() -> None:
     limits = CoordinationLimits()
-    assert (limits.max_steps, limits.max_duration_s) == (6, 300)
-    assert (limits.context_max_bytes, limits.context_max_estimated_tokens) == (131072, 16000)
+    assert (limits.max_steps, limits.max_duration_s) == (10, 300)
+    assert (limits.context_max_bytes, limits.context_max_estimated_tokens) == (None, None)
+
+
+def test_config_coordination_defaults_match_the_limits(tmp_path: Any) -> None:
+    from dataclasses import asdict
+
+    from relay.core.registry import load_config
+
+    config = load_config(tmp_path, user_config=None).config
+    assert asdict(CoordinationLimits()) == config.coordination.model_dump()
+
+
+def test_project_config_overrides_coordination_limits(tmp_path: Any) -> None:
+    from relay.core.registry import load_config
+
+    agents = tmp_path / ".agents"
+    agents.mkdir()
+    (agents / "agents.yaml").write_text(
+        "version: 1\ncoordination:\n  max_steps: 12\n", encoding="utf-8"
+    )
+    config = load_config(tmp_path, user_config=None).config
+    assert config.coordination.max_steps == 12
+    assert config.coordination.max_duration_s == 300
 
 
 @pytest.mark.parametrize("bad", [0, -1, True, 1.5])

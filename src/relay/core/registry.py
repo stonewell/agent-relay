@@ -79,6 +79,15 @@ class RouteLogConfig(_Strict):
     title_max_chars: int = Field(default=120, ge=1)
 
 
+class CoordinationConfig(_Strict):
+    """Per-turn coordinator limits (design section 5.6); defaults match `CoordinationLimits`."""
+
+    max_steps: int = Field(default=10, ge=1)
+    max_duration_s: int = Field(default=300, ge=1)
+    context_max_bytes: int | None = Field(default=None, ge=1)
+    context_max_estimated_tokens: int | None = Field(default=None, ge=1)
+
+
 class Risk(_Strict):
     paths: list[str] = []
 
@@ -129,6 +138,7 @@ class Config(_Strict):
     version: Literal[1]
     defaults: Defaults = Defaults()
     route_log: RouteLogConfig = RouteLogConfig()
+    coordination: CoordinationConfig = CoordinationConfig()
     risk: Risk = Risk()
     paths: Paths = Paths()
     routes: Routes = Routes()
