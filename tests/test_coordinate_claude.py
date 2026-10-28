@@ -149,3 +149,12 @@ def test_timeout_is_invalid_not_success(monkeypatch: pytest.MonkeyPatch, tmp_pat
     a = adapter()
     with pytest.raises(CoordinatorInvalid, match="timed out"):
         call(a, qualified(a), tmp_path)
+
+
+def test_profile_version_is_the_bare_number() -> None:
+    """The probe prints `2.1.312 (Claude Code)`; records are written with the number alone."""
+    a = adapter()
+    assert a.coordinator_profile("2.1.312 (Claude Code)").cli_version == "2.1.312"
+    assert a.coordinator_profile("2.1.312").cli_version == "2.1.312"
+    assert a.coordinator_profile(None).cli_version == "unknown"
+    assert a.coordinator_profile("not a version").cli_version == "unknown"

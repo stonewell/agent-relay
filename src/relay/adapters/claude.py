@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -93,6 +94,12 @@ COORDINATOR_FLAGS: tuple[str, ...] = (
 
 class PermissionUnsupported(ValueError):
     """A requested permission level has no verified Claude profile (design section 9.3)."""
+
+
+def _bare_version(raw: str | None) -> str:
+    """The version number alone, so a record matches `2.1.312 (Claude Code)` and `2.1.312`."""
+    match = re.search(r"\d+(?:\.\d+)+", raw or "")
+    return match.group(0) if match else "unknown"
 
 
 def _auth_mode(parent: Mapping[str, str], agent: Agent) -> AuthMode:
@@ -258,7 +265,7 @@ class ClaudeAdapter:
         )
         return CoordinatorProfile(
             agent=self.id,
-            cli_version=cli_version or "unknown",
+            cli_version=_bare_version(cli_version),
             os=sys.platform,
             auth_mode=_auth_mode(self._parent_env, self._agent),
             config_digest=hashlib.sha256(canonical.encode()).hexdigest(),

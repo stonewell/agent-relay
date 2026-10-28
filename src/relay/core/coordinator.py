@@ -81,6 +81,22 @@ QUALIFICATIONS: tuple[Qualification, ...] = (
             "subscription auth, one observation each; operator-directed qualification"
         ),
     ),
+    Qualification(
+        profile=CoordinatorProfile(
+            agent="claude",
+            cli_version="2.1.312",
+            os="win32",
+            auth_mode="subscription",
+            config_digest="e2a8912cdaf30e6cd6952b12b877e64f295cb8dcb0362cc72728b6dcf1fb73ee",
+        ),
+        mode="tool-free",
+        status="qualified",
+        evidence=(
+            "`relay doctor --check coordinator.claude` returned enforced on Claude Code 2.1.312 "
+            "(2026-10-27; tool-free profile ignored hooks, MCP, CLAUDE.md and files); Windows 11 "
+            "10.0.26100, subscription auth, one observation; operator-directed qualification"
+        ),
+    ),
     # Codex has no coordinate capability, so no adapter produces a profile that could match
     # this record yet; it documents the spike 2.31 no-go and the fail-closed outcome.
     Qualification(
