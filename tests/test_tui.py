@@ -32,6 +32,7 @@ from relay.core.store import RunStore  # noqa: E402
 from relay.tui import keys  # noqa: E402
 from relay.tui.app import RelayApp  # noqa: E402
 from relay.tui.screens import (  # noqa: E402
+    AnswerScreen,
     ConfirmScreen,
     CoordinatorScreen,
     DeliveryScreen,
@@ -334,6 +335,44 @@ def test_full_session_walkthrough(repo: Path, size: tuple[int, int]) -> None:
         await pilot.press("escape")
 
     drive(repo, svc, size, body)
+
+
+@pytest.mark.parametrize("custom", [False, True], ids=["pick-option", "other"])
+def test_choice_question_is_answered_from_a_list(repo: Path, custom: bool) -> None:
+    question = {
+        "action": "ask_user",
+        "questions": [
+            {"id": "q1", "text": "Which cache?", "kind": "choice", "options": ["redis", "lru"]}
+        ],
+    }
+    script = Scripted(question, plan(node("a")))
+    prompts: list[str] = []
+    original = script.__call__
+
+    async def recording(prompt: str, **kw: Any) -> CoordinatorCall:
+        prompts.append(prompt)
+        return await original(prompt, **kw)
+
+    svc = service(repo, FakeAdapter({"a": Scenario(hang=True)}), recording)  # pyright: ignore[reportArgumentType]
+
+    async def body(app: RelayApp, pilot: Pilot[int]) -> None:
+        await send(pilot, "Add a cache")
+        await until(pilot, lambda: app.projection == "Awaiting answers")
+        await pilot.press("ctrl+s")  # empty composer opens the answer screen
+        await until(pilot, lambda: isinstance(app.screen, AnswerScreen))
+        picker = app.screen.query_one("#choice-0", OptionList)
+        await until(pilot, lambda: picker.option_count == 3)
+        if custom:
+            await pilot.press("end", "enter")  # Enter on Other moves to its text field
+            await type_text(pilot, "memcached")
+        else:
+            await pilot.press("down")  # redis -> lru
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, PlanScreen))
+        await pilot.press("ctrl+q")
+
+    drive(repo, svc, WIDE, body)
+    assert "memcached" in prompts[-1] if custom else "lru" in prompts[-1]
 
 
 def test_stop_shows_stopping_and_reopen_never_dispatches(repo: Path) -> None:

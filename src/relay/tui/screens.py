@@ -167,16 +167,64 @@ class AnswerScreen(_Modal):
         with Vertical(classes="dialog"):
             yield Static(f"Answer {who}, question set {self.questions.revision}", markup=False)
             for index, q in enumerate(self.questions.questions):
-                hint = f" (one of: {', '.join(q.options)})" if q.options else ""
-                yield Label(f"{q.id}: {q.text}{hint}", markup=False)
-                yield Input(
-                    value=self._prefill if index == 0 else "",
-                    placeholder=q.default or ("required" if q.required else "optional"),
-                    id=f"answer-{index}",
-                )
+                yield Label(f"{q.id}: {q.text}", markup=False)
+                prefill = self._prefill if index == 0 else ""
+                if q.options:
+                    # A prefill that is not an option becomes a custom ("other") answer.
+                    custom = prefill if prefill and prefill not in q.options else ""
+                    picker = OptionList(
+                        *(Option(o, id=f"opt-{i}") for i, o in enumerate(q.options)),
+                        Option(self._OTHER, id="opt-other"),
+                        id=f"choice-{index}",
+                    )
+                    picker.styles.height = min(len(q.options) + 3, 8)
+                    yield picker
+                    yield Input(
+                        value=custom,
+                        placeholder="your own answer",
+                        id=f"answer-{index}",
+                        classes="other-input",
+                    )
+                else:
+                    yield Input(
+                        value=prefill,
+                        placeholder=q.default or ("required" if q.required else "optional"),
+                        id=f"answer-{index}",
+                    )
+            yield Label("", id="answer-error", markup=False)
             with Horizontal(classes="buttons"):
                 yield Button("Cancel", id="cancel", compact=True)
                 yield Button("Submit answers (Ctrl+S)", id="submit", compact=True)
+
+    _OTHER = "Other (type your own)"
+
+    def on_mount(self) -> None:
+        for index, q in enumerate(self.questions.questions):
+            if not q.options:
+                continue
+            picker = self.query_one(f"#choice-{index}", OptionList)
+            custom = self.query_one(f"#answer-{index}", Input)
+            if custom.value:
+                picker.highlighted = len(q.options)
+            elif q.default in q.options:
+                picker.highlighted = q.options.index(q.default)
+            self._sync_other(index)
+        first = self.query("OptionList, Input")
+        if first:
+            first.first().focus()
+
+    def _sync_other(self, index: int) -> None:
+        q = self.questions.questions[index]
+        picker = self.query_one(f"#choice-{index}", OptionList)
+        self.query_one(f"#answer-{index}", Input).display = picker.highlighted == len(q.options)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.id and event.option_list.id.startswith("choice-"):
+            self._sync_other(int(event.option_list.id.removeprefix("choice-")))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.focus_next()
 
     def on_input_submitted(self, _event: Input.Submitted) -> None:
         self.focus_next()
@@ -185,8 +233,17 @@ class AnswerScreen(_Modal):
         answers: dict[str, str | list[str]] = {}
         for index, q in enumerate(self.questions.questions):
             value = self.query_one(f"#answer-{index}", Input).value.strip()
+            if q.options:
+                picked = self.query_one(f"#choice-{index}", OptionList).highlighted
+                if picked is not None and picked < len(q.options):
+                    value = q.options[picked]
+                elif picked is None:
+                    value = ""
             if value:
                 answers[q.id] = value
+            elif q.required:
+                self.query_one("#answer-error", Label).update(f"Answer required for {q.id}")
+                return
         self.dismiss(answers)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

@@ -390,7 +390,7 @@ class RelayApp(App[int]):
         mode = self.mode
         if mode.kind == "answer" and mode.target is not None:
             target = mode.target
-            if len(target.questions) == 1 and text.strip():
+            if len(target.questions) == 1 and text.strip() and not target.questions[0].options:
                 self._answer(target.source, target.node_id, target.revision,
                              {target.questions[0].id: text.strip()})  # fmt: skip
                 return

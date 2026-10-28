@@ -41,9 +41,13 @@ def render_questions(qs: QuestionSetView) -> str:
     head = f"QUESTIONS [{qs.state}] {who}, question set {qs.revision}"
     lines = [head]
     for q in qs.questions:
-        extra = f" (choose: {', '.join(q.options)})" if q.options else ""
         optional = "" if q.required else " (optional)"
-        lines.append(f"  {q.id}: {q.text}{extra}{optional}")
+        lines.append(f"  {q.id}: {q.text}{optional}")
+        for number, option in enumerate(q.options, 1):
+            marker = " (default)" if option == q.default else ""
+            lines.append(f"      {number}) {option}{marker}")
+        if q.options:
+            lines.append("      or type your own answer")
     if qs.retained:
         lines.append("  retained answer: " + "; ".join(qs.retained))
     if qs.note:
