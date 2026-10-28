@@ -366,3 +366,18 @@ def test_session_deletion_is_refused_while_a_run_branch_is_checked_out(tmp_path:
     delete_session(repo, store.session_id, include_undelivered=True, worktree_root="auto")
     assert not linked.run_dir.exists()
     assert git(repo, "for-each-ref", "--format=%(refname)", branch) == ""
+
+
+def test_creating_a_session_excludes_runtime_state_from_git(tmp_path: Path) -> None:
+    """Transcripts under `.agents/sessions/` must not appear as untracked files."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    SessionStore.create(tmp_path)
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert ".agents" not in status

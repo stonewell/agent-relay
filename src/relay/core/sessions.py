@@ -36,6 +36,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from .events import EventLog
+from .gitexclude import ExcludeError, ensure_exclude_block
 from .platform.locks import LifetimeLock, LockHeld, probe_lock_support
 from .runrecord import SessionLink
 from .specs.common import RunId, SpecModel, VersionedSpec
@@ -188,6 +189,8 @@ class SessionStore:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> SessionStore:
         """Allocate a session id exclusively; ids whose lock object exists are never reused."""
+        with contextlib.suppress(ExcludeError):  # no repository means nothing to exclude
+            ensure_exclude_block(repo_root)  # transcripts must never reach `git add -A`
         parent = sessions_dir(repo_root)
         parent.mkdir(parents=True, exist_ok=True)
         locks_dir(repo_root).mkdir(parents=True, exist_ok=True)
