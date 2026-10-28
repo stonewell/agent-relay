@@ -266,6 +266,8 @@ accepted on Windows; Linux and macOS acceptance is still pending. The interactio
 | Blocked for input (exit 6) | Follow the reply/resume walkthrough above and inspect the blocked reason. |
 | Approval required (exit 7) | Review the prepared operation and use the confirmation command printed by Relay. |
 | Dirty starting tree or overlapping edits during apply | Follow the snapshot and delivery rules in section 8.3; preserve your edits before retrying. |
+| `apply` says the run is still owned by a running relay process (exit 1) | Wait for that `relay run` to finish (`relay status RUN`), then apply again; nothing was changed. |
+| `clean --purge-runs` reports a blocked `relay/<run>/...` ref and keeps the run | A worktree, possibly your main checkout, has that branch checked out. Switch it to another branch, then repeat the purge. |
 | Interrupted or failed run | Use the recovery walkthrough above; the recorded attempt count is retained. |
 
 ## Layout

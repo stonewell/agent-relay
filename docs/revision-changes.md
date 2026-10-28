@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.34 |
-| `development-plan.md` | v0.16 |
+| `design.md` | v0.35 |
+| `development-plan.md` | v0.17 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.35 / plan v0.17: independent-review follow-ups to 2.29 (TU19–TU22): headless `apply` refuses while the run's owner is alive or uncheckable and runners publish `done` only after `run.finished`; purges never delete a run branch a kept worktree has checked out; coordinator cancellation is bounded and its bookkeeping cannot replace the cancellation. Cursor follow-ups to 4.2/4.11 (CU2–CU5): shared command resolution, a version check in `probe()`, `--trust` at `full` only, and refusal of unadvertised levels. Details are recorded below.
 
 v0.34 / plan v0.16: Windows acceptance and hardening of phase 2c (task 2.29): observer paths no longer sweep temporary files, coordinator turns are cancel-safe, and `relay clean` uses the shared purge rules; 2.29 is done for Windows and Linux/macOS stays with 2.33. The same version records the opt-in Cursor adapter (task 4.2) and its first doctor canaries (task 4.11). Details are recorded below.
 
@@ -610,3 +612,34 @@ This revision records local validation already performed; it does not claim a ne
 | ID / severity | Finding | Resolution |
 |---|---|---|
 | CU1 / P3 | An `inconclusive` permission canary records only its classification, so the reason (for example the Windows CLI refusing `--sandbox enabled`) is not visible in the result. | Open follow-up under 4.11: keep the CLI exit code and a redacted first stderr line in the canary result. |
+
+## Review follow-ups to phase 2c hardening (design v0.35, plan v0.17)
+
+| What changed | Where |
+|---|---|
+| Headless `relay apply` (a run with no session link) checks the run lock's owner up front for a `done` run and again immediately before it first opens the event log; an `ALIVE` or `UNKNOWN` owner is refused with exit 1 and nothing changed. A run that is not `done` keeps its exit 2 refusal from preparation, which never opens the log. `relay clean --json` run entries gain `blocked_refs` (TU21). Single-node and graph runners append `run.finished` first and then write `state: done` and `final_commit` in one `run.json` update (the recovered-node finish does the same), so `done` is never visible before the last event. | Design 6, 14, 16; plan 2.29 |
+| `core.run_purge` marks a run branch as blocked when a worktree the purge keeps has it checked out (the main worktree included): the plan lists it, it is not deleted, and the run record is kept. Checkouts are listed again after the worktree removals, so the branch of a worktree whose removal failed is kept too. `relay clean` shows blocked refs in its text plan and confirmation and in a new `blocked_refs` JSON field (`ref`, `worktree`); session deletion lists them as problems and refuses before its marker is written. | Design 6, 14, 16; plan 2.29 |
+| A cancelled coordinator call is drained for at most `planning.CANCEL_GRACE_S` (10 s, also the existing drain bound after a duration limit), then its task is cancelled and the call record notes `cancel_forced`. The interrupted call record is written once; it, the turn record and `coordinator.finished` are each attempted, and a failure becomes a note on the propagating `CancelledError`. | Design 8.7, 16; plan 2.29 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| TU19 / P2 | Pre-existing. Headless `relay apply` could open a run's `EventLog` while the run's owner was still alive. Runners wrote `state: done`, then `final_commit`, then appended `run.finished`, all under the run lock, and `_prepare_headless` never checked the lock. So `apply` could append with a duplicate `seq` (and later opens failed with `EventLogCorrupt`), or repair as torn a tail that was really the runner's half-written record. | `apply` refuses a live or uncheckable owner before the log is touched (`events.jsonl` stays byte-identical). Runners publish `done` with `final_commit` in one write after `run.finished` is durable. A crash between the two leaves the run `running`; resume finishes it without redispatch (the killed-owner recovery test now crashes at that point). Records with `done` and no `final_commit`, written by older code, are still recovered. |
+| TU20 / P3 | In `PlanningEngine._invoke`, the `finally` wrote the call record and `coordinator.finished` without suppression, so an `OSError` or `SessionError` there replaced an in-flight `CancelledError`. The interrupted call record was also written twice. | A dedicated close step writes the call record once, then the interrupted turn, then the event, and attaches each failure to the cancellation as a note. Cancellation always propagates. |
+| TU21 / P3 | The `run_purge` docstring promised that the user's checked-out branch is never touched, but `purge_run` ran `git update-ref -d` on every `refs/heads/relay/<run>/...` ref, including one checked out in the main worktree or in a worktree whose removal had just failed. | Such branches are blocked, reported and kept, together with the run record, by both `relay clean --purge-runs` and session deletion. The plan output shows them before confirmation. |
+| TU22 / P3 | `planning._drain` ignored repeated cancellation and never cancelled the call task, so stop and shutdown hung on a coordinator that ignored `cancel_processes_when`. | The drain is bounded by the grace period; then the task is cancelled and waited for once more with the same bound, and the forced cancel is recorded on the call. Tested with a fake coordinator that ignores the signal. |
+
+## Cursor adapter follow-ups (design v0.35, plan v0.17)
+
+| What changed | Where |
+|---|---|
+| The adapter and `relay doctor` resolve Cursor's command with one function, `resolve_cursor_command`: legacy `cursor-agent` is probed only when the configured `cmd` is the built-in `agent` and that is not on PATH, and an explicitly configured `cmd` is never replaced. | Design 7.2; plan 4.11 |
+| `probe()` reports Cursor available only when `--version` parses as a Cursor version (for example `2026.10.22-27dcf5f`). A generic `agent` binary with other output is unavailable, with a note. | Design 7.2; plan 4.2 |
+| `--trust` is passed at `full` only. It writes a persistent per-directory workspace-trust marker and skips the "Workspace Trust Required" prompt. Trust gates project code such as `.cursor/worktrees.json` setup and, interactively, also offers to enable project MCP servers; whether project hooks or rules depend on trust is not confirmed. `readonly` never passes it, so a headless `readonly` run in an untrusted worktree stops at the trust gate (fails closed). Doctor canaries still pass `--trust`, because they run in disposable directories. | Design 7.2, 9.3; plan 4.2, 4.11 |
+| `build_invocation` refuses any level outside the adapter's advertised levels, so `readonly` (`--mode plan`) is unreachable until it is promoted into `probe().levels`. | Design 7.2, 9.3; plan 4.2 |
+
+| ID / severity | Finding | Resolution |
+|---|---|---|
+| CU2 / P3 | Doctor probed the configured Cursor `cmd` literally, while the adapter fell back to `cursor-agent`, so the two could disagree about which binary was checked. | Both use `resolve_cursor_command`. |
+| CU3 / P3 | `agent` is a generic command name, but `probe()` only noted an unrecognised `--version` output and still reported the agent available. | A non-Cursor version makes the probe unavailable, with the output in its note. |
+| CU4 / P3 | `--trust` was passed for every level, so a `readonly` run would trust (and so run project code from) an untrusted repository. | `--trust` is passed at `full` only; `readonly` fails closed at the trust gate. |
+| CU5 / P3 | `build_invocation` built a `--mode plan` invocation for `readonly` even though `readonly` is mapped but not advertised. | Unadvertised levels raise `PermissionUnsupported`. |
