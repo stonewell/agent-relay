@@ -377,7 +377,7 @@ verification:           # filled by the Verifier
   mode: default
   acceptance: passed
   details: [{ run: "npm test -- autosave", exit: 0 }]
-open_questions: []       # for needs_input: [{id, text, kind: free|choice, options?, default?, required}] with question_revision (section 8.2)
+open_questions: []       # for needs_input: [{id, text, kind: free|choice, options?, default?, required}] with question_revision (section 8.2); a choice answer may be an option or a custom ("other") value
 # phase 4
 spawn_requests:          # optional follow-up work proposed by this node
   - { category: review, goal: "Review debounce edge cases", depends_on: [n3-implement-autosave] }
@@ -871,7 +871,7 @@ For the single-node CLI, `--dry-run` is not implemented; `--concurrency` is acce
 
 `relay plan` uses the selected deterministic template (default `feature`), writes `graph.yaml` or `--output FILE` relative to `-C`, and refuses to overwrite an existing file. Repeatable `--check` supplies implementation/test and integration acceptance. Review routing, scopes and verification before execution; this headless template command never calls an agent. Adaptive interactive planning is separate (section 8.7). `relay cancel` prepares a run-wide or node-specific cancellation request and requires confirmation or `--yes`; in phase 2a the foreground coordinator consumes atomic request files under its run's `cancel-requests/` directory. For foreground graphs in phase 2a, Ctrl-C stops active workers and preserves an interrupted graph for resume; single-node runs use Ctrl-C as described in section 6. Detached run ownership and IPC remain phase 2b (section 8.6); phase 2c separately uses native session ownership (section 6).
 
-**Foreground reply intake.** A positional answer is accepted for exactly one pending question. For several questions, `--answers-file` loads a YAML or JSON mapping from question IDs to strings or lists of strings; relative paths use `-C`. Unknown IDs, missing required values, invalid choice values and duplicate mapping keys are rejected before confirmation. `--revision` defaults to the current question revision; `--submission-id` supplies an idempotency key, otherwise a fresh one is generated. Reusing an ID with different content is invalid input. Confirmation prints the affected node and revision; without confirmation, exit 7 prints the command with `--yes` and changes no run state. The foreground lock covers answer validation and persistence, with question-set revalidation after confirmation. Protocol behavior and provenance are defined in section 8.2.
+**Foreground reply intake.** A positional answer is accepted for exactly one pending question. For several questions, `--answers-file` loads a YAML or JSON mapping from question IDs to strings or lists of strings; relative paths use `-C`. Unknown IDs, missing required values and duplicate mapping keys are rejected before confirmation. `--revision` defaults to the current question revision; `--submission-id` supplies an idempotency key, otherwise a fresh one is generated. Reusing an ID with different content is invalid input. Confirmation prints the affected node and revision; without confirmation, exit 7 prints the command with `--yes` and changes no run state. The foreground lock covers answer validation and persistence, with question-set revalidation after confirmation. Protocol behavior and provenance are defined in section 8.2.
 
 **`relay routes` and `relay explain`** read the route log's canonical `node.routed` events (section 4.4) instead of the derived projection.
 

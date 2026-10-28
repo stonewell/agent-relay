@@ -217,6 +217,10 @@ uv run relay -C ../relay-demo tui
 uv run relay -C ../relay-demo tui --session SESSION
 ```
 
+Questions with options open an answer list: pick an option with the arrow keys and Enter, or
+choose **Other (type your own)** to enter a custom answer. A choice question's answer is not
+restricted to its options (the same applies to `relay reply`); free-text questions keep a text field.
+
 A typical round: type a request in the composer and press Ctrl+S; answer the coordinator's
 questions; review the proposed plan (Ctrl+R) and approve that revision; watch the tasks and
 inspect a task's exact handoff, files, diff, checks and logs (Ctrl+N moves between the task list,
