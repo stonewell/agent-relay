@@ -437,6 +437,8 @@ class NodeDetail:
     diff: str
     verification: str
     logs: str
+    report: str = ""
+    """What the task reported: summary, decisions and open questions (the result of a review)."""
 
 
 @dataclass(frozen=True)
@@ -1107,6 +1109,8 @@ class SessionApp:
             flags.finished.add(run_id)
             detail = f" ({result.error})" if result.error else ""
             self._notice(f"round {run_id} finished: {result.state}{detail}")
+            for report in await asyncio.to_thread(self._node_reports, run_id):
+                self._notice(report)
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -1116,6 +1120,24 @@ class SessionApp:
             self._notice(f"round {run_id} ended with an error: {exc}")
         finally:
             flags.finishing = False
+
+    def _node_reports(self, run_id: str) -> list[str]:
+        """What each finished task reported; read-only tasks (reviews) change no files."""
+        reports: list[str] = []
+        try:
+            store = _reader(self.repo_root, run_id)
+            graph = store.read_run().graph
+            nodes = [] if graph is None else [node.id for node in graph.nodes]
+            for node_id in nodes:
+                path = store.node_dir(node_id) / "result.spec.yaml"
+                if not path.is_file():
+                    continue
+                body = _report_text(load_spec(ResultSpec, path))
+                if body:
+                    reports.append(f"task {node_id} reported:\n{body}")
+        except (OSError, ValueError, StoreError):
+            pass
+        return reports
 
     def _drain_progress(self) -> None:
         if self._progress is None:
@@ -1315,10 +1337,12 @@ class SessionApp:
                             sources.append(f"context from {ref.node} {target}".rstrip())
         files: tuple[str, ...] = ()
         verification = ""
+        report = ""
         result_path = directory / "result.spec.yaml"
         if result_path.is_file():
             with contextlib.suppress(OSError, ValueError):
                 result = load_spec(ResultSpec, result_path)
+                report = _report_text(result)
                 if result.changes is not None:
                     files = tuple(result.changes.files)
                 if result.verification is not None:
@@ -1350,6 +1374,7 @@ class SessionApp:
             diff=diff,
             verification=verification,
             logs=logs,
+            report=report,
         )
 
     async def plan(self, revision: int | None = None) -> PlanView:
@@ -1855,6 +1880,15 @@ def _outcome(turn: Mapping[str, Any]) -> dict[str, Any]:
 def _number(turn_id: str) -> int:
     digits = "".join(c for c in turn_id if c.isdigit())
     return int(digits) if digits else 0
+
+
+def _report_text(result: ResultSpec) -> str:
+    parts = [result.summary.strip()] if result.summary and result.summary.strip() else []
+    if result.decisions:
+        parts.append("Decisions:\n" + "\n".join(f"- {d}" for d in result.decisions))
+    if result.open_questions:
+        parts.append("Open questions:\n" + "\n".join(f"- {q.text}" for q in result.open_questions))
+    return _bounded("\n\n".join(parts), _TEXT_LIMIT)
 
 
 def _question(raw: Mapping[str, Any]) -> QuestionView:

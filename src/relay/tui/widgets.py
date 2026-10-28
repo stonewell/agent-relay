@@ -263,6 +263,7 @@ class Inspector(VerticalScroll):
     def show_node(self, detail: NodeDetail) -> None:
         sections = [
             f"Task {detail.node_id} in round {detail.run_id}",
+            "Result reported by the task:\n" + (detail.report or "-"),
             "Exact handoff delivered:\n" + (detail.handoff or "(not dispatched yet)"),
             "Sources:\n" + ("\n".join(detail.sources) or "-"),
             "Changed files:\n" + ("\n".join(detail.changed_files) or "-"),

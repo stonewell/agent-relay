@@ -377,6 +377,27 @@ def test_choice_question_is_answered_from_a_list(repo: Path, custom: bool) -> No
     assert "memcached" in prompts[-1] if custom else "lru" in prompts[-1]
 
 
+def test_review_results_are_shown_when_a_read_only_round_finishes(repo: Path) -> None:
+    """A review changes no files, so its summary is the result: it must reach the screen."""
+    adapter = FakeAdapter({"r": Scenario(summary="FINDING: run.py:1088 rejects custom answers")})
+    svc = service(repo, adapter, Scripted(plan(node("r", category="review", owns=[]))))
+
+    async def body(app: RelayApp, pilot: Pilot[int]) -> None:
+        await send(pilot, "Review it")
+        await until(pilot, lambda: isinstance(app.screen, PlanScreen))
+        await press_button(pilot, "approve")
+        await until(pilot, lambda: node_state(app, "r") == "done", timeout=60)
+        await until(
+            pilot,
+            lambda: any("FINDING: run.py:1088" in text for _, text in (app.view_state.notices if app.view_state else ())),  # noqa: E501
+        )
+        detail = await svc.node_detail("r")
+        assert "FINDING: run.py:1088" in detail.report
+        await pilot.press("ctrl+q")
+
+    drive(repo, svc, WIDE, body)
+
+
 def test_stop_shows_stopping_and_reopen_never_dispatches(repo: Path) -> None:
     adapter = FakeAdapter({"a": [Scenario(hang=True), Scenario(write={"a/a.py": "a\n"})]})
     script = Scripted(plan(node("a", budget={"max_attempts": 2})))
