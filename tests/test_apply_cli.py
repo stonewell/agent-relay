@@ -582,6 +582,46 @@ def test_incomplete_run_exits_invalid(
     assert snapshot(repo) == before
 
 
+@pytest.mark.parametrize("owner", ["alive", "unknown"])
+def test_headless_apply_refuses_while_the_run_owner_is_alive_or_unknown(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], owner: str
+) -> None:
+    """The record can say `done` while its runner still holds the lock and appends events.
+
+    Opening the log then would race that writer (duplicate `seq`, or a torn-tail repair of
+    its record), so a headless apply is refused before the log is touched.
+    """
+    from relay.core.runlock import RunLock, lock_path
+
+    base = head(repo)
+    integration = commit_in_worktree(repo, tmp_path, base, {"feature.txt": "feature\n"})
+    store = create_run(repo, base=base, integration=integration)
+    before, log_before = snapshot(repo), store.events_path.read_bytes()
+    lock: RunLock | None = None
+    if owner == "alive":
+        lock = RunLock.acquire(repo, RUN)  # this live process owns the run
+    else:
+        lock_path(repo, RUN).parent.mkdir(parents=True, exist_ok=True)
+        lock_path(repo, RUN).write_text("", encoding="utf-8")  # partly written: unknown
+    try:
+        code = invoke(repo, "--yes")
+    finally:
+        if lock is not None:
+            lock.release()
+        else:
+            lock_path(repo, RUN).unlink()
+
+    assert code == Exit.FAILURE
+    err = capsys.readouterr().err
+    assert ("still owned" if owner == "alive" else "cannot be checked") in err
+    assert "nothing was changed" in err.lower()
+    assert snapshot(repo) == before
+    assert store.events_path.read_bytes() == log_before  # the log was never opened
+    assert store.read_run().state == "done"
+
+    assert invoke(repo, "--yes") == Exit.OK  # once the owner is gone, delivery proceeds
+
+
 def test_force_is_rejected_in_git_mode(
     repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

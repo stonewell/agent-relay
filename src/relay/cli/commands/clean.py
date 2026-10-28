@@ -16,7 +16,8 @@ asks for confirmation and reports. In short:
   creates, replaces or unlinks a lock object (design section 6), so a purged run id stays
   unusable while its lock object exists. Nothing is swept or written in a run it skips.
 * Refs go before the run record, and the record is kept when an earlier removal failed, so a
-  failed purge can be repeated.
+  failed purge can be repeated. A run branch that a kept worktree (the main one included) has
+  checked out is shown as blocked, never deleted, and keeps the record (exit ``1``).
 * ``--purge-runs`` is privileged (design section 8.6). Without ``--yes`` an interactive
   session is asked to confirm; a non-interactive session exits ``7`` and changes nothing. The
   exact confirming command is printed. ``--dry-run`` prints the plan and changes nothing.
@@ -84,6 +85,8 @@ class _RunPlan:
     scratch: Removal | None = None
     run_dir: Removal | None = None
     refs: list[str] = field(default_factory=list[str])
+    blocked_refs: dict[str, Path] = field(default_factory=dict[str, Path])
+    """Run branches a kept worktree has checked out: never deleted; they keep the record."""
     skipped: str | None = None
     active: bool = False
     error: str | None = None
@@ -244,6 +247,7 @@ def _plan_run(
     plan.purge = shared
     plan.worktrees, plan.scratch, plan.run_dir = shared.worktrees, shared.scratch, shared.record
     plan.refs = shared.refs
+    plan.blocked_refs = shared.blocked_refs
     return plan
 
 
@@ -413,9 +417,19 @@ def _summary_lines(plans: list[_RunPlan], repo_root: Path, *, dry_run: bool = Fa
             )
         for ref in plan.refs:
             lines.append(f"  ref {ref}")
+        for ref, holder in plan.blocked_refs.items():
+            lines.append(
+                f"  ref {ref} (blocked: checked out in {_worktree_label(holder, repo_root)}; "
+                "kept with the run record)"
+            )
         if plan.error is not None:
             lines.append(f"  error: {plan.error}")
     return lines
+
+
+def _worktree_label(path: Path, repo_root: Path) -> str:
+    shown = display_path(path, repo_root)
+    return "the main worktree" if shown == "." else f"the worktree {shown}"
 
 
 def _removal_line(kind: str, removal: Removal, repo_root: Path, *, dry_run: bool) -> str:
@@ -446,6 +460,10 @@ def _plan_json(plan: _RunPlan, repo_root: Path, *, dry_run: bool) -> dict[str, A
         "scratch": _removal_json(plan.scratch, repo_root, dry_run=dry_run),
         "run_directory": _removal_json(plan.run_dir, repo_root, dry_run=dry_run),
         "refs": list(plan.refs),
+        "blocked_refs": [
+            {"ref": ref, "worktree": display_path(holder, repo_root)}
+            for ref, holder in plan.blocked_refs.items()
+        ],
         "error": plan.error,
     }
 

@@ -333,3 +333,36 @@ def test_clean_purge_never_removes_runs_referenced_by_a_session(
 
     assert main(["-C", str(repo), "clean", "--purge-runs", "--yes", "--json"]) == Exit.OK
     assert linked.run_dir.is_dir() and not other.run_dir.exists()
+
+
+def test_session_deletion_is_refused_while_a_run_branch_is_checked_out(tmp_path: Path) -> None:
+    """A run branch checked out in a worktree outside the deletion blocks it, untouched."""
+    from harness import git, init_repo
+    from relay.core.sessions import DELETING, delete_session, plan_session_deletion
+
+    repo = init_repo(tmp_path / "repo")
+    store = SessionStore.create(repo)
+    with store.acquire_owner() as owner:
+        approved(owner)
+        linked = owner.start_run()
+    linked.update_run(lambda record: setattr(record, "state", "done"))  # a finished round
+    head = git(repo, "rev-parse", "HEAD")
+    branch = f"refs/heads/relay/{linked.run_id}/integration"
+    git(repo, "update-ref", branch, head)
+    elsewhere = tmp_path / "elsewhere"
+    git(repo, "worktree", "add", "-q", str(elsewhere), f"relay/{linked.run_id}/integration")
+
+    plan = plan_session_deletion(repo, store.session_id, worktree_root="auto")
+    assert any("checked out" in problem and branch in problem for problem in plan.problems)
+    (run,) = plan.runs
+    assert run.blocked_refs == (branch,) and branch not in run.refs
+    with pytest.raises(SessionConflict, match="checked out"):
+        delete_session(repo, store.session_id, include_undelivered=True, worktree_root="auto")
+    assert git(repo, "rev-parse", branch) == head
+    assert linked.run_dir.is_dir() and not (store.dir / DELETING).exists()
+    assert store.session_id in SessionStore.list_sessions(repo)
+
+    git(repo, "worktree", "remove", "--force", str(elsewhere))
+    delete_session(repo, store.session_id, include_undelivered=True, worktree_root="auto")
+    assert not linked.run_dir.exists()
+    assert git(repo, "for-each-ref", "--format=%(refname)", branch) == ""

@@ -81,6 +81,23 @@ def test_independent_writers_and_dependency_snapshot(tmp_path: Path) -> None:
     assert [e.seq for e in events] == list(range(1, len(events) + 1))
 
 
+def test_graph_publishes_done_after_run_finished_with_its_final_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`done` and `final_commit` land in one record write, after the durable `run.finished`."""
+    from test_run import watch_done_publication
+
+    repo = init_repo(tmp_path / "repo")
+    at_finished, written = watch_done_publication(monkeypatch, repo, RUN)
+    outcome = invoke(
+        repo, graph([{"id": "a"}]), FakeAdapter(Scenario(write={"a.py": "a"})), run_id=RUN
+    )
+    assert outcome.exit_code == 0, outcome
+    assert at_finished == [("running", None)]
+    assert all(state != "done" for state, _ in written[:-1])
+    assert written[-1] == ("done", outcome.integration_commit)
+
+
 def test_failed_branch_blocks_dependents_and_keeps_independent_output(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     spec = graph([{"id": "a"}, {"id": "b", "depends_on": ["a"]}, {"id": "c"}])

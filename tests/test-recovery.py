@@ -50,8 +50,9 @@ if phase in ('capture','publish'):
         return result
     setattr(runner,name,stop)
 elif phase=='final':
+    # After the durable run.finished, before the one record write publishing done+final_commit.
     def stop(*args,**kwargs):pause()
-    runner._set_final_commit=stop
+    runner._set_done=stop
 elif phase=='complete':
     original=runner._set_node
     def stop(*args,**kwargs):

@@ -8,11 +8,15 @@ confirmed session deletion:
   purging, capture candidates registered under the run directory), each through
   :class:`WorktreeManager`'s containment checks. The main worktree and unrelated paths are
   never touched.
-* Only refs under `refs/relay/<run>/` and `refs/heads/relay/<run>/` are deleted: no other branch,
-  and never the user's checked-out branch, is touched.
+* Only refs under `refs/relay/<run>/` and `refs/heads/relay/<run>/` are deleted: no other branch
+  is touched. A run branch that a worktree the purge does not remove has checked out (the main
+  worktree included, for example after `git switch relay/<run>/integration`) is *blocked*: it is
+  shown as such in the plan, never deleted, and keeps the run record. The checkouts are listed
+  again after the worktree removals, so a node branch whose worktree could not be removed is
+  kept too.
 * Every other removal comes before the run record, and the record is kept when any of them
-  failed, so an interrupted or partly failed purge can be repeated. Lock objects are never
-  created, replaced or unlinked.
+  failed or was blocked, so an interrupted or partly failed purge can be repeated. Lock objects
+  are never created, replaced or unlinked.
 
 Nothing here opens a run for writing or sweeps its temp files: planning only reads.
 """
@@ -33,6 +37,8 @@ from .worktree import WorktreeError, WorktreeManager
 __all__ = [
     "Removal",
     "RunPurge",
+    "blocked_message",
+    "checked_out_branches",
     "execute_run_purge",
     "owner_blocker",
     "owner_state",
@@ -44,7 +50,7 @@ __all__ = [
 
 _PROBE_NODE = "n1"  # a valid node id, used only to derive the run's worktree directory
 _GIT_TIMEOUT_S = 300
-KEPT_RECORD = "kept: an earlier removal failed, so the purge can be retried"
+KEPT_RECORD = "kept: an earlier removal failed or was blocked, so the purge can be retried"
 
 
 @dataclass
@@ -70,6 +76,10 @@ class RunPurge:
     record: Removal | None = None
     """The run directory; None when only worktrees and scratch are cleaned."""
     refs: list[str] = field(default_factory=list[str])
+    """The run's refs the purge deletes (blocked branches excluded)."""
+    blocked_refs: dict[str, Path] = field(default_factory=dict[str, Path])
+    """Run branches kept because a worktree the purge keeps has them checked out (ref ->
+    that worktree); each also keeps the run record."""
     ref_errors: list[str] = field(default_factory=list[str])
 
     @property
@@ -144,6 +154,42 @@ def registered_worktrees(repo_root: Path) -> list[Path]:
     ]
 
 
+def checked_out_branches(repo_root: Path) -> dict[str, list[Path]]:
+    """Each branch ref checked out in a registered worktree (the main one included)."""
+    proc = _git(repo_root, "worktree", "list", "--porcelain")
+    if proc.returncode != 0:
+        raise WorktreeError(f"cannot list worktrees: {proc.stderr.strip()}")
+    found: dict[str, list[Path]] = {}
+    current: Path | None = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree ") :])
+        elif line.startswith("branch ") and current is not None:
+            found.setdefault(line[len("branch ") :], []).append(current)
+        elif not line:
+            current = None
+    return found
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return os.path.normcase(left.resolve()) == os.path.normcase(right.resolve())
+    except (OSError, RuntimeError):
+        return os.path.normcase(left) == os.path.normcase(right)
+
+
+def _blocked_by(ref: str, checkouts: dict[str, list[Path]], removed: list[Path]) -> Path | None:
+    """The kept worktree that has branch `ref` checked out, or None."""
+    for path in checkouts.get(ref, []):
+        if not any(_same_path(path, gone) for gone in removed):
+            return path
+    return None
+
+
+def blocked_message(ref: str, worktree: Path) -> str:
+    return f"kept {ref}: it is checked out in the worktree {worktree}"
+
+
 def _is_under(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -185,15 +231,26 @@ def plan_run_purge(
         plan.scratch = Removal(scratch)
     if record:
         plan.record = Removal(run_dir)
-        plan.refs = run_refs(repo_root, run_id)
+        refs = run_refs(repo_root, run_id)
+        branches = [ref for ref in refs if ref.startswith("refs/heads/")]
+        checkouts = checked_out_branches(repo_root) if branches else {}
+        removing = [removal.path for removal in plan.worktrees]
+        for ref in refs:
+            holder = _blocked_by(ref, checkouts, removing) if ref in branches else None
+            if holder is None:
+                plan.refs.append(ref)
+            else:
+                plan.blocked_refs[ref] = holder
     return plan
 
 
 def purge_run(repo_root: Path, plan: RunPurge) -> None:
     """Attempt every removal in `plan`, recording each outcome in it; never raises for them.
 
-    Worktrees and scratch go first, then the refs; the run record goes last and only when
-    nothing before it failed (it is then marked kept with :data:`KEPT_RECORD`).
+    Worktrees and scratch go first, then the refs; a run branch still checked out in a kept
+    worktree (planned as blocked, or found so after the removals) is skipped and reported. The
+    run record goes last and only when nothing before it failed or was blocked (it is then
+    marked kept with :data:`KEPT_RECORD`).
     """
     for removal in plan.worktrees:
         try:
@@ -211,10 +268,29 @@ def purge_run(repo_root: Path, plan: RunPurge) -> None:
             removal.error = str(exc)
     if plan.scratch is not None:
         _remove_tree(plan.scratch)
+    for ref, holder in plan.blocked_refs.items():
+        plan.ref_errors.append(blocked_message(ref, holder))
+    # Checkouts are listed again now: a worktree whose removal failed (or one created since
+    # planning) still has its branch checked out, and deleting it would orphan that checkout.
+    checkouts: dict[str, list[Path]] | None = {}
+    if any(ref.startswith("refs/heads/") for ref in plan.refs):
+        try:
+            checkouts = checked_out_branches(repo_root)
+        except WorktreeError as exc:
+            checkouts = None  # unknown: no branch is deleted
+            plan.ref_errors.append(f"kept the run's branches: {exc}")
+    removed = [r.path for r in plan.worktrees if r.error is None]
     for ref in plan.refs:
         if not _own_ref(plan.run_id, ref):
             plan.ref_errors.append(f"refusing to delete {ref}: outside run {plan.run_id}")
             continue
+        if ref.startswith("refs/heads/"):
+            if checkouts is None:
+                continue  # reported once above
+            holder = _blocked_by(ref, checkouts, removed)
+            if holder is not None:
+                plan.ref_errors.append(blocked_message(ref, holder))
+                continue
         try:
             proc = _git(repo_root, "update-ref", "-d", ref)
         except WorktreeError as exc:

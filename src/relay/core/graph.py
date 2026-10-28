@@ -1086,7 +1086,6 @@ async def run_graph(
             branch = publication.integration_branch(store.run_id)
             if not compare_and_swap(repo, branch, commit, prior_integration or "0" * len(commit)):  # pyright: ignore[reportPrivateUsage]
                 raise publication.PublicationError("integration branch changed concurrently")
-            store.update_run(lambda r: setattr(r, "final_commit", commit))
             events.append(
                 "integration.published",
                 {"commit": commit, "branch": branch, "nodes": sorted(results)},
@@ -1100,8 +1099,18 @@ async def run_graph(
             if code == 6
             else "failed"
         )
-        store.update_run(lambda r: setattr(r, "state", state))
+        # The terminal state (with `final_commit`, in one record write) is published only after
+        # `run.finished` is durable: a reader that sees `done` (relay apply) never races this
+        # writer's last event. A crash in between leaves the run `running`; resume re-finishes
+        # from the durable node outputs and the published integration branch.
         events.append("run.finished", {"state": state, "integration_commit": commit})
+
+        def finished(record: Any) -> None:
+            record.state = state
+            if commit is not None:
+                record.final_commit = commit
+
+        store.update_run(finished)
         return GraphResult(code, store.run_id, state, results, commit)
     except asyncio.CancelledError:
         coordinator.cancel.set()

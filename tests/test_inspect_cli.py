@@ -26,7 +26,7 @@ from relay.core.events import EventLog
 from relay.core.runlock import RunLock, lock_path
 from relay.core.specs.result import Changes, OpenQuestion, ResultSpec, Verification, VerifyDetail
 from relay.core.store import RunStore
-from relay.core.worktree import WorktreeManager
+from relay.core.worktree import WorktreeError, WorktreeManager
 
 RUN = "2026-10-22-a1b2"
 OTHER = "2026-10-22-c3d4"
@@ -535,6 +535,67 @@ def test_clean_purge_removes_run_directory_and_refs_but_not_lock_objects(
         if "relay" in line
     ]
     assert refs == ["refs/relay/other-run/n1"]
+
+
+def test_clean_purge_never_deletes_a_run_branch_checked_out_in_the_main_worktree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The user switched the main worktree to the run's integration branch: it is blocked."""
+    repo = init_repo(tmp_path / "repo")
+    store = make_run(repo)
+    head = git(repo, "rev-parse", "HEAD")
+    branch = f"refs/heads/relay/{RUN}/integration"
+    git(repo, "update-ref", f"refs/relay/{RUN}/{NODE}", head)
+    git(repo, "update-ref", branch, head)
+    git(repo, "switch", "-q", f"relay/{RUN}/integration")
+
+    assert call(repo, "clean", RUN, "--purge-runs", "--dry-run", "--json") == Exit.OK
+    planned = payload(capsys)["runs"][0]
+    assert planned["refs"] == [f"refs/relay/{RUN}/{NODE}"]
+    assert planned["blocked_refs"] == [{"ref": branch, "worktree": "."}]
+
+    assert call(repo, "clean", RUN, "--purge-runs", "--dry-run") == Exit.OK
+    assert f"ref {branch} (blocked: checked out in the main worktree" in capsys.readouterr().out
+
+    assert call(repo, "clean", RUN, "--purge-runs", "--yes", "--json") == Exit.FAILURE
+    data = payload(capsys)
+    assert "checked out" in data["runs"][0]["error"]
+    assert git(repo, "rev-parse", branch) == head  # the checked-out branch is untouched
+    assert git(repo, "symbolic-ref", "HEAD") == branch
+    assert store.run_dir.is_dir()  # the record is kept, so the purge can be retried
+    assert git(repo, "for-each-ref", "--format=%(refname)", f"refs/relay/{RUN}/") == ""
+
+    git(repo, "switch", "-q", "main")
+    assert call(repo, "clean", RUN, "--purge-runs", "--yes", "--json") == Exit.OK
+    assert not store.run_dir.exists()
+    assert git(repo, "for-each-ref", "--format=%(refname)", f"refs/heads/relay/{RUN}/") == ""
+
+
+def test_clean_purge_keeps_a_node_branch_whose_worktree_removal_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from relay.core import run_purge
+
+    repo = init_repo(tmp_path / "repo")
+    store = make_run(repo)
+    head = git(repo, "rev-parse", "HEAD")
+    branch = f"refs/heads/relay/{RUN}/{NODE}"
+    worktree = WorktreeManager(repo, RUN).create(NODE, head, branch=f"relay/{RUN}/{NODE}").path
+    git(worktree, "switch", "-q", f"relay/{RUN}/{NODE}")  # the short layout leaves it detached
+
+    def refuse(self: WorktreeManager, path: Path) -> object:
+        raise WorktreeError("simulated: the worktree is in use")
+
+    monkeypatch.setattr(run_purge.WorktreeManager, "decommission", refuse)
+    code = call(repo, "clean", RUN, "--purge-runs", "--yes", "--json")
+    refs = git(repo, "for-each-ref", "--format=%(refname)", f"refs/heads/relay/{RUN}/")
+    assert refs == branch  # still the retained worktree's branch
+    assert worktree.is_dir()
+    assert store.run_dir.is_dir()
+    assert code == Exit.FAILURE
+    data = payload(capsys)
+    assert data["runs"][0]["blocked_refs"] == []  # planned for deletion with its worktree
+    assert "checked out" in data["runs"][0]["error"]
 
 
 def test_clean_without_run_id_skips_live_runs_and_honours_older_than(

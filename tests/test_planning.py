@@ -459,6 +459,109 @@ def test_an_unexpected_coordinator_error_fails_the_turn_durably(repo: Path) -> N
     run(scenario)
 
 
+def _notes(exc: BaseException | None) -> list[str]:
+    """Every note on `exc` and the exceptions it was raised from (a task re-wraps cancellation)."""
+    found: list[str] = []
+    while exc is not None:
+        found += getattr(exc, "__notes__", [])
+        exc = exc.__context__
+    return found
+
+
+def test_a_failed_interrupted_record_never_replaces_the_cancellation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from relay.core.sessions import SessionError
+
+    async def scenario() -> None:
+        engine, owner, _ = make(repo, Scripted(0.5))
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        interrupted_writes: list[str] = []
+        real_write, real_event = owner.write_record, owner.event
+
+        def write_record(subdir: str, name: str, data: dict[str, Any]) -> None:
+            if subdir == "calls" and data.get("status") == "interrupted":
+                interrupted_writes.append(name)
+                raise OSError("disk full")
+            real_write(subdir, name, data)
+
+        def event(type_: str, data: dict[str, Any] | None = None) -> None:
+            if type_ == "coordinator.started":
+                loop.call_soon_threadsafe(started.set)
+            if type_ == "coordinator.finished":
+                raise SessionError("the session event log is closed")
+            real_event(type_, data)
+
+        monkeypatch.setattr(owner, "write_record", write_record)
+        monkeypatch.setattr(owner, "event", event)
+        task = asyncio.ensure_future(engine.submit("go"))
+        await started.wait()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as info:
+            await task  # not OSError or SessionError from the bookkeeping
+        assert interrupted_writes == ["t1-c1"]  # the interrupted call record is written once
+        notes = " ".join(_notes(info.value))
+        assert "call record" in notes and "disk full" in notes
+        assert "coordinator.finished event" in notes and "event log is closed" in notes
+        turn = owner.store.read_record("turns", "t1")
+        assert turn is not None and turn["status"] == "interrupted"  # still written
+        owner.close()
+
+    run(scenario)
+
+
+class Stubborn(Scripted):
+    """A coordinator that ignores the process-cancellation signal until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.task_cancelled = False
+
+    async def __call__(self, prompt: str, **_kw: Any) -> CoordinatorCall:
+        self.prompts.append(prompt)
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.task_cancelled = True
+            raise
+        return respond({"action": "finish", "summary": "late"})
+
+
+def test_shutdown_never_hangs_on_a_coordinator_that_ignores_cancellation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from relay.core import planning
+
+    monkeypatch.setattr(planning, "CANCEL_GRACE_S", 0.3, raising=False)
+
+    async def scenario() -> None:
+        stubborn = Stubborn()
+        engine, owner, _ = make(repo, stubborn)
+        loop = asyncio.get_running_loop()
+        loop.call_later(6.0, stubborn.release.set)  # an unbounded drain would wait for this
+        task = asyncio.ensure_future(engine.submit("go"))
+        await stubborn.entered.wait()
+        began = loop.time()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert loop.time() - began < 3.0
+        assert stubborn.task_cancelled  # the grace period ran out and the task was cancelled
+        call = owner.store.read_record("calls", "t1-c1")
+        assert call is not None and call["status"] == "interrupted"
+        assert "ignored cancellation" in call["cancel_forced"]
+        turn = owner.store.read_record("turns", "t1")
+        assert turn is not None and turn["status"] == "interrupted"
+        owner.close()
+
+    run(scenario)
+
+
 def test_resume_cannot_reset_an_exhausted_budget(repo: Path) -> None:
     async def scenario() -> None:
         engine, owner, script = make(repo, Scripted(propose()), max_steps=2)

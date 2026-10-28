@@ -854,6 +854,8 @@ class RunDeletion:
     worktrees: int
     scratch: bool
     blocker: str | None
+    blocked_refs: tuple[str, ...] = ()
+    """Run branches a worktree outside the deletion has checked out (deletion is refused)."""
 
 
 @dataclass(frozen=True)
@@ -956,7 +958,7 @@ def plan_session_deletion(
     repo_root: Path, session_id: str, *, worktree_root: str | None = None
 ) -> SessionDeletionPlan:
     """Exactly what deleting the session removes; read-only (no lock, no sweeping)."""
-    from .run_purge import owner_blocker, plan_run_purge
+    from .run_purge import blocked_message, owner_blocker, plan_run_purge
 
     store = SessionStore(repo_root, session_id)
     if not (store.dir / SESSION_JSON).is_file():
@@ -977,10 +979,11 @@ def plan_session_deletion(
         if blocker is not None:
             problems.append(blocker)
         purge = plan_run_purge(repo_root, run_id, root)
+        problems += [blocked_message(ref, path) for ref, path in purge.blocked_refs.items()]
         runs.append(
             RunDeletion(
                 run_id, state, delivery, detail, tuple(purge.refs), len(purge.worktrees),
-                purge.scratch is not None, blocker,
+                purge.scratch is not None, blocker, tuple(purge.blocked_refs),
             )
         )  # fmt: skip
     refs = _git_lines(
@@ -1018,12 +1021,14 @@ def delete_session(
     like `relay clean --purge-runs` (worktrees, scratch, then `refs/relay/<run>/...` and
     `refs/heads/relay/<run>/...`, then its record); then the session's checkpoint refs and
     records go, `session.json` last. Deleting again after a crash finishes the job; ownership
-    is refused until then. No other ref is touched, so the user's branches never change. Lock
-    objects are never created, replaced or unlinked; the session lock keeps its id reserved.
+    is refused until then. No other ref is touched, so the user's branches never change, and a
+    run branch checked out in a worktree the purge keeps (the main one included) refuses the
+    deletion with :class:`SessionConflict`. Lock objects are never created, replaced or
+    unlinked; the session lock keeps its id reserved.
     """
     import shutil
 
-    from .run_purge import execute_run_purge, owner_blocker, plan_run_purge
+    from .run_purge import blocked_message, execute_run_purge, owner_blocker, plan_run_purge
 
     # Nothing is swept or written before the lock is held: that would race a live owner.
     store = SessionStore(repo_root, session_id)
@@ -1037,6 +1042,11 @@ def delete_session(
         problems = [] if finishing else _unconfirmed_execution(repo_root, store)
         problems += _shared_with_others(repo_root, session_id, run_ids)
         problems += [b for b in (owner_blocker(repo_root, r) for r in run_ids) if b is not None]
+        purges = {r: plan_run_purge(repo_root, r, root) for r in run_ids}  # read-only
+        for purge in purges.values():
+            # A run branch the user has checked out (any worktree the purge keeps) is never
+            # deleted, so the deletion is refused before the marker rather than left partial.
+            problems += [blocked_message(ref, path) for ref, path in purge.blocked_refs.items()]
         if problems:
             raise SessionConflict("cannot delete the session: " + "; ".join(problems))
         if not finishing:
@@ -1057,7 +1067,7 @@ def delete_session(
             marker = {"at": iso(datetime.now(UTC)), "runs": run_ids}
             atomic_write(store.dir / DELETING, json.dumps(marker) + "\n")
         for run_id in run_ids:
-            execute_run_purge(repo_root, plan_run_purge(repo_root, run_id, root))
+            execute_run_purge(repo_root, purges[run_id])
         prefix = f"{SESSION_REFS}/{store.session_id}/"
         refs = _git_lines(repo_root, "for-each-ref", "--format=%(refname)", prefix)
         if refs is None:

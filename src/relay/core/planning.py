@@ -249,11 +249,36 @@ async def _settled(function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return future.result()
 
 
-async def _drain(task: asyncio.Future[Any]) -> None:
-    """Wait until `task` ends, through repeated cancellation; only for handlers that re-raise."""
-    while not task.done():
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait({task})
+CANCEL_GRACE_S = 10.0
+"""How long a cancelled coordinator call may take to end on its own (the process-cancellation
+signal) before its task is cancelled outright; also the drain bound after a duration limit."""
+
+
+async def _drain(task: asyncio.Future[Any]) -> bool:
+    """Wait for `task` to end, through repeated cancellation; only for handlers that re-raise.
+
+    The wait is bounded: a coordinator that ignores the process-cancellation signal for
+    :data:`CANCEL_GRACE_S` has its task cancelled, and that is waited for once more for the
+    same bound, so shutdown never hangs on it. Returns False when the task had to be cancelled
+    (if it also ignores task cancellation it is then left pending rather than awaited forever).
+    """
+    loop = asyncio.get_running_loop()
+    bound = CANCEL_GRACE_S
+
+    async def wait(seconds: float) -> None:
+        deadline = loop.time() + seconds
+        while not task.done() and (left := deadline - loop.time()) > 0:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({task}, timeout=left)
+
+    await wait(bound)
+    ended = task.done()
+    if not ended:
+        task.cancel()
+        await wait(bound)
+    if task.done() and not task.cancelled():
+        task.exception()  # retrieved: the cancellation is what the caller handles
+    return ended
 
 
 class PlanningEngine:
@@ -534,6 +559,7 @@ class PlanningEngine:
         remaining = max(0.1, limit_s - turn["active_s"])
         cancel = threading.Event()
         task: asyncio.Task[CoordinatorCall] | None = None
+        interrupted: asyncio.CancelledError | None = None
 
         def observe(phase: str, pid: int | None) -> None:
             if phase == "starting":
@@ -573,7 +599,7 @@ class PlanningEngine:
             done, _ = await asyncio.wait({task}, timeout=remaining)
             if not done:  # duration limit: cancel and drain the active call
                 cancel.set()
-                done, _ = await asyncio.wait({task}, timeout=10.0)
+                done, _ = await asyncio.wait({task}, timeout=CANCEL_GRACE_S)
                 if not done:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
@@ -596,29 +622,71 @@ class PlanningEngine:
                 record["model"] = outcome.model
                 record["tokens_in"] = outcome.tokens_in
                 record["tokens_out"] = outcome.tokens_out
-        except asyncio.CancelledError:
-            # Owner stop or shutdown: drain the process before surfacing the cancellation.
+        except asyncio.CancelledError as exc:
+            # Owner stop or shutdown: drain the process before surfacing the cancellation. The
+            # drain is bounded; a coordinator that ignored the signal is noted on the record.
+            interrupted = exc
             cancel.set()
-            if task is not None:
-                await _drain(task)
+            if task is not None and not await _drain(task):
+                record["cancel_forced"] = (
+                    f"the coordinator call ignored cancellation for {CANCEL_GRACE_S}s; "
+                    "its task was cancelled"
+                )
             record["status"] = "interrupted"
             turn["status"] = "interrupted"
-            with contextlib.suppress(Exception):  # the cancellation is what the caller handles
-                await _settled(self.owner.write_record, "calls", call_id, record)
-                await _settled(self.owner.write_record, "turns", turn["turn_id"], turn)
             raise
         except Exception:
             if record["status"] == "started":  # a failed durable write before the call ran
                 record["status"] = "failed"
             raise
         finally:
-            await _settled(self.owner.write_record, "calls", call_id, record)
-            await _settled(
-                self.owner.event,
-                "coordinator.finished",
-                {"turn_id": turn["turn_id"], "call_id": call_id, "status": record["status"]},
-            )
+            await self._close_call(turn, call_id, record, interrupted)
         return outcome
+
+    async def _close_call(
+        self,
+        turn: dict[str, Any],
+        call_id: str,
+        record: dict[str, Any],
+        interrupted: asyncio.CancelledError | None,
+    ) -> None:
+        """Write the call's final record (once) and `coordinator.finished`.
+
+        After a cancellation the interrupted turn is written too, and every write is attempted
+        even if an earlier one failed: a failure (or a repeated cancellation) is attached to
+        the propagating cancellation as a note instead of replacing it.
+        """
+        writes: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+            ("call record", lambda: _settled(self.owner.write_record, "calls", call_id, record)),
+        ]
+        if interrupted is not None:
+            writes.append(
+                (
+                    "turn record",
+                    lambda: _settled(self.owner.write_record, "turns", turn["turn_id"], turn),
+                )
+            )
+        writes.append(
+            (
+                "coordinator.finished event",
+                lambda: _settled(
+                    self.owner.event,
+                    "coordinator.finished",
+                    {"turn_id": turn["turn_id"], "call_id": call_id, "status": record["status"]},
+                ),
+            )
+        )
+        for what, write in writes:
+            if interrupted is None:
+                await write()
+                continue
+            try:
+                await write()
+            except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - noted below
+                interrupted.add_note(
+                    f"relay: recording the interrupted coordinator call {call_id} failed "
+                    f"({what}): {type(exc).__name__}: {exc}"
+                )
 
     # --- actions ----------------------------------------------------------------------------
 

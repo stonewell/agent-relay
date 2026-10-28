@@ -576,11 +576,14 @@ class _AttemptRunner:
                 },
             )
             if integration is not None:
-                self.store.update_run(lambda record: setattr(record, "state", "done"))
-                self.store.update_run(partial(_set_final_commit, commit=integration.commit))
+                # `done` is published only after `run.finished` is durable, together with
+                # `final_commit` in one record write: a reader that sees `done` (relay apply)
+                # never races this writer's last event. A crash in between leaves the run
+                # `running` with the node done, which resume finishes without redispatch.
                 self.events.append(
                     "run.finished", {"state": "done", "integration_commit": integration.commit}
                 )
+                self.store.update_run(partial(_set_done, commit=integration.commit))
             return RunResult(
                 exit_code=EXIT_OK,
                 run_id=self.store.run_id,
@@ -942,7 +945,8 @@ async def run_foreground(
             worktree_manager.decommission(node_id)
 
 
-def _set_final_commit(record: Any, *, commit: str) -> None:
+def _set_done(record: Any, *, commit: str) -> None:
+    record.state = "done"
     record.final_commit = commit
 
 
@@ -1220,14 +1224,16 @@ def _finish_recovered_node(store: RunStore, node_id: str, output: str) -> RunRes
         raise PublicationError(
             "completed node refs do not match the durable output; refusing redispatch"
         )
+    # As in the attempt runner: `run.finished` first, then `done` with `final_commit` in one
+    # write, so `done` never precedes the last event. A crash in between repeats this step.
+    EventLog(store.events_path).append(
+        "run.finished", {"state": "done", "integration_commit": output}
+    )
     record = store.read_run()
     record.state = "done"
     record.final_commit = output
     record.nodes[node_id].recovery_pending = False
     store.write_run(record)
-    EventLog(store.events_path).append(
-        "run.finished", {"state": "done", "integration_commit": output}
-    )
     return RunResult(EXIT_OK, store.run_id, node_id, "done", output, output)
 
 

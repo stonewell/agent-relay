@@ -10,8 +10,9 @@ delivered paths are updated in the working tree and index.
 
 A run that belongs to a session resolves the session's cumulative delivery policy, revalidates
 every carried checkpoint and integration, and checks the whole session delta; it cannot bypass
-them by naming the last round (design section 10). A run with no session link behaves exactly as
-before.
+them by naming the last round (design section 10). A `done` run with no session link is refused
+(exit 1, nothing changed) while its run-lock owner is alive or cannot be checked, before its event
+log is opened: that owner is the log's single writer (design section 6).
 
 Order matters:
 
@@ -76,7 +77,9 @@ from relay.core.delivery import (
     verify_delivery,
 )
 from relay.core.events import EventLog, EventLogCorrupt
-from relay.core.sessions import SessionError, session_guard
+from relay.core.run_purge import owner_state
+from relay.core.runlock import OwnerState
+from relay.core.sessions import SessionError, linked_session, session_guard
 from relay.core.store import RunStore, StoreError
 
 from ..exitcodes import Exit
@@ -120,12 +123,23 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
 
     try:
         store = RunStore.open(repo_root, run_id)  # read-only: never sweeps a live writer's files
-        store.read_run()
+        state = store.read_run().state
     except (StoreError, ValueError, OSError) as exc:
         return _fail(f"relay apply: {exc}", Exit.INVALID, as_json)
 
+    # A run with no session link has no session lock to serialize on: its single writer is the
+    # run-lock owner, which may still be appending to the event log after the record says
+    # `done`. Refuse while that owner is alive or cannot be checked, before the log is opened.
+    # A run that is not `done` keeps its "not done" refusal (exit 2) from preparation, which
+    # never opens the log; `_RunLog` checks the owner again before any first open.
+    headless = linked_session(repo_root, run_id) is None
+    if headless and state == "done":
+        blocker = _owner_blocker(repo_root, run_id)
+        if blocker is not None:
+            return _fail(f"relay apply: {blocker}", Exit.FAILURE, as_json)
+
     op_id = secrets.token_hex(8)
-    log = _RunLog(store)
+    log = _RunLog(store, repo_root=repo_root if headless else None)
     try:
         with session_guard(repo_root, run_id):
             return _apply(
@@ -149,22 +163,44 @@ class _LogUnavailable(RuntimeError):
     """The run's event log cannot be opened; nothing has been changed yet."""
 
 
+def _owner_blocker(repo_root: Path, run_id: str) -> str | None:
+    """Why a headless run's log must not be opened now (its run-lock owner), or None."""
+    state = owner_state(repo_root, run_id)
+    if state is OwnerState.ALIVE:
+        return (
+            f"run {run_id} is still owned by a running relay process; wait for it to finish "
+            "and re-run. Nothing was changed."
+        )
+    if state is OwnerState.UNKNOWN:
+        return (
+            f"the owner of run {run_id} cannot be checked (its run lock is unreadable or "
+            "partly written); nothing was changed"
+        )
+    return None
+
+
 class _RunLog:
     """The run's event log, opened on its first event.
 
     Opening an :class:`EventLog` repairs a torn trailing record (truncating it, or appending a
-    newline), which would corrupt the record a live writer is appending. So the log is opened
-    only once delivery got past its first checks: inside the session guard, for a run that
-    preparation found finished (headless) or whose session lock this command holds. A run
-    that is still running is refused before its log is touched.
+    newline), and appends with the next ``seq``: both corrupt the log while another writer is
+    appending. So the log is opened only by a command that excludes the run's writer: inside
+    the session guard for a session-linked run, and for a headless run only while its run-lock
+    owner is absent or gone -- checked before the command starts and again (`repo_root`)
+    immediately before the first open. A live or uncheckable owner is refused untouched.
     """
 
-    def __init__(self, store: RunStore) -> None:
+    def __init__(self, store: RunStore, *, repo_root: Path | None = None) -> None:
         self._store = store
+        self._repo_root = repo_root
         self._log: EventLog | None = None
 
     def append(self, type_: str, data: dict[str, str]) -> None:
         if self._log is None:
+            if self._repo_root is not None:
+                blocker = _owner_blocker(self._repo_root, self._store.run_id)
+                if blocker is not None:
+                    raise _LogUnavailable(blocker)
             try:
                 generation = self._store.read_run().owner_generation
                 self._log = EventLog(self._store.events_path, owner_generation=generation)

@@ -190,6 +190,7 @@ def test_clean_keeps_the_record_when_a_ref_cannot_be_deleted(
         "scratch",
         "run_directory",
         "refs",
+        "blocked_refs",  # added for blocked run branches (TU21)
         "error",
     }
     assert "ref locked" in entry["error"] and "kept" in entry["run_directory"]["error"]

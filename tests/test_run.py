@@ -17,6 +17,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -180,6 +181,48 @@ def test_success_end_to_end(tmp_path: Path) -> None:
     assert not store.path(f"{NODE}/candidate").exists()
     listed = git(repo, "worktree", "list", "--porcelain")
     assert len([line for line in listed.splitlines() if line.startswith("worktree ")]) == 1
+
+
+def watch_done_publication(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, run_id: str
+) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]]:
+    """(record written at each `run.finished`, every (state, final_commit) written) for a run."""
+    from relay.core.events import EventLog
+    from relay.core.runrecord import RunRecord
+
+    at_finished: list[tuple[str, str | None]] = []
+    written: list[tuple[str, str | None]] = []
+    real_append, real_write = EventLog.append, RunStore.write_run
+
+    def append(self: EventLog, type_: str, data: Any = None, **kwargs: Any) -> Any:
+        if type_ == "run.finished":
+            record = RunStore(repo, run_id).read_run()
+            at_finished.append((record.state, record.final_commit))
+        return real_append(self, type_, data, **kwargs)
+
+    def write_run(self: RunStore, record: RunRecord) -> None:
+        if self.run_id == run_id:
+            written.append((record.state, record.final_commit))
+        real_write(self, record)
+
+    monkeypatch.setattr(EventLog, "append", append)
+    monkeypatch.setattr(RunStore, "write_run", write_run)
+    return at_finished, written
+
+
+def test_done_is_published_after_run_finished_with_its_final_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`done` is never visible before `run.finished` is durable (relay apply relies on it)."""
+    repo = init_repo(tmp_path / "repo")
+    at_finished, written = watch_done_publication(monkeypatch, repo, RUN)
+
+    result = invoke(repo, scenario=Scenario(write={"src/hello.txt": "hello\n"}))
+
+    assert result.exit_code == 0
+    assert at_finished == [("running", None)]  # still running when the last event lands
+    assert ("done", None) not in written  # state and final_commit land in one write
+    assert written[-1] == ("done", result.integration_commit)
 
 
 # --- failures ---------------------------------------------------------------------------------
