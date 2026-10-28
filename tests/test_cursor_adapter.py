@@ -478,12 +478,14 @@ def test_builtin_cursor_agent_is_opt_in_with_the_agent_command(
     assert cursor.cmd == "agent"
 
 
-def test_cursor_is_not_a_default_worker_coordinator_or_progress_source(tmp_path: Path) -> None:
+def test_cursor_is_a_registered_worker_but_not_coordinator_or_progress_source(
+    tmp_path: Path,
+) -> None:
     from relay.core.run import _default_adapters  # pyright: ignore[reportPrivateUsage]
 
     config = load_config(tmp_path, user_config=None).config
     enabled = config.model_copy(update={"agents": {**config.agents, "cursor": agent(cmd="agent")}})
-    assert "cursor" not in _default_adapters(enabled)
+    assert isinstance(_default_adapters(enabled)["cursor"], CursorAdapter)
     adapter = CursorAdapter(agent(), parent_env={})
     assert not hasattr(adapter, "coordinate")
     assert not hasattr(adapter, "coordinator_profile")

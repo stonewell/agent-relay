@@ -196,20 +196,24 @@ def _override_model(model: ModelDecision, agent: Agent, tier: str | None) -> Mod
 
 
 def _default_adapters(config: Config) -> dict[str, AgentAdapter]:
-    """Claude and Codex adapters for the configured agents (design section 7.1).
+    """Claude, Codex and Cursor adapters for the configured agents (design section 7.1).
 
     Imports are local so importing ``relay.core.run`` never drags in adapter modules, and so
-    agents without an adapter here (e.g. the built-in ``gemini``, the disabled ``cursor``) are
-    simply absent from the registry and reported unavailable by the probe below.
+    agents without an adapter here (e.g. the built-in ``gemini``) are simply absent from the
+    registry and reported unavailable by the probe below. ``cursor`` is registered whenever it
+    is configured; it is disabled by default, and routing never selects a disabled agent.
     """
     from relay.adapters.claude import ClaudeAdapter
     from relay.adapters.codex import CodexAdapter
+    from relay.adapters.cursor import CursorAdapter
 
     adapters: dict[str, AgentAdapter] = {}
     if "claude" in config.agents:
         adapters["claude"] = ClaudeAdapter(config.agents["claude"])
     if "codex" in config.agents:
         adapters["codex"] = CodexAdapter(agent=config.agents["codex"])
+    if "cursor" in config.agents:
+        adapters["cursor"] = CursorAdapter(config.agents["cursor"])
     return adapters
 
 
