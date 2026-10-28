@@ -100,7 +100,7 @@ def test_reply_resume_preserves_edits_and_changes_input_key(
     )
 
 
-@pytest.mark.parametrize("arguments", [("green", "--yes"), ("blue", "--revision", "2", "--yes")])
+@pytest.mark.parametrize("arguments", [("", "--yes"), ("blue", "--revision", "2", "--yes")])
 def test_invalid_reply_changes_nothing(
     blocked: tuple[Path, FakeAdapter, RunStore], arguments: tuple[str, ...]
 ) -> None:
@@ -223,5 +223,13 @@ def test_json_approval_and_validation_errors(
     capsys.readouterr()
     assert reply(repo, "blue", "--json") == 7
     assert "--yes" in json.loads(capsys.readouterr().err)["error"]
-    assert reply(repo, "green", "--yes", "--json") == 2
-    assert "invalid option" in json.loads(capsys.readouterr().err)["error"]
+    assert reply(repo, "", "--yes", "--json") == 2
+    assert "answer required" in json.loads(capsys.readouterr().err)["error"]
+
+
+def test_choice_question_accepts_a_custom_answer(
+    blocked: tuple[Path, FakeAdapter, RunStore],
+) -> None:
+    repo, _, store = blocked
+    assert reply(repo, "green", "--yes") == 0
+    assert (store.node_dir("n1") / "input_answers.yaml").exists()

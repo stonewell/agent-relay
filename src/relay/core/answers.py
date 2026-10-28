@@ -53,11 +53,7 @@ def validate_answers(result: ResultSpec, answers: dict[str, AnswerValue]) -> Non
         value = answers.get(question.id)
         if question.required and (value is None or value == "" or value == []):
             raise ValueError(f"answer required for {question.id}")
-        if value is None:
-            continue
-        values = [value] if isinstance(value, str) else value
-        if question.kind == "choice" and any(v not in (question.options or []) for v in values):
-            raise ValueError(f"invalid option for {question.id}")
+        # Choice questions also accept a custom ("other") answer outside `options`.
 
 
 def record_answers(

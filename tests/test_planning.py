@@ -175,8 +175,8 @@ def test_clarification_round_trip_is_a_new_turn(repo: Path) -> None:
             await engine.answer(1, {})
         with pytest.raises(Exception, match="unknown question"):
             await engine.answer(1, {"q1": "a", "zz": "x"})
-        with pytest.raises(Exception, match="options"):
-            await engine.answer(1, {"q1": "c"})
+        with pytest.raises(Exception, match="requires an answer"):
+            await engine.answer(1, {"q2": "x"})  # a custom answer still needs q1 answered
         with pytest.raises(Exception, match="no coordinator question set"):
             await engine.answer(9, {"q1": "a"})
 

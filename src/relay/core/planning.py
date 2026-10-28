@@ -899,9 +899,5 @@ def _validate_answers(
             elif q.required:
                 raise SessionError(f"question {q.id} requires an answer")
             continue
-        if q.kind == "choice":
-            chosen = [value] if isinstance(value, str) else value
-            if any(v not in (q.options or []) for v in chosen):
-                raise SessionError(f"question {q.id}: answer is not one of its options")
-        resolved[q.id] = value
+        resolved[q.id] = value  # a choice question also takes a custom ("other") answer
     return resolved
