@@ -291,6 +291,61 @@ accepted on Windows; Linux and macOS acceptance is still pending. The interactio
 | `clean --purge-runs` reports a blocked `relay/<run>/...` ref and keeps the run | A worktree, possibly your main checkout, has that branch checked out. Switch it to another branch, then repeat the purge. |
 | Interrupted or failed run | Use the recovery walkthrough above; the recorded attempt count is retained. |
 
+## Local completion gateway
+
+Install the optional server dependencies and start the foreground service:
+
+```sh
+uv sync --extra serve
+uv run --extra serve relay serve
+```
+
+The default listener is `http://127.0.0.1:8765/v1`; `--host ::1` selects IPv6 loopback.
+Only loopback listeners are supported. `serve` needs no Git repository and loads built-in
+and user configuration once, without the current project's `.agents/agents.yaml`.
+`--concurrency`, `--timeout`, `--max-request-bytes` and `--max-output-bytes` control admission
+and request resource limits. Stop the foreground process with Ctrl+C.
+
+The gateway offers each qualified agent's CLI model aliases as `<agent>/<alias>` (for example
+`claude/opus`), plus `<agent>` for the first alias and `relay/auto`. The default aliases are
+`default` (the CLI's own default model), `sonnet`, `opus` and `fable`; repeat `--model ALIAS`
+to choose others. The Claude CLI has no model-listing command, so model ids and limits are
+discovered from the CLI itself: on the first `/v1/models` request (never at startup) each alias
+is probed once with a minimal prompt, and the model the CLI reports running, with its context
+window and output limit, is cached in `~/.config/relay/gateway-models.json` for that CLI
+version and configuration. **Each probe is a short billed model call.** An alias whose probe
+fails is not listed; it can still be requested by id.
+
+Set `RELAY_GATEWAY_TOKEN` before startup to choose the bearer token. Otherwise the server
+generates a token and prints it once on stderr. Supply that same token to client processes
+through their environment; the gateway never writes it into project files. For example,
+in a second PowerShell terminal:
+
+```powershell
+$env:RELAY_GATEWAY_TOKEN = '<token from the server terminal>'
+uv run relay opencode-config --base-url http://127.0.0.1:8765/v1 --refresh
+```
+
+On POSIX shells, use `export RELAY_GATEWAY_TOKEN='<token>'` before starting OpenCode.
+`opencode-config` builds the same catalog as `serve` locally (it does not contact the server
+or need the token) and prints a `provider.relay` JSON snippet with an environment reference for
+the token. Without `--refresh` it reads only cached discoveries and makes no model call; models
+not yet discovered are left out and named on stderr with a hint to rerun with `--refresh`, which
+probes every alias (billed) and updates the shared cache. Pass the same `--model` options given
+to `serve`; `--timeout` bounds each probe (default 120 s). Review and merge the snippet into
+your OpenCode configuration yourself. It includes only models with CLI-reported context/output
+limits and enables tool calling only when advertised by the qualified profile.
+The configuration fields follow the [OpenCode provider documentation](https://opencode.ai/docs/providers/)
+and its [environment substitution syntax](https://opencode.ai/docs/config/#env-vars).
+
+This build includes one reviewed plain-text profile for Claude Code 2.1.312 on Windows with
+subscription authentication and an exact configuration fingerprint. Text models appear only
+when that profile matches; other installations/configurations remain unavailable. Client tool
+calling is not qualified, so generated OpenCode models have `tool_call: false`; their limits are
+those the CLI reported during discovery. See the [gateway qualification guide](docs/gateway-qualification.md)
+for the observed evidence and qualification procedure. Pinned OpenCode acceptance remains a
+release gate; installing the CLI alone does not establish compatibility.
+
 ## Layout
 
 | Path | Contents |

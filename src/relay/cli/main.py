@@ -14,7 +14,7 @@ from relay import __version__
 from .commands import agents as agents_command
 from .commands import apply as apply_command
 from .commands import clean as clean_command
-from .commands import doctor, result, routes, run, status
+from .commands import doctor, opencode_config, result, routes, run, serve, status
 from .commands import graph as graph_command
 from .commands import input as input_command
 from .commands import tui as tui_command
@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_parser(commands)
     graph_command.add_parsers(commands)
     tui_command.add_parser(commands)
+    serve.add_parser(commands)
+    opencode_config.add_parser(commands)
     for name in COMMAND_PHASE:
         if name not in IMPLEMENTED:
             stub = commands.add_parser(name, add_help=False)
@@ -85,6 +87,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _dispatch(args: argparse.Namespace, repo_root: Path) -> int:
+    if args.command == "serve":
+        return serve.run(args, repo_root)
+    if args.command == "opencode-config":
+        return opencode_config.run(args, repo_root)
     if args.command in ("graph", "plan", "cancel"):
         return graph_command.run(args, repo_root)
     if args.command == "resume" and args.session is not None:

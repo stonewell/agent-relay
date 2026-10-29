@@ -20,7 +20,8 @@ COMMAND_PHASE: dict[str, int] = {
     "graph": 2,
     "cancel": 2,
     "tui": 2,
-    "opencode-config": 3,
+    "serve": 5,
+    "opencode-config": 5,
     "replay": 4,
 }
 
@@ -40,14 +41,23 @@ IMPLEMENTED = {
     "run",
     "status",
     "tui",
+    "serve",
+    "opencode-config",
 }
 """Commands whose handler exists in this build; grows with the phase 1 tasks."""
+
+EARLY_ACCESS = frozenset({"serve", "opencode-config"})
+"""Later-phase commands shipped ahead of their phase gate.
+
+The standalone phase-5 gateway (milestone M7) is independent of the phase 2b-4 work, so its
+commands are usable now without raising `CURRENT_PHASE` for every other later-phase feature.
+"""
 
 
 def availability_error(command: str) -> str | None:
     """A clear error if `command` is not available yet, else None."""
     phase = COMMAND_PHASE[command]
-    if phase > CURRENT_PHASE:
+    if phase > CURRENT_PHASE and command not in EARLY_ACCESS:
         return f"relay {command}: available from phase {phase}"
     if command not in IMPLEMENTED:
         return (
