@@ -393,6 +393,16 @@ def test_review_results_are_shown_when_a_read_only_round_finishes(repo: Path) ->
         )
         detail = await svc.node_detail("r")
         assert "FINDING: run.py:1088" in detail.report
+        # A finished round does not pin the session: switching to a new one works.
+        first = app.view_state.session_id if app.view_state else None
+        await pilot.press("f7")
+        await until(pilot, lambda: isinstance(app.screen, SessionsScreen))
+        await highlight(pilot, "sessions", "new")
+        await pilot.press("enter")
+        await until(
+            pilot,
+            lambda: app.view_state is not None and app.view_state.session_id not in (None, first),
+        )
         await pilot.press("ctrl+q")
 
     drive(repo, svc, WIDE, body)
