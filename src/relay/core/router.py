@@ -112,6 +112,17 @@ def _fallback_order(config: Config, name: str) -> tuple[int, int]:
     return (1, tuple(config.agents).index(name))
 
 
+def score_candidate(
+    name: str,
+    agent: Agent,
+    classification: Classification,
+    load: Mapping[str, int],
+    recent_failures: Mapping[str, int],
+) -> float:
+    """Rank a prequalified candidate without applying task permission filters."""
+    return _score(name, agent, classification, load, recent_failures)
+
+
 def _pick_reason(
     name: str,
     agent: Agent,

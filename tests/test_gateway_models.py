@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import threading
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from relay.adapters.completion import (
+    DEFAULT_MODEL_ALIASES,
+    CompletionProfile,
+    CompletionRequest,
+    CompletionResult,
+    CompletionSupport,
+    ObservedModel,
+    model_aliases,
+)
+from relay.core.registry import Config
+from relay.gateway.discovery import PROBE_PROMPT
+from relay.gateway.models import ModelCatalog
+from relay.gateway.protocol import GatewayError, parse_request
+
+OBSERVED = {
+    "default": ObservedModel("m-default", 200000, 32000),
+    "opus": ObservedModel("m-opus", 100000, 10000),
+}
+
+
+class FakeBackend:
+    """Completion fake; discovery probes are answered from `limits` and kept out of `calls`."""
+
+    def __init__(self, name: str = "fake", *, tools: bool = True) -> None:
+        self.id = name
+        self.support: CompletionSupport | None = CompletionSupport(
+            CompletionProfile(name, "test", "test", "test", "test"), supports_tools=tools
+        )
+        self.calls: list[CompletionRequest] = []
+        self.probes: list[str] = []
+        self.limits: dict[str, ObservedModel] = dict(OBSERVED)
+        self.results = [CompletionResult(content="hello\n雪", raw="hello\n雪")]
+
+    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport | None:
+        return self.support
+
+    def complete(
+        self,
+        request: CompletionRequest,
+        *,
+        cwd: Path,
+        cancel: threading.Event,
+        timeout_s: float,
+        max_output_bytes: int,
+    ) -> CompletionResult:
+        assert cwd.is_dir()
+        if request.prompt == PROBE_PROMPT:
+            self.probes.append(request.model)
+            return CompletionResult(content="OK", observed=self.limits.get(request.model))
+        self.calls.append(request)
+        return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+
+
+def configuration() -> Config:
+    return Config.model_validate(
+        {
+            "version": 1,
+            "agents": {
+                "fake": {
+                    "cmd": "never-called",
+                    "models": {"deep": "m/deep", "fast": "m/fast"},
+                    "model_routing": {"default": {"model": "deep", "effort": "high"}},
+                }
+            },
+        }
+    )
+
+
+def observed_catalog(config: Config, adapters: dict[str, FakeBackend]) -> ModelCatalog:
+    catalog = ModelCatalog(config, adapters)
+    catalog.observe(probe=True)
+    return catalog
+
+
+def test_alias_ids_bare_default_and_pinning() -> None:
+    backend = FakeBackend()
+    catalog = ModelCatalog(configuration(), {"fake": backend})
+    assert set(catalog.models) == {"fake", *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES)}
+    request = parse_request(
+        {"model": "fake/sonnet", "messages": [{"role": "user", "content": "x"}]}
+    )
+    # Routing needs no discovery and does not probe; registry tiers are not gateway models.
+    assert catalog.candidates(request)[0].model == "sonnet"
+    request.model = "fake"
+    assert catalog.candidates(request)[0].model == "default"
+    assert catalog.candidates(request)[0].effort is None
+    request.model = "fake/deep"
+    with pytest.raises(GatewayError, match="unknown model"):
+        catalog.candidates(request)
+    with pytest.raises(GatewayError, match="unknown model"):
+        catalog.public("nope")
+    assert backend.probes == [] and backend.calls == []
+
+
+def test_listing_advertises_only_observed_limits() -> None:
+    backend = FakeBackend()
+    catalog = ModelCatalog(configuration(), {"fake": backend})
+    # Nothing is advertised before discovery: limits are never null and never invented.
+    assert catalog.listing() == {"object": "list", "data": []}
+    assert catalog.state("fake/opus") == "undiscovered"
+    catalog.observe(probe=True)
+    assert backend.probes == list(DEFAULT_MODEL_ALIASES)
+    listing = {entry["id"]: entry["relay"] for entry in catalog.listing()["data"]}
+    assert set(listing) == {"fake", "fake/default", "fake/opus", "relay/auto"}
+    assert listing["fake/opus"]["resolved_model"] == "fake/m-opus"
+    assert listing["fake/opus"]["model_alias"] == "opus"
+    assert (listing["fake/opus"]["context_length"], listing["fake/opus"]["max_output_tokens"]) == (
+        100000,
+        10000,
+    )
+    assert listing["fake"]["resolved_model"] == "fake/m-default"
+    assert all(value["context_length"] and value["max_output_tokens"] for value in listing.values())
+    assert catalog.state("fake/sonnet") == "failed"
+    with pytest.raises(GatewayError, match="unknown model"):
+        catalog.public("fake/sonnet")
+    # Tried aliases are not probed again by the same catalog.
+    catalog.observe(probe=True)
+    assert backend.probes == list(DEFAULT_MODEL_ALIASES)
+
+
+def test_configured_aliases_replace_defaults_and_are_validated() -> None:
+    catalog = ModelCatalog(configuration(), {"fake": FakeBackend()}, ["opus", "opus", "haiku"])
+    assert catalog.aliases == ("opus", "haiku")
+    assert set(catalog.models) == {"fake", "fake/opus", "fake/haiku"}
+    assert catalog.models["fake"].model == "opus"
+    for bad in ("", "-p", "--dangerously-skip-permissions", "has space", "a/b"):
+        with pytest.raises(ValueError, match="invalid model alias"):
+            model_aliases([bad])
+    with pytest.raises(ValueError, match="at least one"):
+        model_aliases([])
+    assert model_aliases() == DEFAULT_MODEL_ALIASES
+
+
+def test_unqualified_backends_never_advertised_or_probed() -> None:
+    backend = FakeBackend()
+    backend.support = None
+    catalog = ModelCatalog(configuration(), {"fake": backend})
+    catalog.observe(probe=True)
+    assert catalog.listing() == {"object": "list", "data": []}
+    assert backend.probes == []
+
+
+def test_native_output_limits_fail_closed() -> None:
+    catalog = observed_catalog(configuration(), {"fake": FakeBackend()})
+    request = parse_request(
+        {
+            "model": "fake",
+            "messages": [{"role": "user", "content": "x"}],
+            "max_completion_tokens": 10,
+        }
+    )
+    with pytest.raises(GatewayError) as caught:
+        catalog.candidates(request)
+    assert caught.value.param == "max_completion_tokens"
+
+
+def test_observed_output_limit_rejected_and_auto_filters_candidates() -> None:
+    backend = FakeBackend()
+    assert backend.support is not None
+    backend.support = replace(backend.support, native_max_tokens=True)
+    catalog = observed_catalog(configuration(), {"fake": backend})
+    request = parse_request(
+        {
+            "model": "fake/opus",
+            "messages": [{"role": "user", "content": "x"}],
+            "max_completion_tokens": 10001,
+        }
+    )
+    with pytest.raises(GatewayError, match="observed model limit") as caught:
+        catalog.candidates(request)
+    assert caught.value.param == "max_completion_tokens"
+    request.model = "relay/auto"
+    request.max_completion_tokens = 32001
+    with pytest.raises(GatewayError):
+        catalog.candidates(request)
+    request.max_completion_tokens = 32000
+    assert catalog.candidates(request)[0].agent == "fake"
+
+
+def test_auto_reports_minimum_observed_limits_or_is_omitted() -> None:
+    config = configuration()
+    config.agents["other"] = config.agents["fake"].model_copy(deep=True)
+    other = FakeBackend("other")
+    other.limits = {"default": ObservedModel("o-default", 50000, 64000)}
+    catalog = observed_catalog(config, {"fake": FakeBackend(), "other": other})
+    auto = catalog.public("relay/auto")["relay"]
+    assert (auto["context_length"], auto["max_output_tokens"]) == (50000, 32000)
+    other.limits = {}
+    catalog = observed_catalog(config, {"fake": FakeBackend(), "other": other})
+    assert "relay/auto" not in {entry["id"] for entry in catalog.listing()["data"]}
+    assert catalog.state("relay/auto") == "failed"
+
+
+def test_auto_classifies_and_filters_only_qualified_capabilities() -> None:
+    config = configuration()
+    config.agents["fake"].categories = ["docs-for-code"]
+    config.agents["debugger"] = config.agents["fake"].model_copy(deep=True)
+    config.agents["debugger"].categories = ["bugfix"]
+    catalog = ModelCatalog(
+        config, {"fake": FakeBackend(tools=True), "debugger": FakeBackend("debugger", tools=False)}
+    )
+    request = parse_request(
+        {
+            "model": "relay/auto",
+            "messages": [{"role": "user", "content": "fix this crash regression"}],
+        }
+    )
+    assert catalog.candidates(request)[0].agent == "debugger"
+    request = parse_request(
+        {
+            "model": "relay/auto",
+            "messages": [{"role": "user", "content": "fix this crash regression"}],
+            "tools": [
+                {"type": "function", "function": {"name": "edit", "parameters": {"type": "object"}}}
+            ],
+        }
+    )
+    assert [model.agent for model in catalog.candidates(request)] == ["fake"]

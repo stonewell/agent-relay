@@ -1,0 +1,453 @@
+"""Optional FastAPI transport for the stateless completion service."""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import ipaddress
+import json
+import time
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
+from http import HTTPStatus
+from typing import Any
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException
+from starlette.responses import JSONResponse as StarletteJSONResponse
+from starlette.responses import Response, StreamingResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from relay.adapters.completion import (
+    CompletionCapable,
+    CompletionError,
+    CompletionInvalid,
+    CompletionRequest,
+    CompletionResult,
+)
+from relay.core.registry import Config
+
+from .discovery import ModelCache, default_adapters
+from .envelope import EnvelopeError, prepare_envelope, validate_envelope
+from .models import ModelCatalog
+from .protocol import GatewayError, parse_request
+from .render import render_transcript
+from .runtime import CompletionHandle, GatewayLimits, GatewayRuntime
+from .sse import completion_response, event, response_events
+
+__all__ = ["GatewayLimits", "create_app"]
+KEEPALIVE_INTERVAL = 15.0
+TRANSPORT_CHUNK_BYTES = 16384
+HTTP_MESSAGES = {404: "route not found", 405: "method not allowed"}
+
+
+class JSONResponse(StarletteJSONResponse):
+    """Bound transport buffering so admission also bounds slow-reader memory."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await send(
+            {"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers}
+        )
+        for offset in range(0, len(self.body), TRANSPORT_CHUNK_BYTES):
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": self.body[offset : offset + TRANSPORT_CHUNK_BYTES],
+                    "more_body": True,
+                }
+            )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if self.background is not None:
+            await self.background()
+
+
+def _local(host: str | None) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return bool(host and ipaddress.ip_address(host).is_loopback)
+    except ValueError:
+        return False
+
+
+class BoundaryMiddleware:
+    """Authenticate and bound raw body bytes before routing or JSON decoding."""
+
+    def __init__(self, app: ASGIApp, *, token: str, max_bytes: int, timeout_s: float) -> None:
+        self.app, self.token, self.max_bytes = app, token, max_bytes
+        self.timeout_s = timeout_s
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers: dict[bytes, list[bytes]] = {}
+        for key, value in scope["headers"]:
+            headers.setdefault(key.lower(), []).append(value)
+        error: GatewayError | None = None
+        host = headers.get(b"host", [])
+        try:
+            parsed = urlsplit("//" + host[0].decode("ascii")) if len(host) == 1 else None
+            if (
+                (
+                    parsed is None
+                    or not _local(parsed.hostname)
+                    or parsed.username is not None
+                    or parsed.path
+                    or parsed.query
+                    or parsed.fragment
+                )
+                or parsed.port is not None
+                and not 0 < parsed.port <= 65535
+            ):
+                error = GatewayError(400, "invalid loopback Host header")
+        except (ValueError, UnicodeError):
+            error = GatewayError(400, "invalid loopback Host header")
+        origins = headers.get(b"origin", [])
+        if origins:
+            try:
+                origin = urlsplit(origins[0].decode("ascii"))
+                if (
+                    len(origins) != 1
+                    or origin.scheme not in {"http", "https"}
+                    or not _local(origin.hostname)
+                    or origin.username is not None
+                    or origin.path
+                    or origin.query
+                    or origin.fragment
+                ):
+                    error = GatewayError(403, "non-local browser origin forbidden")
+            except (ValueError, UnicodeError):
+                error = GatewayError(403, "invalid browser origin")
+        path = scope["path"]
+        if path == "/v1" or path.startswith("/v1/"):
+            auth = headers.get(b"authorization", [])
+            expected = ("Bearer " + self.token).encode("utf-8")
+            if len(auth) != 1 or not hmac.compare_digest(auth[0], expected):
+                error = GatewayError(
+                    401, "invalid authentication credentials", code="invalid_api_key"
+                )
+        if error:
+            response = JSONResponse(error.body(), status_code=error.status)
+            await response(scope, receive, send)
+            return
+        body = bytearray()
+        body_deadline = time.monotonic() + self.timeout_s
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    receive(), timeout=max(0.001, body_deadline - time.monotonic())
+                )
+            except TimeoutError:
+                response = JSONResponse(
+                    GatewayError(504, "request body deadline exceeded").body(), status_code=504
+                )
+                await response(scope, receive, send)
+                return
+            if message["type"] == "http.disconnect":
+                return
+            body.extend(message.get("body", b""))
+            if len(body) > self.max_bytes:
+                response = JSONResponse(
+                    GatewayError(413, "request body too large").body(), status_code=413
+                )
+                await response(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        delivered = False
+
+        async def buffered_receive() -> Any:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        started = False
+        is_sse = False
+
+        async def tracked_send(message: Any) -> None:
+            nonlocal started, is_sse
+            if message["type"] == "http.response.start":
+                started = True
+                is_sse = any(
+                    key.lower() == b"content-type" and value.startswith(b"text/event-stream")
+                    for key, value in message.get("headers", [])
+                )
+            await send(message)
+
+        try:
+            async with asyncio.timeout(self.timeout_s):
+                await self.app(scope, buffered_receive, tracked_send)
+        except TimeoutError:
+            failure = GatewayError(504, "request deadline exceeded", code="deadline_exceeded")
+            if not started:
+                await JSONResponse(failure.body(), status_code=504)(scope, receive, send)
+            elif is_sse:
+                # A slow/disconnected socket may also prevent delivery of this terminal error.
+                with suppress(TimeoutError, OSError):
+                    await asyncio.wait_for(
+                        send(
+                            {
+                                "type": "http.response.body",
+                                "body": event(failure.body()),
+                                "more_body": False,
+                            }
+                        ),
+                        timeout=1,
+                    )
+            else:
+                # A partial non-streaming body cannot be replaced with another JSON
+                # response. Let the server close the incomplete HTTP transport.
+                raise
+        finally:
+            cleanup = scope.get("relay.cleanup")
+            if cleanup is not None:
+                await cleanup()
+
+
+def create_app(
+    config: Config,
+    *,
+    token: str,
+    limits: GatewayLimits | None = None,
+    host: str = "127.0.0.1",
+    adapters: Mapping[str, CompletionCapable] | None = None,
+    catalog: ModelCatalog | None = None,
+    runtime: GatewayRuntime | None = None,
+    models: Sequence[str] | None = None,
+    model_cache: ModelCache | None = None,
+) -> FastAPI:
+    """Build the gateway app; ``model_cache=None`` keeps discovered limits in memory only."""
+    if not _local(host) or host == "localhost":
+        raise ValueError("gateway listener must be a loopback IP address")
+    if not token:
+        raise ValueError("gateway token must not be empty")
+    limits = limits or GatewayLimits(
+        concurrency=config.defaults.concurrency, timeout_s=config.defaults.timeout_s
+    )
+    runtime = runtime or GatewayRuntime(
+        limits,
+        {
+            name: agent.concurrency or config.defaults.concurrency
+            for name, agent in config.agents.items()
+        },
+    )
+    if adapters is None:
+        adapters = default_adapters(config)
+    # Non-billable inspect() profile checks are synchronous and happen once before the server
+    # event loop. Billed model discovery is lazy: it starts on the first /v1/models request.
+    catalog = catalog or ModelCatalog(config, adapters, models, model_cache)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        try:
+            yield
+        finally:
+            await catalog.close()
+            await runtime.shutdown()
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.catalog, app.state.runtime = catalog, runtime
+    app.add_middleware(
+        BoundaryMiddleware,
+        token=token,
+        max_bytes=limits.max_request_bytes,
+        timeout_s=limits.timeout_s,
+    )
+
+    @app.exception_handler(GatewayError)
+    async def gateway_error(_request: Request, exc: GatewayError) -> JSONResponse:
+        headers = {"Retry-After": "1"} if exc.status == 429 else None
+        return JSONResponse(exc.body(), status_code=exc.status, headers=headers)
+
+    @app.exception_handler(CompletionError)
+    async def completion_error(_request: Request, exc: CompletionError) -> JSONResponse:
+        return await gateway_error(
+            _request, GatewayError(exc.status, str(exc), exc.param, exc.code)
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
+        # Fixed messages only: framework detail strings never cross the API boundary.
+        try:
+            message = HTTP_MESSAGES.get(exc.status_code) or HTTPStatus(exc.status_code).phrase
+        except ValueError:
+            message = "request failed"
+        error = GatewayError(exc.status_code, message.lower())
+        # Preserve framework headers such as Allow on 405 responses.
+        return JSONResponse(error.body(), status_code=error.status, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        return await gateway_error(_request, GatewayError(400, "invalid request"))
+
+    @app.exception_handler(Exception)
+    async def internal_error(_request: Request, _exc: Exception) -> JSONResponse:
+        return await gateway_error(
+            _request,
+            GatewayError(
+                500, "internal gateway error", code="internal_error", error_type="server_error"
+            ),
+        )
+
+    @app.get("/healthz")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    async def discover() -> None:
+        # A quarantined gateway launches no further probes; it serves what is already known.
+        if runtime.healthy:
+            await catalog.discover(runtime)
+
+    @app.get("/v1/models")
+    async def list_models() -> dict[str, Any]:
+        await discover()
+        return catalog.listing()
+
+    @app.get("/v1/models/{model_id:path}")
+    async def get_model(model_id: str) -> dict[str, Any]:
+        if model_id != "relay/auto" and model_id not in catalog.models:
+            raise GatewayError(404, "unknown model", "model", "model_not_found")
+        await discover()
+        return catalog.public(model_id)
+
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request) -> Response:
+        try:
+            payload = json.loads(
+                await request.body(),
+                parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON")),
+            )
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise GatewayError(400, "invalid JSON request body") from exc
+        parsed = parse_request(payload)
+        schema = prepare_envelope(parsed)
+        candidates = catalog.candidates(parsed)
+        model = candidates[0]
+        handle: CompletionHandle | None = None
+
+        def validate(result: CompletionResult) -> CompletionResult:
+            if schema is None:
+                if result.content is None:
+                    raise CompletionError("completion has no assistant text")
+                try:
+                    result.content.encode("utf-8", errors="strict")
+                except UnicodeEncodeError as exc:
+                    raise CompletionError("completion contains invalid Unicode") from exc
+                return result
+            raw = json.dumps(result.envelope) if result.envelope is not None else result.raw
+            try:
+                content, calls = validate_envelope(raw, parsed, schema)
+            except EnvelopeError as exc:
+                raise CompletionInvalid(str(exc), raw=raw, usage=result.usage) from exc
+            return replace(
+                result, content=content, envelope={"content": content, "tool_calls": calls}
+            )
+
+        for model in candidates:
+            invocation = CompletionRequest(
+                render_transcript(parsed, model.model, model.effort),
+                model.model,
+                model.effort,
+                schema,
+                parsed.output_tokens,
+            )
+            try:
+                handle = runtime.start(model.adapter, invocation, validate=validate)
+                break
+            except CompletionError as exc:
+                if exc.status != 429 or parsed.model != "relay/auto":
+                    raise
+        if handle is None:
+            raise GatewayError(429, "completion capacity exhausted", code="rate_limit_exceeded")
+        completion_id, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
+        headers = {"X-Relay-Resolved-Model": f"{model.agent}/{model.model}"}
+        ignored = [key for key in ("temperature", "top_p") if getattr(parsed, key) is not None]
+        if ignored:
+            headers["X-Relay-Ignored-Parameters"] = ", ".join(ignored)
+
+        async def disconnected() -> None:
+            while not await request.is_disconnected():
+                await asyncio.sleep(0.05)
+            handle.cancel()
+            await handle.drain()
+
+        watcher = asyncio.create_task(disconnected())
+
+        async def cleanup() -> None:
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
+            if not handle.result.done():
+                handle.cancel()
+            await handle.drain()
+
+        request.scope["relay.cleanup"] = cleanup
+
+        def final(result: CompletionResult) -> dict[str, Any]:
+            calls: list[dict[str, Any]] = result.envelope["tool_calls"] if result.envelope else []
+            return completion_response(
+                completion_id,
+                created,
+                parsed.model,
+                result.content,
+                calls,
+                result.finish_reason,
+                result.usage.as_openai() if result.usage else None,
+            )
+
+        if not parsed.stream:
+            try:
+                result = await asyncio.shield(handle.result)
+                return JSONResponse(final(result), headers=headers)
+            except BaseException:
+                await cleanup()
+                raise
+        # Keep failures before the first keepalive as ordinary HTTP errors.
+        try:
+            done, _pending = await asyncio.wait({handle.result}, timeout=KEEPALIVE_INTERVAL)
+            if done:
+                result = handle.result.result()
+                buffered = final(result)
+            else:
+                buffered = None
+        except BaseException:
+            await cleanup()
+            raise
+
+        # StreamingResponse is the sole consumer of disconnect notifications once
+        # headers are handed to it; competing receive calls can lose disconnects.
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+
+        async def stream() -> AsyncIterator[bytes]:
+            try:
+                response = buffered
+                if response is None:
+                    while not handle.result.done():
+                        yield b": keepalive\n\n"
+                        await asyncio.wait({handle.result}, timeout=KEEPALIVE_INTERVAL)
+                    response = final(handle.result.result())
+                include_usage = bool(parsed.stream_options and parsed.stream_options.include_usage)
+                for data in response_events(response, include_usage):
+                    for offset in range(0, len(data), TRANSPORT_CHUNK_BYTES):
+                        yield data[offset : offset + TRANSPORT_CHUNK_BYTES]
+            except CompletionError as exc:
+                yield event(GatewayError(exc.status, str(exc), exc.param, exc.code).body())
+            finally:
+                await cleanup()
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={**headers, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    return app
