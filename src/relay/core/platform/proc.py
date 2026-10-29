@@ -53,6 +53,10 @@ class OutputLimitExceeded(RuntimeError):
     """Captured output passed its configured limit; the process tree was stopped."""
 
 
+class ProcessDrainError(RuntimeError):
+    """A child or inherited pipe remains alive after the termination/drain grace period."""
+
+
 class CommandNotFound(FileNotFoundError):
     """A command could not be resolved to an executable (design section 7.2)."""
 
@@ -419,13 +423,35 @@ def _posix_killer(popen: subprocess.Popen[str]) -> Callable[[], None]:
     return kill_tree
 
 
-def _windows_killer(popen: subprocess.Popen[str], job: int | None) -> Callable[[], None]:
+class _JobHandle:
+    """A Job Object handle that is never used after (or concurrently with) its close.
+
+    A pump thread may still call ``kill_tree`` after the supervisor closed the job; a closed
+    handle value can be reused by the OS for an unrelated object, so it must not be touched.
+    """
+
+    def __init__(self, handle: int) -> None:
+        self._handle: int | None = handle
+        self._lock = threading.Lock()
+
+    def terminate(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                _terminate_job(self._handle)
+
+    def close(self) -> None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+            _close_job(handle)
+
+
+def _windows_killer(popen: subprocess.Popen[str], job: _JobHandle | None) -> Callable[[], None]:
     def kill_tree() -> None:
-        if popen.returncode is not None:
-            return
         if job is not None:
-            _terminate_job(job)
-        else:
+            # Descendants can retain pipes after the leader exits. Once the job is closed,
+            # kill-on-close has already terminated every member, so this becomes a no-op.
+            job.terminate()
+        elif popen.returncode is None:
             # Job assignment failed (e.g. nested-job limits): kill the direct child only.
             with contextlib.suppress(OSError):
                 popen.terminate()
@@ -536,17 +562,31 @@ def _stream_pump(
     forward: OutputSink | None,
 ) -> None:
     """Drain one pipe line by line: bounded capture first, best-effort forwarding second."""
-    with contextlib.suppress(OSError, ValueError):
-        for line in iter(stream.readline, ""):
-            counter[0] += len(line.encode("utf-8", errors="replace"))
-            if counter[0] > limit:
-                overflow.set()
-                kill()
-                return
-            chunks.append(line)
-            if forward is not None:
-                with contextlib.suppress(Exception):  # a bad sink must never stall draining
-                    forward(line)
+    pending: list[str] = []
+    try:
+        with contextlib.suppress(OSError, ValueError):
+            while True:
+                # readline() without a size allocates an arbitrarily large unterminated line.
+                part = stream.readline(min(65536, max(1, limit - counter[0] + 1)))
+                if not part:
+                    return
+                counter[0] += len(part.encode("utf-8", errors="replace"))
+                if counter[0] > limit:
+                    overflow.set()
+                    kill()
+                    return
+                chunks.append(part)
+                if forward is not None:
+                    pending.append(part)
+                    if part.endswith("\n"):
+                        with contextlib.suppress(Exception):  # a bad sink must never stall
+                            forward("".join(pending))
+                        pending.clear()
+    finally:
+        # EOF, a pipe error or overflow: forward the captured unterminated tail exactly once.
+        if pending and forward is not None:
+            with contextlib.suppress(Exception):
+                forward("".join(pending))
 
 
 def _stream_run(
@@ -608,9 +648,12 @@ def _stream_run(
             thread.join(timeout=2.0)
         if any(thread.is_alive() for thread in threads):
             self.kill_tree()  # a descendant still holds a pipe open
+        self._close()  # pyright: ignore[reportPrivateUsage]
+        if any(thread.is_alive() for thread in threads):
             for thread in threads:
                 thread.join(timeout=2.0)
-        self._close()  # pyright: ignore[reportPrivateUsage]
+        if any(thread.is_alive() for thread in threads):
+            raise ProcessDrainError("process pipes did not drain after tree termination")
     if overflow.is_set():
         raise OutputLimitExceeded(
             f"agent output exceeded the {max_bytes}-byte capture limit; the attempt was stopped"
@@ -665,7 +708,8 @@ def _spawn(
             popen.communicate()
             _close_job(job)
             raise OSError(f"could not attach process {popen.pid} to a Job Object")
-        return SupervisedProcess(popen, _windows_killer(popen, job), lambda: _close_job(job))
+        owned = _JobHandle(job)
+        return SupervisedProcess(popen, _windows_killer(popen, owned), owned.close)
     popen = subprocess.Popen(
         argv,
         cwd=str(cwd),
