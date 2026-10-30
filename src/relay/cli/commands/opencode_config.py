@@ -64,7 +64,11 @@ def validate_base_url(value: str) -> tuple[str, str, int]:
 
 
 def provider_config(
-    catalog: object, base_url: str, omitted: list[str] | None = None
+    catalog: object,
+    base_url: str,
+    omitted: list[str] | None = None,
+    *,
+    effort_models: set[str] | None = None,
 ) -> dict[str, object]:
     """Build the provider snippet; models without observed limits are listed without one."""
     if not isinstance(catalog, dict):
@@ -87,10 +91,11 @@ def provider_config(
         model: dict[str, object] = {
             "name": model_id,
             "tool_call": metadata.get("supports_tools") is True,
-            "variants": {
-                effort: {"reasoningEffort": effort} for effort in ("low", "medium", "high")
-            },
         }
+        if effort_models is None or model_id in effort_models:
+            model["variants"] = {
+                effort: {"reasoningEffort": effort} for effort in ("low", "medium", "high")
+            }
         if type(context) is int and type(output) is int and context > 0 and output > 0:
             model["limit"] = {"context": context, "output": output}
         # Unprobed models keep their entry: OpenCode falls back to its own default limits.
@@ -133,7 +138,14 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         except CompletionTerminationError:
             raise ValueError("a model probe's process termination could not be confirmed") from None
         invalid: list[str] = []
-        snippet = provider_config(catalog.listing(), base_url, invalid)
+        effort_models = {
+            name
+            for name, model in catalog.models.items()
+            if model.support.supports_reasoning_effort
+        }
+        if any(model.support.supports_reasoning_effort for model in catalog.defaults):
+            effort_models.add("relay/auto")
+        snippet = provider_config(catalog.listing(), base_url, invalid, effort_models=effort_models)
     except ValueError as exc:
         return report_error(f"relay opencode-config: {exc}", Exit.INVALID, args.json)
     if not catalog.defaults:

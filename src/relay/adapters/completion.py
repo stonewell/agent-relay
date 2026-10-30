@@ -48,6 +48,7 @@ class CompletionSupport:
     profile: CompletionProfile
     supports_tools: bool = False
     native_max_tokens: bool = False
+    supports_reasoning_effort: bool = True
 
 
 @dataclass(frozen=True)

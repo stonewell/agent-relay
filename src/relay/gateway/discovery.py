@@ -15,7 +15,7 @@ optional HTTP stack.
 from __future__ import annotations
 
 import json
-import sys
+import logging
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -39,16 +39,17 @@ PROBE_TIMEOUT_S = 120.0
 PROBE_OUTPUT_BYTES = 1024 * 1024
 CACHE_SCHEMA = 1
 CACHE_LIMIT = 1024 * 1024
+logger = logging.getLogger("uvicorn.error")
 
 
-def report_probe_failure(
-    adapter: CompletionCapable, alias: str, error: BaseException
-) -> None:
+def report_probe_failure(adapter: CompletionCapable, alias: str, error: BaseException) -> None:
     """Probes only refresh metadata, so their failure is reported here instead of failing a call."""
-    print(
-        f"relay serve: probe of {adapter.id}/{alias} failed: {type(error).__name__}: {error}",
-        file=sys.stderr,
-        flush=True,
+    logger.warning(
+        "relay serve: probe of %s/%s failed: %s: %s; continuing with remaining models",
+        adapter.id,
+        alias,
+        type(error).__name__,
+        error,
     )
 
 
@@ -60,12 +61,18 @@ def default_cache_path() -> Path:
 def default_adapters(config: Config) -> dict[str, CompletionCapable]:
     from relay.adapters.agy_completion import AgyCompletionAdapter
     from relay.adapters.claude_completion import ClaudeCompletionAdapter
+    from relay.adapters.codex_completion import CodexCompletionAdapter
+    from relay.adapters.cursor_completion import CursorCompletionAdapter
 
     adapters: dict[str, CompletionCapable] = {}
     if "claude" in config.agents and config.agents["claude"].enabled:
         adapters["claude"] = ClaudeCompletionAdapter(config.agents["claude"])
     if "agy" in config.agents and config.agents["agy"].enabled:
         adapters["agy"] = AgyCompletionAdapter(config.agents["agy"])
+    if "codex" in config.agents and config.agents["codex"].enabled:
+        adapters["codex"] = CodexCompletionAdapter(config.agents["codex"])
+    if "cursor" in config.agents and config.agents["cursor"].enabled:
+        adapters["cursor"] = CursorCompletionAdapter(config.agents["cursor"])
     return adapters
 
 
@@ -191,6 +198,8 @@ def probe(
     except CompletionTerminationError:
         raise
     except (CompletionError, OSError) as exc:
+        if isinstance(exc, CompletionError) and exc.code == "request_cancelled":
+            raise
         report_probe_failure(adapter, alias, exc)
         return None
     return result.observed
@@ -235,11 +244,19 @@ def discover(
                 result.undiscovered.append(alias)
             else:
                 result.probed.append(alias)
-                observed = (
-                    probe_model(adapter, alias)
-                    if probe_model is not None
-                    else probe(adapter, alias, cancel=cancel, timeout_s=timeout_s)
-                )
+                try:
+                    observed = (
+                        probe_model(adapter, alias)
+                        if probe_model is not None
+                        else probe(adapter, alias, cancel=cancel, timeout_s=timeout_s)
+                    )
+                except CompletionTerminationError:
+                    raise
+                except (CompletionError, OSError) as exc:
+                    if isinstance(exc, CompletionError) and exc.code == "request_cancelled":
+                        raise
+                    report_probe_failure(adapter, alias, exc)
+                    observed = None
                 if observed is None:
                     result.failed.append(alias)
                 else:

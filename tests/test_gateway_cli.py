@@ -302,12 +302,9 @@ def test_config_without_cache_reports_undiscovered_models_and_never_probes(
     output = capsys.readouterr()
     provider = json.loads(output.out)["provider"]["relay"]
     assert set(provider["models"]) == {
-        "claude",
-        "claude/default",
         "claude/sonnet",
         "claude/opus",
         "claude/fable",
-        "relay/auto",
     }
     assert all("limit" not in model for model in provider["models"].values())
     assert all(
@@ -348,15 +345,10 @@ def test_config_refresh_probes_caches_and_later_reads_cache(
         },
     }
     assert set(models) == {
-        "claude",
-        "claude/default",
         "claude/sonnet",
         "claude/opus",
         "claude/fable",
-        "relay/auto",
     }
-    assert models["relay/auto"]["limit"] == models["claude"]["limit"]
-    assert models["claude"]["limit"] == {"context": 200000, "output": 32000}
     # Failed probes keep their entry without limits; limits are never invented.
     assert "listed without observed context/output limits (probe failed)" in output.err
     assert "claude/sonnet" in output.err and "claude/fable" in output.err
@@ -372,11 +364,7 @@ def test_config_refresh_probes_caches_and_later_reads_cache(
     assert main(["opencode-config", "--model", "opus", "--json"]) == 0
     selected = capsys.readouterr()
     assert backends[2].probes == []
-    assert set(json.loads(selected.out)["provider"]["relay"]["models"]) == {
-        "claude",
-        "claude/opus",
-        "relay/auto",
-    }
+    assert set(json.loads(selected.out)["provider"]["relay"]["models"]) == {"claude/opus"}
     assert selected.err == ""
 
     # An added alias is undiscovered until refreshed; refresh probes only what is asked.
@@ -408,3 +396,22 @@ def test_config_refresh_replaces_changed_observations(
     models = json.loads(capsys.readouterr().out)["provider"]["relay"]["models"]
     assert models["claude/opus"]["limit"] == {"context": 400000, "output": 20000}
     assert backends[-1].probes == ["opus"]
+
+
+def test_opencode_config_omits_cursor_effort_variants_without_new_catalog_fields() -> None:
+    from relay.gateway.models import ModelCatalog
+
+    config = load_config(user_config=None, project_root=None).config
+    config.agents["cursor"].enabled = True
+    catalog = ModelCatalog(config, discovery.default_adapters(config), models=["named"])
+    supported = {
+        name for name, model in catalog.models.items() if model.support.supports_reasoning_effort
+    }
+    supported.add("relay/auto")
+    snippet = opencode_config.provider_config(
+        catalog.listing(), "http://127.0.0.1:8765/v1", effort_models=supported
+    )
+    models = json.loads(json.dumps(snippet))["provider"]["relay"]["models"]
+    assert "variants" not in models["cursor/named"]
+    assert set(models["codex/named"]["variants"]) == {"low", "medium", "high"}
+    assert not {"cursor", "cursor/default", "codex", "relay/auto"} & models.keys()

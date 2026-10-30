@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -130,6 +131,70 @@ def test_failed_probes_are_omitted_and_not_cached(tmp_path: Path) -> None:
     assert result.undiscovered == ["sonnet", "fable"] and again.probes == ["sonnet", "fable"]
 
 
+@pytest.mark.parametrize("failure", [CompletionError("model rejected"), OSError("CLI failed")])
+def test_probe_callback_rejection_warns_and_continues(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: Exception
+) -> None:
+    attempted: list[str] = []
+
+    def probe_model(_adapter: object, alias: str) -> ObservedModel:
+        attempted.append(alias)
+        if alias == "default":
+            raise failure
+        return OBSERVED[alias]
+
+    cache = ModelCache(tmp_path / "models.json")
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+        result = discover(
+            FakeBackend(),
+            PROFILE,
+            ["default", "opus"],
+            cache,
+            probe_missing=True,
+            probe_model=probe_model,
+        )
+    assert attempted == ["default", "opus"]
+    assert result.failed == ["default"]
+    assert result.observed == cache.load(PROFILE) == {"opus": OBSERVED["opus"]}
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "fake/default" in caplog.records[0].message
+    assert str(failure) in caplog.records[0].message
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [CompletionError("cancelled", code="request_cancelled"), CompletionTerminationError()],
+)
+def test_probe_callback_cancellation_and_unconfirmed_termination_stop_discovery(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: CompletionError
+) -> None:
+    attempted: list[str] = []
+
+    def probe_model(_adapter: object, alias: str) -> ObservedModel:
+        attempted.append(alias)
+        raise failure
+
+    with pytest.raises(type(failure)):
+        discover(
+            FakeBackend(),
+            PROFILE,
+            ["default", "opus"],
+            ModelCache(tmp_path / "models.json"),
+            probe_missing=True,
+            probe_model=probe_model,
+        )
+    assert attempted == ["default"]
+    assert not caplog.records
+
+
+def test_direct_probe_cancellation_stops_discovery() -> None:
+    backend = ScriptedBackend({"default": CompletionError("cancelled", code="request_cancelled")})
+    with pytest.raises(CompletionError, match="cancelled"):
+        discover(backend, PROFILE, ["default", "opus"], ModelCache(None), probe_missing=True)
+    assert backend.probes == ["default"]
+
+
 def test_termination_uncertainty_propagates_after_saving_earlier_observations(
     tmp_path: Path,
 ) -> None:
@@ -234,6 +299,46 @@ def client(app: Any) -> TestClient:
     return TestClient(app, base_url="http://localhost", headers={"Authorization": "Bearer t"})
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CompletionError("unsupported model", status=400, param="model"),
+        CompletionError("invalid CLI response", code="invalid_completion"),
+        OSError("CLI could not start"),
+    ],
+)
+def test_models_request_warns_and_continues_after_rejected_probe(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: Exception
+) -> None:
+    rejected = ScriptedBackend({"default": failure})
+    next_backend = FakeBackend("cursor")
+    config = configuration()
+    config.agents["claude"] = config.agents.pop("fake")
+    config.agents["cursor"] = Agent(cmd="never-called")
+    cache = ModelCache(tmp_path / "models.json")
+    app = create_app(
+        config,
+        token="t",
+        adapters={"claude": rejected, "cursor": next_backend},
+        models=["default", "opus"],
+        model_cache=cache,
+    )
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"), client(app) as http:
+        response = http.get("/v1/models")
+        assert response.status_code == 200
+        listing = {entry["id"]: entry["relay"] for entry in response.json()["data"]}
+        assert "claude/default" not in listing
+        assert listing["claude/opus"]["context_length"] == OBSERVED["opus"].context_length
+        assert listing["cursor/opus"]["context_length"] == OBSERVED["opus"].context_length
+        assert http.get("/v1/models").status_code == 200
+    assert rejected.probes == next_backend.probes == ["default", "opus"]
+    assert cache.load(rejected.support.profile) == {"opus": OBSERVED["opus"]}
+    assert cache.load(next_backend.support.profile) == OBSERVED
+    warnings = [record for record in caplog.records if record.name == "uvicorn.error"]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "claude/default" in warnings[0].message and str(failure) in warnings[0].message
+
+
 def test_discovery_is_lazy_and_single_flight(tmp_path: Path) -> None:
     backend = BlockingProbeBackend()
     cache = ModelCache(tmp_path / "models.json")
@@ -259,9 +364,7 @@ def test_discovery_is_lazy_and_single_flight(tmp_path: Path) -> None:
         assert backend.probes == list(DEFAULT_MODEL_ALIASES)
         ids = {entry["id"] for entry in listings[0]["data"]}
         assert ids == {
-            "fake",
-            *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES),
-            "relay/auto",
+            *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES if alias != "default"),
         }
         assert http.get("/v1/models/fake/opus").json()["relay"]["context_length"] == 100000
         assert http.get("/v1/models/fake/sonnet").json()["relay"]["context_length"] is None
@@ -283,8 +386,14 @@ def test_gateway_reads_cache_and_probes_only_missing_aliases(tmp_path: Path) -> 
     )
     with client(app) as http:
         listing = {entry["id"]: entry["relay"] for entry in http.get("/v1/models").json()["data"]}
+        assert (
+            http.get("/v1/models/fake/default").json()["relay"]["resolved_model"] == "fake/cached"
+        )
+        auto = http.get("/v1/models/relay/auto").json()
+        assert auto["id"] == "relay/auto" and auto["relay"]["resolved_model"] == "auto"
+        assert auto["relay"]["context_length"] == 5
     assert backend.probes == ["opus"]
-    assert listing["fake/default"]["resolved_model"] == "fake/cached"
+    assert set(listing) == {"fake/opus"}
     assert listing["fake/opus"]["max_output_tokens"] == 10000
 
 
@@ -301,9 +410,7 @@ def test_probe_termination_uncertainty_quarantines_gateway() -> None:
         # A quarantined gateway admits no work and launches no further probes.
         listing = http.get("/v1/models").json()
         assert {entry["id"] for entry in listing["data"]} == {
-            "claude",
-            *(f"claude/{alias}" for alias in DEFAULT_MODEL_ALIASES),
-            "relay/auto",
+            *(f"claude/{alias}" for alias in DEFAULT_MODEL_ALIASES if alias != "default"),
         }
         assert all(entry["relay"]["context_length"] is None for entry in listing["data"])
         chat = http.post(
@@ -379,7 +486,7 @@ def test_models_http_request_waits_for_active_chat() -> None:
             assert chat.result(timeout=3).status_code == 200
             response = listing.result(timeout=3)
             assert response.status_code == 200
-            assert "fake/default" in {entry["id"] for entry in response.json()["data"]}
+            assert response.json() == {"object": "list", "data": []}
             assert backend.probes == ["default"]
         finally:
             backend.release.set()

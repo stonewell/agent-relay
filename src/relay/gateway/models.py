@@ -1,7 +1,8 @@
 """Pinned public model ids derived from the configured completion backends.
 
-Each enabled agent offers ``<agent>/<alias>`` for every configured CLI model alias, plus the
-bare ``<agent>`` id for its first alias. Limits come from discovery
+Each enabled agent resolves ``<agent>/<alias>`` for every configured CLI model alias, plus
+the bare ``<agent>`` id for its first alias. Public listings contain only named models;
+automatic/default shortcuts remain available for routing. Limits come from discovery
 (``relay.gateway.discovery``): an alias whose limits were not observed is still listed, with
 its limits reported as null until a probe succeeds.
 """
@@ -72,6 +73,8 @@ class GatewayModel:
         }
 
     def check(self, request: ChatRequest, observed: ObservedModel | None) -> None:
+        if request.reasoning_effort is not None and not self.support.supports_reasoning_effort:
+            raise GatewayError(400, "model does not support reasoning effort", "reasoning_effort")
         if (
             observed is not None
             and request.output_tokens is not None
@@ -114,19 +117,20 @@ class ModelCatalog:
             adapter = adapters[name]
             support = adapter.inspect()
             self._supports[name] = (adapter, support)
-            adapter_aliases: object = getattr(adapter, "default_aliases", None)
             if models is not None:
                 aliases = self.aliases
-            elif isinstance(adapter_aliases, (tuple, list)):
-                aliases = model_aliases(cast("Sequence[str]", adapter_aliases))
-            elif name == "agy" or getattr(adapter, "id", None) == "agy":
-                aliases = (
-                    model_aliases(("default", *agent.models.values()))
-                    if agent.models
-                    else ("default",)
-                )
             else:
-                aliases = self.aliases
+                adapter_aliases: object = getattr(adapter, "default_aliases", None)
+                if isinstance(adapter_aliases, (tuple, list)):
+                    aliases = model_aliases(cast("Sequence[str]", adapter_aliases))
+                elif name == "agy" or getattr(adapter, "id", None) == "agy":
+                    aliases = (
+                        model_aliases(("default", *agent.models.values()))
+                        if agent.models
+                        else ("default",)
+                    )
+                else:
+                    aliases = self.aliases
             self.agent_aliases[name] = aliases
             alias = GatewayModel(name, name, aliases[0], None, support, adapter, agent.cost)
             self._add(alias)
@@ -289,9 +293,13 @@ class ModelCatalog:
         return value
 
     def listing(self) -> dict[str, Any]:
-        """Every configured model; limits are null until a probe observes them."""
+        """Named models only; limits are null until a probe observes them."""
         observed = self._observed
-        ids = [*self.models, *(["relay/auto"] if self.defaults else [])]
+        ids = [
+            model.id
+            for model in self.models.values()
+            if model.id != model.agent and model.model not in {"auto", "default"}
+        ]
         entries = [self._public(model_id, observed) for model_id in ids]
         return {"object": "list", "data": [entry for entry in entries if entry is not None]}
 

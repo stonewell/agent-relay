@@ -103,12 +103,10 @@ def test_alias_ids_bare_default_and_pinning() -> None:
 def test_listing_includes_configured_aliases_with_null_limits() -> None:
     backend = FakeBackend()
     catalog = ModelCatalog(configuration(), {"fake": backend})
-    # Every configured alias is listed before discovery; limits stay null until observed.
+    # Named aliases are listed before discovery; routing shortcuts stay internal.
     before = {entry["id"]: entry["relay"] for entry in catalog.listing()["data"]}
     assert set(before) == {
-        "fake",
-        *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES),
-        "relay/auto",
+        *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES if alias != "default"),
     }
     assert all(value["context_length"] is None for value in before.values())
     assert catalog.state("fake/opus") == "undiscovered"
@@ -116,9 +114,7 @@ def test_listing_includes_configured_aliases_with_null_limits() -> None:
     assert backend.probes == list(DEFAULT_MODEL_ALIASES)
     listing = {entry["id"]: entry["relay"] for entry in catalog.listing()["data"]}
     assert set(listing) == {
-        "fake",
-        *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES),
-        "relay/auto",
+        *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES if alias != "default"),
     }
     assert listing["fake/opus"]["resolved_model"] == "fake/m-opus"
     assert listing["fake/opus"]["model_alias"] == "opus"
@@ -126,7 +122,7 @@ def test_listing_includes_configured_aliases_with_null_limits() -> None:
         100000,
         10000,
     )
-    assert listing["fake"]["resolved_model"] == "fake/m-default"
+    assert catalog.public("fake")["relay"]["resolved_model"] == "fake/m-default"
     assert listing["fake/sonnet"]["context_length"] is None
     assert listing["fake/fable"]["max_output_tokens"] is None
     assert catalog.state("fake/sonnet") == "failed"
@@ -148,6 +144,37 @@ def test_configured_aliases_replace_defaults_and_are_validated() -> None:
     with pytest.raises(ValueError, match="at least one"):
         model_aliases([])
     assert model_aliases() == DEFAULT_MODEL_ALIASES
+
+
+def test_listing_omits_routing_shortcuts_and_exact_auto_default_aliases() -> None:
+    config = configuration()
+    template = config.agents.pop("fake")
+    names = ("claude", "codex", "cursor", "agy")
+    config.agents.update({name: template.model_copy(deep=True) for name in names})
+    aliases = ["default", "auto", "opus", "auto-review", "default-custom"]
+    catalog = ModelCatalog(config, {name: FakeBackend(name) for name in names}, aliases)
+    listing = catalog.listing()
+    assert listing["object"] == "list"
+    assert {entry["id"] for entry in listing["data"]} == {
+        f"{name}/{alias}" for name in names for alias in ("opus", "auto-review", "default-custom")
+    }
+    # Listing visibility does not disable explicitly selected routing aliases.
+    for model_id in ("claude", "codex/default", "cursor/auto", "relay/auto"):
+        request = parse_request({"model": model_id, "messages": [{"role": "user", "content": "x"}]})
+        assert catalog.candidates(request)
+        assert catalog.public(model_id)["id"] == model_id
+
+
+def test_listing_hides_bare_shortcut_even_when_it_resolves_to_named_model() -> None:
+    catalog = ModelCatalog(configuration(), {"fake": FakeBackend()}, models=["opus"])
+    assert [entry["id"] for entry in catalog.listing()["data"]] == ["fake/opus"]
+    assert catalog.public("fake")["relay"]["model_alias"] == "opus"
+
+
+def test_default_only_catalog_has_empty_public_listing() -> None:
+    catalog = ModelCatalog(configuration(), {"fake": FakeBackend()}, models=["default", "auto"])
+    assert catalog.listing() == {"object": "list", "data": []}
+    assert catalog.public("fake/default")["relay"]["model_alias"] == "default"
 
 
 def test_native_output_limits_are_not_refused_by_capability() -> None:
@@ -196,7 +223,7 @@ def test_auto_reports_minimum_observed_limits_or_is_omitted() -> None:
     catalog = observed_catalog(config, {"fake": FakeBackend(), "other": other})
     auto = catalog.public("relay/auto")["relay"]
     assert auto["context_length"] is None and auto["max_output_tokens"] is None
-    assert "relay/auto" in {entry["id"] for entry in catalog.listing()["data"]}
+    assert "relay/auto" not in {entry["id"] for entry in catalog.listing()["data"]}
     assert catalog.state("relay/auto") == "failed"
 
 
@@ -225,3 +252,72 @@ def test_auto_classifies_and_filters_only_qualified_capabilities() -> None:
         }
     )
     assert [model.agent for model in catalog.candidates(request)] == ["debugger", "fake"]
+
+
+def test_reasoning_effort_filters_auto_and_rejects_unsupported_explicit_backend() -> None:
+    config = configuration()
+    config.agents["cursor"] = config.agents["fake"].model_copy(deep=True)
+    cursor = FakeBackend("cursor")
+    cursor.support = replace(cursor.support, supports_reasoning_effort=False)
+    catalog = ModelCatalog(config, {"fake": FakeBackend(), "cursor": cursor}, models=["default"])
+    request = parse_request(
+        {
+            "model": "relay/auto",
+            "messages": [{"role": "user", "content": "x"}],
+            "reasoning_effort": "high",
+        }
+    )
+    assert [model.agent for model in catalog.candidates(request)] == ["fake"]
+    request.model = "cursor"
+    with pytest.raises(GatewayError) as caught:
+        catalog.candidates(request)
+    assert caught.value.param == "reasoning_effort"
+    request.reasoning_effort = None
+    assert catalog.candidates(request)[0].agent == "cursor"
+
+
+def test_default_registry_adds_codex_and_opt_in_cursor_with_backend_specific_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay.adapters import codex_completion, cursor_completion
+    from relay.core.registry import load_config
+    from relay.gateway.discovery import default_adapters
+
+    def codex_models(*_: object) -> tuple[str, ...]:
+        return ("gpt-codex",)
+
+    def cursor_models(*_: object) -> tuple[str, ...]:
+        return ("auto", "cursor-deep")
+
+    monkeypatch.setattr(codex_completion, "_enumerated_models", codex_models)
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", cursor_models)
+    config = load_config(user_config=None, project_root=None).config
+    adapters = default_adapters(config)
+    assert "codex" in adapters and "cursor" not in adapters
+    assert adapters["codex"].id == "codex"
+    catalog = ModelCatalog(config, adapters)
+    assert catalog.agent_aliases["codex"] == ("default", "gpt-codex")
+    assert "codex/gpt-codex" in catalog.models
+    assert "codex/sonnet" not in catalog.models
+    config.agents["cursor"].enabled = True
+    adapters = default_adapters(config)
+    catalog = ModelCatalog(config, adapters)
+    assert catalog.agent_aliases["cursor"] == ("default", "auto", "cursor-deep")
+    assert "cursor" in catalog.models and "cursor/auto" in catalog.models
+    assert "cursor/cursor-deep" in catalog.models
+    assert catalog.models["cursor"].support.supports_reasoning_effort is False
+    config.agents["codex"].enabled = False
+    assert "codex" not in default_adapters(config)
+
+
+def test_explicit_model_filter_does_not_enumerate_cli_models() -> None:
+    class EnumeratingBackend(FakeBackend):
+        @property
+        def default_aliases(self) -> tuple[str, ...]:
+            raise AssertionError("explicit models must not enumerate CLI models")
+
+    adapter = EnumeratingBackend()
+    catalog = ModelCatalog(configuration(), {"fake": adapter}, models=["explicit"])
+    assert catalog.agent_aliases["fake"] == ("explicit",)
+    assert set(catalog.models) == {"fake", "fake/explicit"}
+    assert not adapter.probes
