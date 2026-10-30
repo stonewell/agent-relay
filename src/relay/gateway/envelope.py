@@ -1,7 +1,7 @@
 """Bounded JSON Schema subset and independent completed-envelope validation.
 
 Supported keywords are listed in SCHEMA_KEYS. References are local JSON pointers;
-cycles, regexes, unique-item checks, remote resources and unrecognized dialect extensions
+cycles, unique-item checks, remote resources and unrecognized dialect extensions
 are rejected. ANNOTATION_KEYS are accepted but never asserted (validation uses Draft 2020-12
 without a format checker), so they cannot weaken argument validation.
 """
@@ -30,6 +30,8 @@ ANNOTATION_KEYS = frozenset(
         "readOnly",
         "writeOnly",
         "format",
+        # Common generator output; argument validation may still enforce it.
+        "pattern",
         "contentEncoding",
         "contentMediaType",
         "nullable",

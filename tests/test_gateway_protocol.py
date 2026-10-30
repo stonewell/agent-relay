@@ -176,7 +176,7 @@ def test_unknown_nested_fields_are_ignored() -> None:
     [
         {"type": "object", "$ref": "https://example.com/schema"},
         {"type": "object", "$defs": {"x": {"$ref": "#/$defs/x"}}, "$ref": "#/$defs/x"},
-        {"type": "object", "properties": {"x": {"type": "string", "pattern": "x"}}},
+        {"type": "object", "properties": {"x": {"type": "array", "contains": {"type": "string"}}}},
         {"type": "object", "patternProperties": {"^x": {"type": "string"}}},
         {"type": "object", "properties": {"x": {"type": "array", "uniqueItems": True}}},
         {"type": "object", "$id": "https://example.com/other"},
@@ -227,6 +227,28 @@ def test_annotation_keywords_are_accepted_without_weakening_validation() -> None
     for bad in invalid_arguments:
         with pytest.raises(EnvelopeError):
             validate_envelope(envelope(bad), request, envelope_schema)
+
+
+def test_pattern_keyword_is_accepted_and_reaches_the_backend() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string", "pattern": "^a+$"}},
+        "required": ["x"],
+    }
+    validate_schema(schema)
+    request = parse_request(
+        tool_request(
+            tools=[{"type": "function", "function": {"name": "edit", "parameters": schema}}]
+        )
+    )
+    envelope_schema = prepare_envelope(request)
+    assert envelope_schema is not None
+    _, calls = validate_envelope(
+        '{"content":null,"tool_calls":[{"name":"edit","arguments":{"x":"aaa"}}]}',
+        request,
+        envelope_schema,
+    )
+    assert calls[0]["arguments"] == {"x": "aaa"}
 
 
 def test_repair_render_is_bounded_json_data_after_the_transcript() -> None:

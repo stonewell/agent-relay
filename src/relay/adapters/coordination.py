@@ -56,7 +56,7 @@ class CoordinatorCall:
 
 
 def coordinator_schema() -> dict[str, Any]:
-    """The inline `--json-schema` form: no `$schema`, titles or OpenAPI `discriminator` keyword."""
+    """The inline `--json-schema` form: no `$schema`, titles, `pattern` or `discriminator`."""
     schema = schema_for(CoordinatorResponse)
     schema.pop("$schema", None)
 
@@ -65,7 +65,7 @@ def coordinator_schema() -> dict[str, Any]:
             return {
                 key: compact(value)
                 for key, value in cast("dict[str, Any]", node).items()
-                if key not in ("title", "discriminator")
+                if key not in ("title", "discriminator", "pattern")
             }
         if isinstance(node, list):
             return [compact(value) for value in cast("list[Any]", node)]

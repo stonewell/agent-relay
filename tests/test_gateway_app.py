@@ -122,6 +122,33 @@ def test_unknown_request_fields_are_ignored(client_backend: tuple[TestClient, Fa
     assert len(backend.calls) == 1
 
 
+def test_pattern_tool_schema_is_accepted(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(envelope={"content": "ok", "tool_calls": []})]
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"x": {"type": "string", "pattern": "^a+$"}},
+                            "required": ["x"],
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(backend.calls) == 1
+
+
 def test_envelope_repair_usage_aggregation(client_backend: tuple[TestClient, FakeBackend]) -> None:
     client, backend = client_backend
     backend.results = [
