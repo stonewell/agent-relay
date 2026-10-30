@@ -113,7 +113,12 @@ class GatewayRuntime:
         max_output_bytes: int | None = None,
     ) -> CompletionHandle:
         # No await between checking capacity and reserving both counters.
-        if self._closed or not self._healthy:
+        if self._closed:
+            # Shutdown aborts request waiters; discovery must not mistake it for a missing CLI.
+            raise CompletionError(
+                "Gateway is shutting down", status=503, code="request_cancelled"
+            )
+        if not self._healthy:
             raise CompletionError(
                 "Gateway is not accepting requests", status=503, code="unavailable"
             )

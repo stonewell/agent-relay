@@ -1,20 +1,21 @@
-"""Discover served models and their limits from the CLI itself, cached per qualified profile.
+"""Discover served models and their limits from the CLI itself, cached per completion profile.
 
 The Claude CLI has no model-listing command. Each configured alias is therefore probed once
-with a minimal prompt through the backend's ordinary ``complete()`` path, which re-checks
-qualification and runs in a fresh scratch directory with the isolated completion
-environment. The CLI's ``modelUsage`` report names the model that actually ran and its
-context window and output limit. A probe that fails or reports no unambiguous limits leaves
-that alias undiscovered: limits are observed, never recorded in qualification or invented.
+with a minimal prompt through the backend's ordinary ``complete()`` path, which runs in a fresh
+scratch directory with the isolated completion environment. The CLI's ``modelUsage`` report
+names the model that actually ran and its context window and output limit. A probe that fails
+or reports no unambiguous limits is best-effort: the alias stays listed with null limits and
+the failure detail is reported on stderr. Limits are observed, never invented.
 
-Observations are cached on disk keyed by the full completion profile (CLI version, platform,
-authentication mode and configuration digest), so a CLI upgrade or configuration change is a
-cache miss. Importing this module does not import the optional HTTP stack.
+Observations are cached on disk keyed by the completion profile's agent and platform fields
+(the remaining profile fields are constants). Importing this module does not import the
+optional HTTP stack.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -40,19 +41,32 @@ CACHE_SCHEMA = 1
 CACHE_LIMIT = 1024 * 1024
 
 
+def report_probe_failure(
+    adapter: CompletionCapable, alias: str, error: BaseException
+) -> None:
+    """Probes only refresh metadata, so their failure is reported here instead of failing a call."""
+    print(
+        f"relay serve: probe of {adapter.id}/{alias} failed: {type(error).__name__}: {error}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def default_cache_path() -> Path:
     """Beside the user-level relay configuration; disposable and rebuilt by probing."""
     return USER_CONFIG.parent / "gateway-models.json"
 
 
 def default_adapters(config: Config) -> dict[str, CompletionCapable]:
+    from relay.adapters.agy_completion import AgyCompletionAdapter
     from relay.adapters.claude_completion import ClaudeCompletionAdapter
 
-    return (
-        {"claude": ClaudeCompletionAdapter(config.agents["claude"])}
-        if "claude" in config.agents
-        else {}
-    )
+    adapters: dict[str, CompletionCapable] = {}
+    if "claude" in config.agents and config.agents["claude"].enabled:
+        adapters["claude"] = ClaudeCompletionAdapter(config.agents["claude"])
+    if "agy" in config.agents and config.agents["agy"].enabled:
+        adapters["agy"] = AgyCompletionAdapter(config.agents["agy"])
+    return adapters
 
 
 def _profile_key(profile: CompletionProfile) -> dict[str, str]:
@@ -159,7 +173,7 @@ def probe(
     cancel: threading.Event,
     timeout_s: float = PROBE_TIMEOUT_S,
 ) -> ObservedModel | None:
-    """One minimal qualified completion; ``None`` unless the CLI reported usable limits.
+    """One minimal completion probe; ``None`` unless the CLI reported usable limits.
 
     Termination that cannot be confirmed is re-raised so the caller can quarantine.
     """
@@ -176,7 +190,8 @@ def probe(
             )
     except CompletionTerminationError:
         raise
-    except (CompletionError, OSError):
+    except (CompletionError, OSError) as exc:
+        report_probe_failure(adapter, alias, exc)
         return None
     return result.observed
 

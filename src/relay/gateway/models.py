@@ -1,8 +1,9 @@
-"""Pinned public model ids derived only from qualified completion backends.
+"""Pinned public model ids derived from the configured completion backends.
 
-Each qualified agent offers ``<agent>/<alias>`` for every configured CLI model alias, plus the
-bare ``<agent>`` id for its first alias. Advertised limits come only from discovery
-(``relay.gateway.discovery``): an alias whose limits were not observed is not listed.
+Each enabled agent offers ``<agent>/<alias>`` for every configured CLI model alias, plus the
+bare ``<agent>`` id for its first alias. Limits come from discovery
+(``relay.gateway.discovery``): an alias whose limits were not observed is still listed, with
+its limits reported as null until a probe succeeds.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import asyncio
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from relay.adapters.completion import (
     CompletionCapable,
@@ -26,7 +27,14 @@ from relay.core.classifier import classify
 from relay.core.registry import Config
 from relay.core.router import score_candidate
 
-from .discovery import PROBE_OUTPUT_BYTES, PROBE_PROMPT, PROBE_TIMEOUT_S, ModelCache, discover
+from .discovery import (
+    PROBE_OUTPUT_BYTES,
+    PROBE_PROMPT,
+    PROBE_TIMEOUT_S,
+    ModelCache,
+    discover,
+    report_probe_failure,
+)
 from .protocol import ChatRequest, GatewayError
 from .runtime import GatewayRuntime
 
@@ -43,34 +51,27 @@ class GatewayModel:
     adapter: CompletionCapable
     cost: str | None = None
 
-    def public(self, observed: ObservedModel) -> dict[str, Any]:
+    def public(self, observed: ObservedModel | None) -> dict[str, Any]:
         return {
             "id": self.id,
             "object": "model",
             "created": 0,
             "owned_by": "relay",
             "relay": {
-                "resolved_model": f"{self.agent}/{observed.model}",
+                "resolved_model": (
+                    f"{self.agent}/{self.model if observed is None else observed.model}"
+                ),
                 "model_alias": self.model,
                 "supports_tools": self.support.supports_tools,
                 "native_max_tokens": self.support.native_max_tokens,
                 "ignored_parameters": ["temperature", "top_p"],
-                "context_length": observed.context_length,
-                "max_output_tokens": observed.max_output_tokens,
+                "context_length": None if observed is None else observed.context_length,
+                "max_output_tokens": None if observed is None else observed.max_output_tokens,
                 "cost_class": self.cost,
             },
         }
 
     def check(self, request: ChatRequest, observed: ObservedModel | None) -> None:
-        if request.tools and not self.support.supports_tools:
-            raise GatewayError(400, "model does not support tools", "tools")
-        if request.output_tokens is not None and not self.support.native_max_tokens:
-            param = (
-                "max_completion_tokens"
-                if request.max_completion_tokens is not None
-                else "max_tokens"
-            )
-            raise GatewayError(400, "model does not enforce native output token limits", param)
         if (
             observed is not None
             and request.output_tokens is not None
@@ -94,6 +95,7 @@ class ModelCatalog:
     ) -> None:
         self.config = config
         self.aliases = model_aliases(models)
+        self.agent_aliases: dict[str, tuple[str, ...]] = {}
         self.cache = cache or ModelCache(None)
         self.models: dict[str, GatewayModel] = {}
         self.defaults: list[GatewayModel] = []
@@ -111,13 +113,25 @@ class ModelCatalog:
                 continue
             adapter = adapters[name]
             support = adapter.inspect()
-            if support is None:
-                continue
             self._supports[name] = (adapter, support)
-            alias = GatewayModel(name, name, self.aliases[0], None, support, adapter, agent.cost)
+            adapter_aliases: object = getattr(adapter, "default_aliases", None)
+            if models is not None:
+                aliases = self.aliases
+            elif isinstance(adapter_aliases, (tuple, list)):
+                aliases = model_aliases(cast("Sequence[str]", adapter_aliases))
+            elif name == "agy" or getattr(adapter, "id", None) == "agy":
+                aliases = (
+                    model_aliases(("default", *agent.models.values()))
+                    if agent.models
+                    else ("default",)
+                )
+            else:
+                aliases = self.aliases
+            self.agent_aliases[name] = aliases
+            alias = GatewayModel(name, name, aliases[0], None, support, adapter, agent.cost)
             self._add(alias)
             self.defaults.append(alias)
-            for model in self.aliases:
+            for model in aliases:
                 self._add(
                     GatewayModel(f"{name}/{model}", name, model, None, support, adapter, agent.cost)
                 )
@@ -146,13 +160,12 @@ class ModelCatalog:
         failed = set(self._failed)
         try:
             for agent, (adapter, support) in self._supports.items():
-                skip = frozenset(
-                    alias for alias in self.aliases if (agent, alias) in self._attempted
-                )
+                aliases = self.agent_aliases.get(agent, self.aliases)
+                skip = frozenset(alias for alias in aliases if (agent, alias) in self._attempted)
                 result = discover(
                     adapter,
                     support.profile,
-                    self.aliases,
+                    aliases,
                     self.cache,
                     probe_missing=probe,
                     refresh=refresh,
@@ -162,7 +175,7 @@ class ModelCatalog:
                     probe_model=probe_model,
                 )
                 self._attempted.update((agent, alias) for alias in result.probed)
-                for alias in self.aliases:
+                for alias in aliases:
                     if alias in result.observed:
                         observed[(agent, alias)] = result.observed[alias]
                         failed.discard((agent, alias))
@@ -189,10 +202,12 @@ class ModelCatalog:
                 except CompletionTerminationError:
                     raise
                 except CompletionError as exc:
-                    if exc.code in {"unavailable", "request_cancelled"}:
+                    if exc.code == "request_cancelled":
                         raise
+                    report_probe_failure(adapter, alias, exc)
                     return None
-                except OSError:
+                except OSError as exc:
+                    report_probe_failure(adapter, alias, exc)
                     return None
                 return result.observed
 
@@ -239,10 +254,11 @@ class ModelCatalog:
         self, model_id: str, observed: Mapping[tuple[str, str], ObservedModel]
     ) -> dict[str, Any] | None:
         if model_id == "relay/auto":
+            if not self.defaults:
+                return None
             known = [observed.get((model.agent, model.model)) for model in self.defaults]
             limits = [entry for entry in known if entry is not None]
-            if not limits or len(limits) != len(known):
-                return None
+            complete = len(limits) == len(known)
             return {
                 "id": model_id,
                 "object": "model",
@@ -253,15 +269,18 @@ class ModelCatalog:
                     "supports_tools": all(m.support.supports_tools for m in self.defaults),
                     "native_max_tokens": all(m.support.native_max_tokens for m in self.defaults),
                     "ignored_parameters": ["temperature", "top_p"],
-                    "context_length": min(entry.context_length for entry in limits),
-                    "max_output_tokens": min(entry.max_output_tokens for entry in limits),
+                    "context_length": (
+                        min(entry.context_length for entry in limits) if complete else None
+                    ),
+                    "max_output_tokens": (
+                        min(entry.max_output_tokens for entry in limits) if complete else None
+                    ),
                 },
             }
         model = self.models.get(model_id)
         if model is None:
             return None
-        entry = observed.get((model.agent, model.model))
-        return None if entry is None else model.public(entry)
+        return model.public(observed.get((model.agent, model.model)))
 
     def public(self, model_id: str) -> dict[str, Any]:
         value = self._public(model_id, self._observed)
@@ -270,7 +289,7 @@ class ModelCatalog:
         return value
 
     def listing(self) -> dict[str, Any]:
-        """Only models with observed limits; undiscovered or failed aliases are omitted."""
+        """Every configured model; limits are null until a probe observes them."""
         observed = self._observed
         ids = [*self.models, *(["relay/auto"] if self.defaults else [])]
         entries = [self._public(model_id, observed) for model_id in ids]
@@ -288,7 +307,7 @@ class ModelCatalog:
             return [model]
         if not self.defaults:
             raise GatewayError(
-                503, "no qualified completion backend available", "model", "model_unavailable"
+                503, "no enabled completion backend available", "model", "model_unavailable"
             )
         candidates: list[GatewayModel] = []
         error: GatewayError | None = None
