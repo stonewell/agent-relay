@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
+import logging
 import socket
 import threading
 import time
@@ -14,6 +16,8 @@ import uvicorn
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
+from starlette.types import Message, Receive, Scope, Send
+from uvicorn.config import LOG_LEVELS
 
 from relay.adapters.completion import (
     CompletionError,
@@ -22,7 +26,7 @@ from relay.adapters.completion import (
     CompletionUsage,
 )
 from relay.gateway import app as gateway_app
-from relay.gateway.app import GatewayLimits, create_app
+from relay.gateway.app import GatewayLimits, RequestSummaryMiddleware, create_app
 from relay.gateway.runtime import GatewayRuntime
 from test_gateway_models import FakeBackend, configuration
 
@@ -35,6 +39,123 @@ def client_backend() -> Iterator[tuple[TestClient, FakeBackend]]:
         app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
     ) as client:
         yield client, backend
+
+
+@pytest.mark.parametrize("level", ["critical", "error", "warning", "info", "debug", "trace"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_request_response_summaries(
+    client_backend: tuple[TestClient, FakeBackend],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    level: str,
+    stream: bool,
+) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(content="private-answer")]
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with caplog.at_level(LOG_LEVELS[level], logger="uvicorn.error"):
+        response = client.post(
+            "/v1/chat/completions?secret=private-query",
+            json={
+                "model": "fake",
+                "messages": [{"role": "user", "content": "private-prompt"}],
+                "stream": stream,
+            },
+        )
+    assert response.status_code == 200
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    if level not in {"debug", "trace"}:
+        assert messages == []
+        return
+    assert len(messages) == 2
+    assert messages[0] == "request method='POST' path='/v1/chat/completions'"
+    assert messages[1].startswith(
+        "response method='POST' path='/v1/chat/completions' status=200 "
+        f"bytes={len(response.content)} complete=True duration_ms="
+    )
+    assert float(messages[1].split("duration_ms=")[1]) >= 0
+    assert all(
+        secret not in "\n".join(messages)
+        for secret in ("private-prompt", "private-answer", "private-query", "test-token")
+    )
+
+
+@pytest.mark.parametrize("status", [401, 400, 502])
+def test_request_response_summaries_include_errors(
+    client_backend: tuple[TestClient, FakeBackend],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(content="\ud800")]
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+        response = client.post(
+            "/v1/chat/completions",
+            content="{"
+            if status == 400
+            else json.dumps({"model": "fake", "messages": [{"role": "user", "content": "hello"}]}),
+            headers={"Authorization": "wrong" if status == 401 else "Bearer test-token"},
+        )
+    assert response.status_code == status
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert len(messages) == 2
+    assert f"status={status} bytes={len(response.content)} complete=True" in messages[1]
+
+
+def test_response_summary_includes_unexpected_error_response(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(configuration(), token="test-token", adapters={"fake": FakeBackend()})
+
+    @app.get("/broken")
+    async def broken() -> None:
+        raise RuntimeError("private-failure")
+
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with (
+        TestClient(app, base_url="http://localhost", raise_server_exceptions=False) as client,
+        caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+    ):
+        response = client.get("/broken")
+    assert response.status_code == 500
+    assert response.json()["error"]["message"] == "internal gateway error"
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert len(messages) == 2
+    assert f"status=500 bytes={len(response.content)} complete=True" in messages[1]
+    assert "private-failure" not in "\n".join(messages)
+
+
+def test_stream_summary_waits_for_delivery_and_reports_interruption(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delivered: list[Message] = []
+
+    async def streaming_app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
+        assert len(delivered) == 2
+        assert not any(record.getMessage().startswith("response ") for record in caplog.records)
+        raise asyncio.CancelledError
+
+    async def receive() -> Message:
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        delivered.append(message)
+
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with (
+        caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        asyncio.run(
+            RequestSummaryMiddleware(streaming_app)(
+                {"type": "http", "method": "POST", "path": "/v1/chat/completions"}, receive, send
+            )
+        )
+    assert "status=200 bytes=5 complete=False" in caplog.records[-1].getMessage()
 
 
 def test_auth_every_v1_path_and_health(client_backend: tuple[TestClient, FakeBackend]) -> None:
