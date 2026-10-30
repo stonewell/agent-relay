@@ -40,6 +40,7 @@ def test_gateway_commands_do_not_advance_other_phase_gates() -> None:
         ["serve", "--max-request-bytes", "-1"],
         ["serve", "--timeout", "nan"],
         ["serve", "--timeout", "inf"],
+        ["serve", "--log-level", "verbose"],
         ["serve", "--model", "--dangerously-skip-permissions"],
         ["serve", "--model", ""],
         ["opencode-config", "--model", "a b"],
@@ -74,8 +75,16 @@ assert not any(name.startswith('relay.gateway') for name in sys.modules)
 
 
 @pytest.mark.parametrize(
-    ("options", "models"),
-    [([], None), (["--model", "opus", "--model", "fable"], ["opus", "fable"])],
+    ("options", "models", "log_level"),
+    [
+        ([], None, "info"),
+        (["--model", "opus", "--model", "fable"], ["opus", "fable"], "info"),
+        *[
+            (["--log-level", level], None, level)
+            for level in ("critical", "error", "warning", "info", "debug", "trace")
+        ],
+        (["--log-level", "DeBuG"], None, "debug"),
+    ],
 )
 def test_server_uses_global_config_and_fixed_process_options(
     monkeypatch: pytest.MonkeyPatch,
@@ -83,6 +92,7 @@ def test_server_uses_global_config_and_fixed_process_options(
     tmp_path: Path,
     options: list[str],
     models: list[str] | None,
+    log_level: str,
 ) -> None:
     import uvicorn
 
@@ -126,6 +136,7 @@ def test_server_uses_global_config_and_fixed_process_options(
         "workers": 1,
         "reload": False,
         "access_log": False,
+        "log_level": log_level,
     }
     assert calls["limits"] == {
         "concurrency": 2,

@@ -65,6 +65,13 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     parser.add_argument("--host", choices=("127.0.0.1", "::1"), default="127.0.0.1")
     parser.add_argument("--port", type=positive_int, default=8765)
     parser.add_argument(
+        "--log-level",
+        type=str.lower,
+        choices=("critical", "error", "warning", "info", "debug", "trace"),
+        default="info",
+        help="server logging level (default: INFO)",
+    )
+    parser.add_argument(
         "--key",
         metavar="KEY",
         help="fixed API bearer token (overrides RELAY_GATEWAY_TOKEN; generated if omitted)",
@@ -109,5 +116,13 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         return report_error(f"relay serve: {exc}", Exit.INVALID, False)
     if generated:
         print(f"RELAY_GATEWAY_TOKEN={token}", file=sys.stderr, flush=True)
-    uvicorn.run(app, host=args.host, port=args.port, workers=1, reload=False, access_log=False)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        workers=1,
+        reload=False,
+        access_log=False,
+        log_level=args.log_level,
+    )
     return Exit.OK
