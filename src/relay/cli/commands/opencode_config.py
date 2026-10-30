@@ -66,7 +66,7 @@ def validate_base_url(value: str) -> tuple[str, str, int]:
 def provider_config(
     catalog: object, base_url: str, omitted: list[str] | None = None
 ) -> dict[str, object]:
-    """Build the provider snippet; ids lacking observed limits are appended to `omitted`."""
+    """Build the provider snippet; models without observed limits are listed without one."""
     if not isinstance(catalog, dict):
         raise ValueError("gateway returned an invalid model catalog")
     entries = cast(dict[str, object], catalog).get("data")
@@ -79,19 +79,19 @@ def provider_config(
         entry = cast(dict[str, object], raw)
         model_id, raw_metadata = entry.get("id"), entry.get("relay")
         if not isinstance(model_id, str) or not model_id or not isinstance(raw_metadata, dict):
+            if omitted is not None and isinstance(model_id, str) and model_id:
+                omitted.append(model_id)
             continue
         metadata = cast(dict[str, object], raw_metadata)
         context, output = metadata.get("context_length"), metadata.get("max_output_tokens")
-        if type(context) is not int or type(output) is not int or context <= 0 or output <= 0:
-            # Limits are never invented; the caller reports what was left out and why.
-            if omitted is not None:
-                omitted.append(model_id)
-            continue
-        models[model_id] = {
+        model: dict[str, object] = {
             "name": model_id,
             "tool_call": metadata.get("supports_tools") is True,
-            "limit": {"context": context, "output": output},
         }
+        if type(context) is int and type(output) is int and context > 0 and output > 0:
+            model["limit"] = {"context": context, "output": output}
+        # Unprobed models keep their entry: OpenCode falls back to its own default limits.
+        models[model_id] = model
     return {
         "provider": {
             "relay": {
@@ -134,10 +134,10 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
     except ValueError as exc:
         return report_error(f"relay opencode-config: {exc}", Exit.INVALID, args.json)
     if not catalog.defaults:
-        notices.append("relay opencode-config: no qualified completion backend; no models listed")
+        notices.append("relay opencode-config: no models configured; no models listed")
     ids = [*catalog.models, *(["relay/auto"] if catalog.defaults else [])]
     undiscovered = [i for i in ids if catalog.state(i) == "undiscovered"]
-    failed = [i for i in ids if catalog.state(i) == "failed"] + invalid
+    failed = [i for i in ids if catalog.state(i) == "failed"]
     if undiscovered:
         notices.append(
             "relay opencode-config: models not yet discovered (no cached CLI observation for "
@@ -148,8 +148,15 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         )
     if failed:
         notices.append(
-            "relay opencode-config: omitted models whose probe reported no context/output "
-            "limits: " + ", ".join(failed)
+            "relay opencode-config: listed without observed context/output limits (probe "
+            "failed): "
+            + ", ".join(failed)
+            + "; run `relay opencode-config --refresh` to probe them again"
+        )
+    if invalid:
+        notices.append(
+            "relay opencode-config: omitted models with unusable catalog metadata: "
+            + ", ".join(invalid)
         )
     print(json.dumps(snippet, indent=2, ensure_ascii=True))
     for notice in notices:

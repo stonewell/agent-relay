@@ -582,7 +582,10 @@ class RelayApp(App[int]):
                 self._op(
                     "select coordinator",
                     lambda: self.host.call(self.service.select_coordinator(agent)),
-                    lambda option: self.note(f"coordinator: {option.agent} ({option.mode})"),
+                    lambda option: self.note(
+                        f"coordinator: {option.agent}"
+                        + (f" ({option.mode})" if option.mode else "")
+                    ),
                 )
 
         view = self.view_state

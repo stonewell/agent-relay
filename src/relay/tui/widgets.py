@@ -242,11 +242,19 @@ class Inspector(VerticalScroll):
         if view.readonly_reason:
             lines.append(view.readonly_reason)
         coordinator = view.coordinator
-        lines.append(
-            "Coordinator: "
-            + (f"{coordinator.agent} ({coordinator.mode}, model {coordinator.model})"
-               if coordinator else "unavailable (select a coordinator for details)")
-        )  # fmt: skip
+        if coordinator is None:
+            lines.append("Coordinator: unavailable (select a coordinator for details)")
+        else:
+            details = [
+                part
+                for part in (
+                    coordinator.mode or "",
+                    f"model {coordinator.model}" if coordinator.model else "",
+                )
+                if part
+            ]
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(f"Coordinator: {coordinator.agent}{suffix}")
         lines.append(f"Next base: {view.base.label}")
         if view.base.primary_unchanged:
             lines.append("Primary branch: unchanged (work continues from a retained snapshot)")
