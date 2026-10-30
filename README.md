@@ -364,18 +364,23 @@ a hint to rerun with `--refresh`, which probes every alias (billed) and updates 
 Pass the same `--model` options given to `serve`; `--timeout` bounds each probe (default 120 s).
 Review and merge the snippet into your OpenCode configuration yourself. Limits appear only where
 the CLI reported them, and `tool_call` follows the adapter's completion support.
-Generated models whose backends support reasoning effort offer `low`, `medium` and `high`
-variants; Cursor entries omit these variants, and a non-null `reasoning_effort` for Cursor returns
-HTTP 400 as unsupported. The same supported effort can be selected directly by an
+Generated models offer only reasoning variants present in model inventory. Cursor groups
+inventory-listed suffix variants when at least two distinct effort values share a base model ID;
+the public catalog shows the base ID once, while original suffixed IDs remain privately resolvable.
+Relay accepts `minimal` only for models whose inventory advertises it; unsupported or unavailable
+effort values return HTTP 400. The same supported effort can be selected directly by an
 OpenAI-compatible client without changing the model ID; for example:
 
 ```json
-{"model":"claude/opus","reasoning_effort":"high","messages":[{"role":"user","content":"Review this code"}]}
+{"model":"cursor/gemini-3.8-flash","reasoning_effort":"low","messages":[{"role":"user","content":"Review this code"}]}
 ```
 
-OpenCode exposes the generated variants through its model variant selector. Agy aliases remain
-the CLI-reported slugs; grouping aliases by effort suffix is deferred until the underlying model
-metadata and invocation behavior are verified (task 5.6).
+OpenCode exposes the inventory-derived variants through its model variant selector. Cursor maps a
+base ID and selected effort to the matching original inventory ID; for example, `medium` on
+`cursor/gemini-3.7-flash` selects Cursor's `gemini-3.7-flash-medium` model. With no effort selected,
+Cursor passes the bare base ID and keeps its native default. A legacy full suffix ID passes through
+unchanged unless the request explicitly selects another available effort. Agy aliases remain the
+CLI-reported slugs; grouping them remains deferred pending task 5.6.
 
 The configuration fields follow the [OpenCode provider documentation](https://opencode.ai/docs/providers/)
 and its [environment substitution syntax](https://opencode.ai/docs/config/#env-vars).
