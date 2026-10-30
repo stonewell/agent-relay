@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-from relay.adapters.completion import DEFAULT_MODEL_ALIASES, ObservedModel
+from relay.adapters.completion import DEFAULT_MODEL_ALIASES, CompletionModelOptions, ObservedModel
 from relay.cli.commands import opencode_config, serve
 from relay.cli.main import main
 from relay.cli.phases import COMMAND_PHASE, EARLY_ACCESS, IMPLEMENTED, availability_error
@@ -398,16 +399,21 @@ def test_config_refresh_replaces_changed_observations(
     assert backends[-1].probes == ["opus"]
 
 
-def test_opencode_config_omits_cursor_effort_variants_without_new_catalog_fields() -> None:
+def test_opencode_config_omits_cursor_effort_variants_without_new_catalog_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay.adapters import cursor_completion
     from relay.gateway.models import ModelCatalog
+
+    def enumerated_models(*_: object) -> tuple[str, ...]:
+        return ("named",)
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", enumerated_models)
 
     config = load_config(user_config=None, project_root=None).config
     config.agents["cursor"].enabled = True
     catalog = ModelCatalog(config, discovery.default_adapters(config), models=["named"])
-    supported = {
-        name for name, model in catalog.models.items() if model.support.supports_reasoning_effort
-    }
-    supported.add("relay/auto")
+    supported = {name: model.reasoning_efforts for name, model in catalog.models.items()}
     snippet = opencode_config.provider_config(
         catalog.listing(), "http://127.0.0.1:8765/v1", effort_models=supported
     )
@@ -415,3 +421,43 @@ def test_opencode_config_omits_cursor_effort_variants_without_new_catalog_fields
     assert "variants" not in models["cursor/named"]
     assert set(models["codex/named"]["variants"]) == {"low", "medium", "high"}
     assert not {"cursor", "cursor/default", "codex", "relay/auto"} & models.keys()
+
+
+def test_config_discovery_notices_exclude_private_group_variants_after_refresh(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    config_environment(monkeypatch, tmp_path)
+
+    class GroupedBackend(FakeBackend):
+        default_aliases = ("default", "group", "group-low", "group-high")
+
+    backend = GroupedBackend("claude")
+    backend.support = replace(
+        backend.support,
+        model_options={
+            "group": CompletionModelOptions(("low", "high")),
+            "group-low": CompletionModelOptions(("low", "high"), listed=False),
+            "group-high": CompletionModelOptions(("low", "high"), listed=False),
+        },
+    )
+    backend.limits["group"] = ObservedModel("actual-group", 100000, 10000)
+
+    def adapters(_: object) -> dict[str, FakeBackend]:
+        return {"claude": backend}
+
+    monkeypatch.setattr(discovery, "default_adapters", adapters)
+    assert main(["opencode-config"]) == 0
+    initial = capsys.readouterr()
+    assert "claude/group" in initial.err and "relay/auto" in initial.err
+    assert "claude/default" in initial.err
+    assert "claude/group-low" not in initial.err and "claude/group-high" not in initial.err
+    assert "--refresh" in initial.err
+
+    assert main(["opencode-config", "--refresh"]) == 0
+    refreshed = capsys.readouterr()
+    assert backend.probes == ["default", "group"]
+    assert refreshed.err == ""
+    assert set(json.loads(refreshed.out)["provider"]["relay"]["models"]) == {"claude/group"}
+    assert main(["opencode-config"]) == 0
+    assert capsys.readouterr().err == ""
+    assert backend.probes == ["default", "group"]

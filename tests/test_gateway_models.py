@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -321,3 +322,185 @@ def test_explicit_model_filter_does_not_enumerate_cli_models() -> None:
     assert catalog.agent_aliases["fake"] == ("explicit",)
     assert set(catalog.models) == {"fake", "fake/explicit"}
     assert not adapter.probes
+
+
+def test_cursor_groups_verified_inventory_and_keeps_legacy_ids_routable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay.adapters import cursor_completion
+    from relay.cli.commands.opencode_config import provider_config
+
+    config = configuration()
+    config.agents["cursor"] = config.agents["fake"].model_copy(deep=True)
+
+    def models(*_: object) -> tuple[str, ...]:
+        return (
+            "auto",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-low",
+            "gemini-3.7-flash-low",
+            "gemini-3.7-flash-high",
+            "gemini-3.6-flash-minimal",
+            "gemini-3.6-flash-high",
+            "gemini-3.1-pro",
+        )
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    cursor = cursor_completion.CursorCompletionAdapter(config.agents["cursor"], parent_env={})
+    catalog = ModelCatalog(config, {"fake": FakeBackend(), "cursor": cursor})
+    listing = catalog.listing()
+    cursor_ids = [row["id"] for row in listing["data"] if row["id"].startswith("cursor/")]
+    assert cursor_ids == [
+        "cursor/gemini-3.8-flash",
+        "cursor/gemini-3.7-flash",
+        "cursor/gemini-3.6-flash",
+        "cursor/gemini-3.1-pro",
+    ]
+    assert "gemini-3.8-flash-low" not in catalog.agent_aliases["cursor"]
+    assert "gemini-3.8-flash-high" not in catalog.agent_aliases["cursor"]
+    assert (
+        catalog.public("cursor/gemini-3.8-flash-low")["relay"]["model_alias"]
+        == "gemini-3.8-flash-low"
+    )
+    assert catalog.public("cursor/gemini-3.8-flash")["relay"]["context_length"] is None
+    request = parse_request(
+        {
+            "model": "cursor/gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+        }
+    )
+    assert catalog.candidates(request)[0].model == "gemini-3.8-flash"
+    request.model = "cursor/gemini-3.8-flash-high"
+    assert catalog.candidates(request)[0].effort is None
+    request.reasoning_effort = "medium"
+    with pytest.raises(GatewayError):
+        catalog.candidates(request)
+    request.model = "cursor/gemini-3.1-pro"
+    with pytest.raises(GatewayError) as caught:
+        catalog.candidates(request)
+    assert caught.value.param == "reasoning_effort"
+    request.reasoning_effort = "low"
+    with pytest.raises(GatewayError):
+        catalog.candidates(request)
+    request.model = "relay/auto"
+    assert [model.agent for model in catalog.candidates(request)] == ["fake"]
+    request.reasoning_effort = None
+    assert {model.agent for model in catalog.candidates(request)} == {"fake", "cursor"}
+    snippet = provider_config(
+        listing,
+        "http://127.0.0.1:8765/v1",
+        effort_models={name: model.reasoning_efforts for name, model in catalog.models.items()},
+    )
+    generated = json.loads(json.dumps(snippet))["provider"]["relay"]["models"]
+    assert generated["cursor/gemini-3.8-flash"]["variants"] == {
+        "low": {"reasoningEffort": "low"},
+        "high": {"reasoningEffort": "high"},
+    }
+    assert "cursor/gemini-3.8-flash-low" not in generated
+    assert generated["cursor/gemini-3.7-flash"]["variants"] == {
+        "low": {"reasoningEffort": "low"},
+        "high": {"reasoningEffort": "high"},
+    }
+    assert generated["cursor/gemini-3.6-flash"]["variants"] == {
+        "minimal": {"reasoningEffort": "minimal"},
+        "high": {"reasoningEffort": "high"},
+    }
+    assert "variants" not in generated["cursor/gemini-3.1-pro"]
+    request.model = "cursor/gemini-3.6-flash"
+    request.reasoning_effort = "minimal"
+    assert catalog.candidates(request)[0].reasoning_efforts == ("minimal", "high")
+    for unsupported in (
+        "cursor/gemini-3.8-flash",
+        "cursor/gemini-3.7-flash",
+        "fake/opus",
+        "relay/auto",
+    ):
+        request.model = unsupported
+        with pytest.raises(GatewayError) as caught:
+            catalog.candidates(request)
+        assert caught.value.param == "reasoning_effort"
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_explicit_cursor_filter_uses_inventory_without_publishing_unselected_aliases(
+    monkeypatch: pytest.MonkeyPatch, reused: bool
+) -> None:
+    from relay.adapters import cursor_completion
+
+    config = configuration()
+    config.agents["cursor"] = config.agents.pop("fake")
+    cursor = cursor_completion.CursorCompletionAdapter(config.agents["cursor"], parent_env={})
+    calls = 0
+
+    def models(*_: object) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        return ("gemini-3.8-flash-low", "gemini-3.8-flash-high")
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    previous: ModelCatalog | None = None
+    if reused:
+        previous = ModelCatalog(config, {"cursor": cursor})
+        assert previous.models["cursor/gemini-3.8-flash"].reasoning_efforts == ("low", "high")
+        assert not previous.models["cursor/gemini-3.8-flash-low"].listed
+
+    selected = ["gemini-3.8-flash", "gemini-3.8-flash-low", "auto", "default"]
+    catalog = ModelCatalog(config, {"cursor": cursor}, models=selected)
+    assert calls == 1
+    assert "cursor/gemini-3.8-flash-high" not in catalog.models
+    assert [entry["id"] for entry in catalog.listing()["data"]] == [
+        "cursor/gemini-3.8-flash",
+        "cursor/gemini-3.8-flash-low",
+    ]
+    for model_id in ("cursor/gemini-3.8-flash", "cursor/gemini-3.8-flash-low"):
+        assert catalog.models[model_id].reasoning_efforts == ("low", "high")
+        for effort in ("low", "high"):
+            request = parse_request(
+                {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": effort,
+                }
+            )
+            model = catalog.candidates(request)[0]
+            assert (
+                cursor.arguments(CompletionRequest("hi", model.model, effort))[-1]
+                == f"gemini-3.8-flash-{effort}"
+            )
+    if reused:
+        assert previous is not None
+        assert previous.models["cursor/gemini-3.8-flash"].reasoning_efforts == ("low", "high")
+        assert not previous.models["cursor/gemini-3.8-flash-low"].listed
+
+
+def test_cursor_verified_capabilities_do_not_register_unselected_models_or_leak_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay.adapters import cursor_completion
+
+    config = configuration()
+    config.agents["cursor"] = config.agents.pop("fake")
+
+    def models(*_: object) -> tuple[str, ...]:
+        return ("gemini-3.8-flash-low", "gemini-3.8-flash-high")
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    enumerated = cursor_completion.CursorCompletionAdapter(config.agents["cursor"], parent_env={})
+    ModelCatalog(config, {"cursor": enumerated})
+
+    def other_models(*_: object) -> tuple[str, ...]:
+        return ("new-model-low", "new-model-high")
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", other_models)
+    fresh = cursor_completion.CursorCompletionAdapter(config.agents["cursor"], parent_env={})
+    assert "gemini-3.8-flash" not in fresh.inspect().model_options
+    assert fresh.inspect().model_options["new-model"].reasoning_efforts == ("low", "high")
+    catalog = ModelCatalog(config, {"cursor": enumerated}, models=["gemini-3.1-pro"])
+    assert set(catalog.models) == {"cursor", "cursor/gemini-3.1-pro"}
+    request = parse_request(
+        {"model": "cursor/gemini-3.8-flash", "messages": [{"role": "user", "content": "hi"}]}
+    )
+    with pytest.raises(GatewayError) as caught:
+        catalog.candidates(request)
+    assert caught.value.code == "model_not_found"

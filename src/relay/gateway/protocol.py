@@ -119,7 +119,7 @@ class StreamOptions(Strict):
 
 class ChatRequest(Strict):
     model: str = Field(min_length=1)
-    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
     messages: list[Message] = Field(min_length=1, max_length=10000)
     tools: list[Tool] | None = Field(default=None, max_length=128)
     tool_choice: Literal["auto", "none", "required"] | NamedChoice = "auto"

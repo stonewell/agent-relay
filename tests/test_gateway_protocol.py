@@ -117,7 +117,7 @@ def test_unsupported_or_wrong_parameters(field: str, value: object) -> None:
         parse_request(tool_request(**{field: value}))
 
 
-@pytest.mark.parametrize("effort", [None, "low", "medium", "high"])
+@pytest.mark.parametrize("effort", [None, "minimal", "low", "medium", "high"])
 def test_reasoning_effort(effort: str | None) -> None:
     assert parse_request(tool_request()).reasoning_effort is None
     assert parse_request(tool_request(reasoning_effort=effort)).reasoning_effort == effort

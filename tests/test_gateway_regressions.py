@@ -6,6 +6,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +21,92 @@ from relay.gateway.app import GatewayLimits, create_app
 from test_gateway_app import WaitingBackend
 from test_gateway_models import FakeBackend, configuration
 from test_gateway_protocol import tool_request
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-low",
+        "gemini-3.7-flash",
+        "gemini-3.7-flash-low",
+        "gemini-3.6-flash",
+        "gemini-3.6-flash-minimal",
+    ],
+)
+@pytest.mark.parametrize("effort", [None, "minimal", "medium"])
+def test_cursor_native_reasoning_selection_survives_http_tool_repair(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, model: str, effort: str | None
+) -> None:
+    from relay.adapters import cursor_completion
+    from relay.core.platform.proc import ProcessResult
+    from relay.gateway.models import ModelCatalog
+
+    calls: list[tuple[tuple[str, ...], str]] = []
+    base = model.removesuffix("-low").removesuffix("-minimal")
+
+    def models(*_: object) -> tuple[str, ...]:
+        return tuple(
+            f"gemini-{version}-flash-{value}"
+            for version in ("3.8", "3.7", "3.6")
+            for value in ("low", "medium", "high")
+        ) + ("gemini-3.6-flash-minimal",)
+
+    def command(cmd: str, args: tuple[str, ...], **_: Any) -> tuple[str, ...]:
+        return (cmd, *args)
+
+    def run(argv: tuple[str, ...], **kwargs: Any) -> ProcessResult:
+        calls.append((argv, kwargs["stdin"]))
+        content = (
+            "invalid envelope"
+            if len(calls) == 1
+            else json.dumps(
+                {"content": None, "tool_calls": [{"name": "edit", "arguments": {"text": "ok"}}]}
+            )
+        )
+        return ProcessResult(
+            0,
+            json.dumps(
+                {"type": "result", "subtype": "success", "is_error": False, "result": content}
+            ),
+        )
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    monkeypatch.setattr(cursor_completion, "resolve_command", command)
+    monkeypatch.setattr(cursor_completion, "run_process", run)
+    config = configuration()
+    config.agents["cursor"] = config.agents.pop("fake")
+    cursor = cursor_completion.CursorCompletionAdapter(config.agents["cursor"], parent_env={})
+    catalog = ModelCatalog(config, {"cursor": cursor})
+    app = create_app(config, token="test-token", adapters={"cursor": cursor}, catalog=catalog)
+    body = tool_request(tool_choice="required", stream=stream)
+    body.update(model=f"cursor/{model}", reasoning_effort=effort)
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.post("/v1/chat/completions", json=body)
+    if effort == "minimal" and base != "gemini-3.6-flash":
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["param"] == "reasoning_effort"
+        assert calls == []
+        return
+    assert response.status_code == 200, response.text
+    assert len(calls) == 2
+    native = model if effort is None else f"{base}-{effort}"
+    assert all(argv[-2:] == ("--model", native) for argv, _ in calls)
+    assert json.loads(calls[0][1].splitlines()[1])["effort"] == effort
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert all(chunk["model"] == f"cursor/{model}" for chunk in chunks)
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["model"] == f"cursor/{model}"
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
 
 
 def test_auto_skips_busy_agent_but_explicit_alias_stays_pinned() -> None:

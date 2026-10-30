@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from relay.adapters.completion import (
@@ -52,6 +52,18 @@ class GatewayModel:
     adapter: CompletionCapable
     cost: str | None = None
 
+    @property
+    def reasoning_efforts(self) -> tuple[str, ...]:
+        options = self.support.model_options.get(self.model)
+        if options is not None:
+            return options.reasoning_efforts
+        return ("low", "medium", "high") if self.support.supports_reasoning_effort else ()
+
+    @property
+    def listed(self) -> bool:
+        options = self.support.model_options.get(self.model)
+        return options is None or options.listed
+
     def public(self, observed: ObservedModel | None) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -73,8 +85,13 @@ class GatewayModel:
         }
 
     def check(self, request: ChatRequest, observed: ObservedModel | None) -> None:
-        if request.reasoning_effort is not None and not self.support.supports_reasoning_effort:
-            raise GatewayError(400, "model does not support reasoning effort", "reasoning_effort")
+        if (
+            request.reasoning_effort is not None
+            and request.reasoning_effort not in self.reasoning_efforts
+        ):
+            raise GatewayError(
+                400, "model does not support this reasoning effort", "reasoning_effort"
+            )
         if (
             observed is not None
             and request.output_tokens is not None
@@ -115,8 +132,6 @@ class ModelCatalog:
             if not agent.enabled or name not in adapters:
                 continue
             adapter = adapters[name]
-            support = adapter.inspect()
-            self._supports[name] = (adapter, support)
             if models is not None:
                 aliases = self.aliases
             else:
@@ -131,7 +146,23 @@ class ModelCatalog:
                     )
                 else:
                     aliases = self.aliases
-            self.agent_aliases[name] = aliases
+            # Model enumeration may establish per-model capabilities on the adapter.
+            support = adapter.inspect()
+            if models is not None:
+                # Explicit selection publishes exactly those IDs, including legacy aliases.
+                support = replace(
+                    support,
+                    model_options={
+                        alias: replace(options, listed=True)
+                        for alias, options in support.model_options.items()
+                    },
+                )
+            self._supports[name] = (adapter, support)
+            self.agent_aliases[name] = tuple(
+                model
+                for model in aliases
+                if model not in support.model_options or support.model_options[model].listed
+            )
             alias = GatewayModel(name, name, aliases[0], None, support, adapter, agent.cost)
             self._add(alias)
             self.defaults.append(alias)
@@ -298,7 +329,7 @@ class ModelCatalog:
         ids = [
             model.id
             for model in self.models.values()
-            if model.id != model.agent and model.model not in {"auto", "default"}
+            if model.listed and model.id != model.agent and model.model not in {"auto", "default"}
         ]
         entries = [self._public(model_id, observed) for model_id in ids]
         return {"object": "list", "data": [entry for entry in entries if entry is not None]}

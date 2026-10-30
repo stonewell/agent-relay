@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -44,11 +44,22 @@ def model_aliases(values: Iterable[str] | None = None) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class CompletionModelOptions:
+    """Internal per-model capabilities; hidden aliases remain explicitly routable."""
+
+    reasoning_efforts: tuple[str, ...] = ()
+    listed: bool = True
+
+
+@dataclass(frozen=True)
 class CompletionSupport:
     profile: CompletionProfile
     supports_tools: bool = False
     native_max_tokens: bool = False
     supports_reasoning_effort: bool = True
+    model_options: Mapping[str, CompletionModelOptions] = field(
+        default_factory=lambda: dict[str, CompletionModelOptions]()
+    )
 
 
 @dataclass(frozen=True)

@@ -364,8 +364,160 @@ def test_cursor_effort_rejected_before_launch(effort: str, tmp_path: Path) -> No
 @pytest.mark.parametrize("model", ["--force", "foo!x!", "foo bar", "foo;echo", "foo%PATH%"])
 def test_cursor_invalid_model_is_rejected(model: str) -> None:
     with pytest.raises(CompletionError) as caught:
-        CursorCompletionAdapter.arguments(CompletionRequest("hello", model))
+        CursorCompletionAdapter(Agent(cmd="agent")).arguments(CompletionRequest("hello", model))
     assert caught.value.param == "model"
+
+
+@pytest.fixture
+def reasoning_cursor(monkeypatch: pytest.MonkeyPatch) -> CursorCompletionAdapter:
+    def models(*_: object) -> tuple[str, ...]:
+        return (
+            "auto",
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-high",
+            "gemini-3.7-flash-low",
+            "gemini-3.7-flash-medium",
+            "gemini-3.7-flash-high",
+            "gemini-3.6-flash-minimal",
+            "gemini-3.6-flash-low",
+            "gemini-3.6-flash-medium",
+            "gemini-3.6-flash-high",
+            "new-provider-model-low",
+            "new-provider-model-high",
+            "other-high",
+            "gemini-3.1-pro",
+        )
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    adapter = CursorCompletionAdapter(Agent(cmd="agent"), parent_env={})
+    assert "gemini-3.8-flash" in adapter.default_aliases
+    return adapter
+
+
+@pytest.mark.parametrize("model", ["gemini-3.8-flash", "gemini-3.8-flash-low"])
+@pytest.mark.parametrize("effort", [None, "low", "medium", "high"])
+def test_cursor_reasoning_parameter_preserves_native_default_and_overrides_legacy_suffix(
+    reasoning_cursor: CursorCompletionAdapter, model: str, effort: str | None
+) -> None:
+    args = reasoning_cursor.arguments(CompletionRequest("hello", model, effort))
+    expected = model if effort is None else f"gemini-3.8-flash-{effort}"
+    assert args == (
+        "-p",
+        "--mode",
+        "ask",
+        "--trust",
+        "--output-format",
+        "stream-json",
+        "--model",
+        expected,
+    )
+
+
+@pytest.mark.parametrize("base", ["gemini-3.7-flash", "gemini-3.6-flash"])
+@pytest.mark.parametrize("effort", [None, "low", "medium", "high"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_cursor_other_reasoning_families_preserve_defaults_and_map_effort(
+    reasoning_cursor: CursorCompletionAdapter, base: str, effort: str | None, legacy: bool
+) -> None:
+    model = f"{base}-low" if legacy else base
+    args = reasoning_cursor.arguments(CompletionRequest("hello", model, effort))
+    assert args[-1] == (model if effort is None else f"{base}-{effort}")
+
+
+@pytest.mark.parametrize(
+    "model", ["gemini-3.6-flash", "gemini-3.6-flash-minimal", "gemini-3.6-flash-high"]
+)
+def test_cursor_minimal_is_native_only_for_supported_family(
+    reasoning_cursor: CursorCompletionAdapter, model: str
+) -> None:
+    assert (
+        reasoning_cursor.arguments(CompletionRequest("hello", model, "minimal"))[-1]
+        == "gemini-3.6-flash-minimal"
+    )
+    assert reasoning_cursor.arguments(CompletionRequest("hello", model))[-1] == model
+
+
+@pytest.mark.parametrize("model", ["gemini-3.8-flash", "gemini-3.7-flash-low", "gemini-3.1-pro"])
+def test_cursor_minimal_is_rejected_for_other_families(
+    reasoning_cursor: CursorCompletionAdapter, model: str
+) -> None:
+    with pytest.raises(CompletionError) as caught:
+        reasoning_cursor.arguments(CompletionRequest("hello", model, "minimal"))
+    assert caught.value.param == "reasoning_effort"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "default",
+        "auto",
+        "other-high",
+        "gemini-9-flash-low",
+        "other-minimal",
+        "gemini-3.1-pro",
+    ],
+)
+def test_cursor_effort_is_not_inferred_from_unverified_suffixes(
+    reasoning_cursor: CursorCompletionAdapter, model: str
+) -> None:
+    with pytest.raises(CompletionError) as caught:
+        reasoning_cursor.arguments(CompletionRequest("hello", model, "low"))
+    assert caught.value.param == "reasoning_effort"
+    args = reasoning_cursor.arguments(CompletionRequest("hello", model))
+    assert ("--model" not in args) if model == "default" else args[-1] == model
+
+
+def test_cursor_future_family_uses_inventory_without_manual_mapping(
+    reasoning_cursor: CursorCompletionAdapter,
+) -> None:
+    assert reasoning_cursor.inspect().model_options["new-provider-model"].reasoning_efforts == (
+        "low",
+        "high",
+    )
+    for model in ("new-provider-model", "new-provider-model-low"):
+        assert (
+            reasoning_cursor.arguments(CompletionRequest("hello", model, "high"))[-1]
+            == "new-provider-model-high"
+        )
+        with pytest.raises(CompletionError):
+            reasoning_cursor.arguments(CompletionRequest("hello", model, "medium"))
+
+
+def test_cursor_groups_only_successfully_enumerated_efforts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def models(*_: object) -> tuple[str, ...]:
+        return ("gemini-3.8-flash-high", "gemini-3.8-flash-low")
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    adapter = CursorCompletionAdapter(Agent(cmd="agent"), parent_env={})
+    assert adapter.default_aliases == (
+        "default",
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-low",
+    )
+    support = adapter.inspect()
+    assert support.model_options["gemini-3.8-flash"].reasoning_efforts == ("low", "high")
+    assert support.model_options["gemini-3.8-flash-low"].listed is False
+    with pytest.raises(CompletionError):
+        adapter.arguments(CompletionRequest("hello", "gemini-3.8-flash", "medium"))
+    with pytest.raises(CompletionError):
+        adapter.arguments(CompletionRequest("hello", "gemini-3.8-flash", "low] --force"))
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", no_models)
+    fallback = CursorCompletionAdapter(
+        Agent(cmd="agent", models={"fast": "gemini-3.8-flash-low"}), parent_env={}
+    )
+    assert fallback.default_aliases == ("default", "gemini-3.8-flash-low")
+    assert fallback.inspect().model_options == {}
+    assert (
+        fallback.arguments(CompletionRequest("hello", "gemini-3.8-flash-low"))[-1]
+        == "gemini-3.8-flash-low"
+    )
+    with pytest.raises(CompletionError):
+        fallback.arguments(CompletionRequest("hello", "gemini-3.8-flash-low", "high"))
 
 
 def test_cursor_plain_usage_and_observed_metadata() -> None:

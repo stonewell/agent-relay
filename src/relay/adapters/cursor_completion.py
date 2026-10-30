@@ -24,6 +24,7 @@ from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
 from relay.adapters.completion import (
     CompletionError,
     CompletionInvalid,
+    CompletionModelOptions,
     CompletionProfile,
     CompletionRequest,
     CompletionResult,
@@ -59,6 +60,7 @@ ENUMERATION_TIMEOUT_S = 15.0
 ENUMERATION_OUTPUT_BYTES = 4 * 1024 * 1024
 _ENUMERATED: dict[tuple[str, str], tuple[str, ...]] = {}
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 logger = logging.getLogger("uvicorn.error")
 _DENY_SCRIPT = """import json
 import sys
@@ -173,24 +175,66 @@ class CursorCompletionAdapter:
     def __init__(self, agent: Agent, *, parent_env: Mapping[str, str] | None = None) -> None:
         self._agent = agent
         self._parent_env = None if parent_env is None else dict(parent_env)
+        self._aliases: tuple[str, ...] | None = None
+        self._model_options: dict[str, CompletionModelOptions] = {}
+        self._reasoning_models: dict[str, dict[str, str]] = {}
+        self._reasoning_aliases: dict[str, str] = {}
 
     @property
     def default_aliases(self) -> tuple[str, ...]:
+        return self._load_models()
+
+    def _load_models(self) -> tuple[str, ...]:
+        if self._aliases is not None:
+            return self._aliases
         parent = os.environ if self._parent_env is None else self._parent_env
         extra: dict[str, str] = {}
         if "CURSOR_API_KEY" not in self._agent.env and parent.get("CURSOR_API_KEY"):
             extra["CURSOR_API_KEY"] = parent["CURSOR_API_KEY"]
         env = build_env(self._agent, extra, parent_env=parent)
         cmd = resolve_cursor_command(self._agent.cmd, env)
-        models = _enumerated_models(cmd, env) or tuple(self._agent.models.values())
-        return model_aliases(("default", *models))
+        models = _enumerated_models(cmd, env)
+        families: dict[str, dict[str, str]] = {}
+        for model in models:
+            base, _, effort = model.rpartition("-")
+            if base and effort in _REASONING_EFFORTS:
+                families.setdefault(base, {})[effort] = model
+        # A lone suffix may be part of a standalone name. Require multiple discovered
+        # variants, and retain their exact native IDs rather than guessing parameter keys.
+        self._reasoning_models = {
+            base: {effort: variants[effort] for effort in _REASONING_EFFORTS if effort in variants}
+            for base, variants in families.items()
+            if len(variants) > 1
+        }
+        self._reasoning_aliases = {
+            alias: base
+            for base, variants in self._reasoning_models.items()
+            for alias in (base, *variants.values())
+        }
+        options: dict[str, CompletionModelOptions] = {}
+        aliases: list[str] = ["default"]
+        for model in models or tuple(self._agent.models.values()):
+            base = self._reasoning_aliases.get(model)
+            if base is not None and model != base:
+                aliases.append(base)
+                efforts = tuple(self._reasoning_models[base])
+                options[base] = CompletionModelOptions(efforts)
+                options[model] = CompletionModelOptions(efforts, listed=False)
+            aliases.append(model)
+        self._model_options = options
+        self._aliases = model_aliases(aliases)
+        return self._aliases
 
     def inspect(self, *, timeout_s: float = 10) -> CompletionSupport:
+        # Explicit --model filters still need account inventory to establish variants.
+        # This is a cached, read-only metadata command, never a completion probe.
+        self._load_models()
         return CompletionSupport(
             profile=CompletionProfile(self.id, "unknown", sys.platform, "unknown", "none"),
             supports_tools=True,
             native_max_tokens=False,
             supports_reasoning_effort=False,
+            model_options=self._model_options,
         )
 
     def _environment(self, config: Path, data: Path) -> CompleteEnv:
@@ -202,22 +246,29 @@ class CursorCompletionAdapter:
         # Keep HOME/APPDATA/XDG_CONFIG_HOME unchanged; no credentials need copying.
         return build_env(self._agent, extra, parent_env=parent)
 
-    @staticmethod
-    def arguments(request: CompletionRequest) -> tuple[str, ...]:
-        if request.effort is not None:
-            raise CompletionError(
-                "Cursor does not support independent reasoning effort",
-                status=400,
-                code="unsupported_parameter",
-                param="reasoning_effort",
-            )
+    def arguments(self, request: CompletionRequest) -> tuple[str, ...]:
         try:
             model_aliases((request.model,))
         except ValueError as exc:
             raise CompletionError("Invalid Cursor model", status=400, param="model") from exc
+        model = request.model
+        if request.effort is not None:
+            self._load_models()
+            base = self._reasoning_aliases.get(model)
+            variants = {} if base is None else self._reasoning_models[base]
+            if request.effort not in variants:
+                raise CompletionError(
+                    "Cursor model does not support this reasoning effort",
+                    status=400,
+                    code="unsupported_parameter",
+                    param="reasoning_effort",
+                )
+            # An explicit effort overrides a legacy suffix. Without one, keep the exact
+            # requested alias: bare base uses Cursor's default, legacy -low stays low.
+            model = variants[request.effort]
         args = ["-p", "--mode", "ask", "--trust", "--output-format", "stream-json"]
-        if request.model != "default":
-            args += ["--model", request.model]
+        if model != "default":
+            args += ["--model", model]
         return tuple(args)
 
     def complete(
