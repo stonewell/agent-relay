@@ -68,21 +68,33 @@ def test_envelope_native_field_preferred_and_failure_cannot_be_repaired_as_succe
 
 
 @pytest.mark.parametrize(
-    ("proc", "status"),
+    ("proc", "status", "code"),
     [
-        (ProcessResult(None, timed_out=True), 504),
-        (ProcessResult(1, stderr="context_length_exceeded: secret"), 400),
-        (ProcessResult(1, stderr="other secret"), 502),
+        (ProcessResult(None, timed_out=True), 504, "timeout"),
+        (
+            ProcessResult(1, stderr="context_length_exceeded: secret"),
+            400,
+            "context_length_exceeded",
+        ),
+        (ProcessResult(1, stderr="other secret"), 502, "completion_failed"),
+        (
+            ProcessResult(1, stderr="429 Too Many Requests: secret"),
+            429,
+            "rate_limit_exceeded",
+        ),
     ],
 )
-def test_process_error_categories_do_not_expose_stderr(proc: ProcessResult, status: int) -> None:
+def test_process_error_categories_do_not_expose_stderr(
+    proc: ProcessResult, status: int, code: str
+) -> None:
     with pytest.raises(CompletionError) as caught:
         parse_completion(proc, structured=False)
     assert caught.value.status == status
-    if status == 502:
+    assert caught.value.code == code
+    if status in (429, 502):
         # Bad exits name the exit code and a redacted stderr tail.
         assert "exit code 1" in str(caught.value)
-        assert "other secret" in str(caught.value)
+        assert "secret" in str(caught.value)
     else:
         assert "secret" not in str(caught.value)
 

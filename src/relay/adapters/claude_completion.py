@@ -50,6 +50,15 @@ def _capture(_: str) -> None:
 
 discard_output = _capture
 
+# CLI diagnostics that indicate provider rate limiting; matched case-insensitively.
+RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    "429",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "quota",
+)
+
 
 class ClaudeCompletionAdapter:
     id = "claude"
@@ -216,6 +225,8 @@ def parse_completion(
             f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
         )
         print(message, file=sys.stderr)
+        if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
+            raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)
     if payload is None:
         message = (

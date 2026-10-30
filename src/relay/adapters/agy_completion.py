@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from relay.adapters.antigravity import agy_envelope, envelope_error
-from relay.adapters.claude_completion import discard_output
+from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
 from relay.adapters.completion import (
     CompletionError,
     CompletionInvalid,
@@ -293,6 +293,8 @@ def parse_completion(
             f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
         )
         print(message, file=sys.stderr)
+        if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
+            raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)
     if payload is None:
         message = (

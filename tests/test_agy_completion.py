@@ -123,6 +123,38 @@ def test_agy_parse_completion_error_sanitization() -> None:
         parse_completion(proc_invalid, structured=False)
 
 
+@pytest.mark.parametrize(
+    ("proc", "status", "code"),
+    [
+        (ProcessResult(None, timed_out=True), 504, "timeout"),
+        (
+            ProcessResult(1, stderr="context_length_exceeded: secret"),
+            400,
+            "context_length_exceeded",
+        ),
+        (ProcessResult(1, stderr="other secret"), 502, "completion_failed"),
+        (
+            ProcessResult(3, stderr="error: Individual quota reached: secret"),
+            429,
+            "rate_limit_exceeded",
+        ),
+    ],
+)
+def test_agy_process_error_categories_do_not_expose_stderr(
+    proc: ProcessResult, status: int, code: str
+) -> None:
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(proc, structured=False)
+    assert caught.value.status == status
+    assert caught.value.code == code
+    if status in (429, 502):
+        # Bad exits name the exit code and a redacted stderr tail.
+        assert f"exit code {proc.exit_code}" in str(caught.value)
+        assert "secret" in str(caught.value)
+    else:
+        assert "secret" not in str(caught.value)
+
+
 SLUGS = ("gemini-4-argon-medium", "claude-sonnet-5-5-high")
 
 
