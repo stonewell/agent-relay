@@ -200,8 +200,9 @@ def _default_adapters(config: Config) -> dict[str, AgentAdapter]:
 
     Imports are local so importing ``relay.core.run`` never drags in adapter modules, and so
     agents without an adapter here (e.g. the built-in ``gemini``) are simply absent from the
-    registry and reported unavailable by the probe below. ``cursor`` is registered whenever it
-    is configured; it is disabled by default, and routing never selects a disabled agent.
+    registry and reported unavailable by ``_availability`` below. ``cursor`` is registered
+    whenever it is configured; it is disabled by default, and routing never selects a disabled
+    agent.
     """
     from relay.adapters.claude import ClaudeAdapter
     from relay.adapters.codex import CodexAdapter
@@ -217,18 +218,22 @@ def _default_adapters(config: Config) -> dict[str, AgentAdapter]:
     return adapters
 
 
-async def _probe(
+def _availability(
     config: Config, adapters: Mapping[str, AgentAdapter]
 ) -> tuple[dict[str, bool], dict[str, tuple[PermissionLevel, ...]]]:
-    """Probe every adapter once; configured agents without an adapter are unavailable."""
-    available = {name: False for name in config.agents}
-    levels: dict[str, tuple[PermissionLevel, ...]] = {name: ("full",) for name in config.agents}
-    for name, adapter in adapters.items():
-        if name not in config.agents:
-            continue
-        probe = await adapter.probe()
-        available[name] = probe.available
-        levels[name] = probe.levels
+    """Availability from configuration only: enabled and backed by an adapter.
+
+    No agent CLI is resolved, executed or version-probed: a missing or broken CLI is the
+    user's problem and surfaces when the adapter launches (design section 7.1). ``levels`` is
+    the literal pair every adapter enforces, so permission gating stays fail-closed without a
+    subprocess.
+    """
+    available = {
+        name: agent.enabled and name in adapters for name, agent in config.agents.items()
+    }
+    levels: dict[str, tuple[PermissionLevel, ...]] = {
+        name: ("full", "readonly") for name in config.agents
+    }
     return available, levels
 
 
@@ -715,7 +720,7 @@ async def run_foreground(
     registry = _default_adapters(config)
     for name, adapter in (adapters or {}).items():
         registry[name] = adapter
-    available, levels = await _probe(config, registry)
+    available, levels = _availability(config, registry)
 
     pre_resolution = resolve_level(
         task=task.permissions,

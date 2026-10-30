@@ -41,14 +41,7 @@ from .apply import (
 from .capture import CaptureResult, Change, ChangeCounts
 from .checkpoints import is_deliverable, load_checkpoint
 from .controller import SessionController
-from .coordinator import (
-    QUALIFICATIONS,
-    CoordinationLimits,
-    CoordinatorProfile,
-    Qualification,
-    qualification_for,
-    select_coordinator,
-)
+from .coordinator import CoordinationLimits, select_coordinator
 from .delivery import (
     DeliveryBlocked,
     PreparedDelivery,
@@ -68,7 +61,6 @@ from .planning import (
     PlanningEngine,
     PlanningSetup,
     TurnResult,
-    proposer_record,
     recover_turns,
 )
 from .planning import validate_plan as _validate_plan
@@ -76,7 +68,7 @@ from .progress import ProgressSubscription
 from .publish import diff_artifact_path
 from .registry import Config
 from .router import route_agent
-from .run import _default_adapters, _probe  # pyright: ignore[reportPrivateUsage]
+from .run import _default_adapters  # pyright: ignore[reportPrivateUsage]
 from .sessions import (
     DELETING,
     SessionBusy,
@@ -122,7 +114,7 @@ _GIT_TIMEOUT_S = 30.0
 
 
 class CoordinationUnavailable(SessionError):
-    """No qualified coordinator is selected; saved sessions can still be inspected."""
+    """No coordinator is selected; saved sessions can still be inspected."""
 
 
 def _token() -> str:
@@ -232,10 +224,9 @@ async def _settle_tasks() -> None:
 
 @dataclass(frozen=True)
 class CoordinatorBackend:
-    """A CLI that could coordinate: its probed profile and `coordinate` capability, if any."""
+    """A CLI that could coordinate: its `coordinate` capability, if any."""
 
     agent: str
-    profile: CoordinatorProfile | None
     coordinate: Coordinate | None
     note: str = ""
 
@@ -251,27 +242,13 @@ class CoordinatorOption:
 
 
 async def default_coordinators(config: Config) -> dict[str, CoordinatorBackend]:
-    """Probe the installed CLIs (`--version` only, never a model call) for coordination."""
+    """The configured, enabled agents whose adapter provides the `coordinate` capability."""
     from relay.adapters.claude import ClaudeAdapter
 
     found: dict[str, CoordinatorBackend] = {}
-    if "claude" in config.agents:
-        adapter = ClaudeAdapter(config.agents["claude"])
-        probe = await adapter.probe()
-        if probe.available:
-            found["claude"] = CoordinatorBackend(
-                "claude", adapter.coordinator_profile(probe.version), adapter.coordinate
-            )
-        else:
-            found["claude"] = CoordinatorBackend("claude", None, None, "claude is not installed")
-    if "codex" in config.agents:
-        found["codex"] = CoordinatorBackend(
-            "codex",
-            None,
-            None,
-            "Codex has no qualifying restricted profile (spike 2.31: `-s read-only` reads "
-            "outside the workspace), so it cannot coordinate",
-        )
+    entry = config.agents.get("claude")
+    if entry is not None and entry.enabled:
+        found["claude"] = CoordinatorBackend("claude", ClaudeAdapter(entry).coordinate)
     return found
 
 
@@ -488,7 +465,6 @@ class SessionApp:
         config: Config,
         adapters: Mapping[str, AgentAdapter] | None = None,
         coordinators: Mapping[str, CoordinatorBackend] | None = None,
-        records: tuple[Qualification, ...] = QUALIFICATIONS,
         limits: CoordinationLimits | None = None,
         concurrency: int | None = None,
         poll_s: float = 0.1,
@@ -499,7 +475,6 @@ class SessionApp:
         self._backends: dict[str, CoordinatorBackend] | None = (
             dict(coordinators) if coordinators is not None else None
         )
-        self._records = records
         self._limits = limits or CoordinationLimits(**config.coordination.model_dump())
         self._concurrency = concurrency
         self._poll_s = poll_s
@@ -530,14 +505,20 @@ class SessionApp:
     # --- startup and coordinators -----------------------------------------------------------
 
     async def start(self) -> None:
-        """Probe agents and coordinators once (`--version` probes only; never a model call)."""
+        """Load coordinators from configuration; no agent CLI is run to detect availability."""
         registry = _default_adapters(self.config)
         registry.update(self._adapters or {})
-        self._available, self._levels = await _probe(self.config, registry)
+        self._available = {
+            name: agent.enabled and name in registry
+            for name, agent in self.config.agents.items()
+        }
+        self._levels = {
+            name: ("full", "readonly") for name in registry if name in self.config.agents
+        }
         if self._backends is None:
             self._backends = await default_coordinators(self.config)
-        profiles = {k: b.profile for k, b in self._backends.items() if b.profile is not None}
-        chosen = select_coordinator(profiles, records=self._records)
+        candidates = [name for name, b in self._backends.items() if b.coordinate is not None]
+        chosen = select_coordinator(candidates)
         self._choice = chosen.agent
 
     def coordinator_options(self) -> tuple[CoordinatorOption, ...]:
@@ -545,16 +526,14 @@ class SessionApp:
         for name in sorted(self._backends or {}):
             backend = (self._backends or {})[name]
             model = self._coordinator_model(name)
-            if backend.profile is None or backend.coordinate is None:
+            if backend.coordinate is None:
                 options.append(
                     CoordinatorOption(
                         name, False, None, backend.note or "no coordinate capability", model, False
                     )
                 )
                 continue
-            selection = select_coordinator(
-                {name: backend.profile}, requested=name, records=self._records
-            )
+            selection = select_coordinator([name], requested=name)
             available = selection.available and model is not None
             reason = selection.reason
             if selection.available and model is None:
@@ -570,15 +549,8 @@ class SessionApp:
         entry = self.config.agents.get(agent)
         return entry.models.get("balanced") if entry is not None else None
 
-    def _qualification(self) -> Qualification | None:
-        backend = (self._backends or {}).get(self._choice or "")
-        if backend is None or backend.profile is None:
-            return None
-        record = qualification_for(backend.profile, self._records)
-        return record if record is not None and record.status == "qualified" else None
-
     async def select_coordinator(self, agent: str) -> CoordinatorOption:
-        """Choose the coordinator; only qualified modes can be chosen (section 7.4)."""
+        """Choose the coordinator (section 7.4)."""
         options = {o.agent: o for o in self.coordinator_options()}
         option = options.get(agent)
         if option is None:
@@ -591,16 +563,16 @@ class SessionApp:
 
     def _build_engine(self) -> None:
         self._engine = None
-        owner, record = self._owner, self._qualification()
+        owner = self._owner
         backend = (self._backends or {}).get(self._choice or "")
-        if owner is None or record is None or backend is None or backend.coordinate is None:
+        if owner is None or backend is None or backend.coordinate is None:
             return
         base = self._next_base(owner.store)
         self._engine = PlanningEngine(
             owner,
             PlanningSetup(
                 coordinate=backend.coordinate,
-                qualification=record,
+                agent=backend.agent,
                 config=self.config,
                 base_commit=base.commit or self._head(),
                 available=self._available,
@@ -697,16 +669,10 @@ class SessionApp:
         return store.session_id
 
     def _coordinator_record(self) -> dict[str, Any]:
-        record = self._qualification()
-        if record is None:
+        backend = (self._backends or {}).get(self._choice or "")
+        if backend is None or backend.coordinate is None:
             return {}
-        return {
-            "agent": record.profile.agent,
-            "mode": record.mode,
-            "cli_version": record.profile.cli_version,
-            "config_digest": record.profile.config_digest,
-            "model": self._coordinator_model(record.profile.agent),
-        }
+        return {"agent": backend.agent, "model": self._coordinator_model(backend.agent)}
 
     async def _acquire(self, store: SessionStore) -> None:
         try:
@@ -868,7 +834,7 @@ class SessionApp:
         """A new operator request (no round executing): one bounded coordination turn."""
         if not text.strip():
             raise SessionError("type a request first")
-        if self._owner is None and self._readonly is None and self._qualification() is None:
+        if self._owner is None and self._readonly is None and self._engine is None:
             self._require_engine()  # explains why coordination is unavailable
         if self.executing:
             raise SessionConflict("a round is executing; steering uses Checkpoint and revise")
@@ -930,12 +896,6 @@ class SessionApp:
             raise SessionConflict(
                 f"plan revision {revision} records no proposing coordinator; ask for a new plan "
                 "revision before approving"
-            )
-        current = self._qualification()
-        if current is None or proposer != proposer_record(current):
-            raise SessionConflict(
-                "the coordinator or its configuration changed since this plan was proposed; "
-                "ask for a new plan revision before approving"
             )
         self._flags.starting = True
         try:
@@ -1865,7 +1825,9 @@ def _settled(nodes: Mapping[str, Mapping[str, Any]]) -> bool:
 
 
 def _proposer_label(proposer: object) -> str | None:
-    """A display label for the recorded proposing profile (the record itself is immutable)."""
+    """The recorded proposing coordinator (an agent name; older plans recorded a profile)."""
+    if isinstance(proposer, str):
+        return proposer or None
     if not isinstance(proposer, dict):
         return None
     data: dict[str, Any] = proposer  # pyright: ignore[reportUnknownVariableType]

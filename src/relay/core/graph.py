@@ -45,7 +45,12 @@ from .recovery import prepare_interrupted
 from .registry import Config, snapshot
 from .route_log import RouteLog
 from .router import AgentDecision, route_agent
-from .run import _AttemptFailure, _AttemptRunner, _default_adapters, _probe  # pyright: ignore[reportPrivateUsage]
+from .run import (
+    _AttemptFailure,  # pyright: ignore[reportPrivateUsage]
+    _AttemptRunner,  # pyright: ignore[reportPrivateUsage]
+    _availability,  # pyright: ignore[reportPrivateUsage]
+    _default_adapters,  # pyright: ignore[reportPrivateUsage]
+)
 from .runlock import RunLock
 from .runrecord import WorkerRecord
 from .scheduler import Outcome, SchedulerControl, schedule
@@ -214,7 +219,6 @@ class Coordinator:
         adapters: dict[str, AgentAdapter],
         available: dict[str, bool],
         levels: dict[str, tuple[PermissionLevel, ...]],
-        versions: dict[str, str | None],
     ) -> None:
         self.repo, self.graph, self.config, self.store, self.events = (
             repo,
@@ -223,12 +227,7 @@ class Coordinator:
             store,
             events,
         )
-        self.adapters, self.available, self.levels, self.versions = (
-            adapters,
-            available,
-            levels,
-            versions,
-        )
+        self.adapters, self.available, self.levels = adapters, available, levels
         self.manager = WorktreeManager(repo, store.run_id, worktree_root=config.paths.worktree_root)
         self.routes = RouteLog(
             events, store.routes_path, store.route_log_path, config.route_log, run_id=store.run_id
@@ -363,7 +362,6 @@ class Coordinator:
             "answers": answer_context(self.store.node_dir(task.id), task.id),
             "project": read_text(self.store.path("PROJECT.spec.md")),
             "config": self.store.read_run().config_hash,
-            "versions": self.versions,
             "execution_fingerprint": fingerprint,
             "verifier": VERIFIER_VERSION,
         }
@@ -939,8 +937,7 @@ async def run_graph(
             return GraphResult(
                 2, None, "failed", {}, error="graph has no integration acceptance or commands"
             )
-    available, levels = await _probe(config, registry)
-    versions = {name: (await adapter.probe()).version for name, adapter in registry.items()}
+    available, levels = _availability(config, registry)
     if store is None:
         store = (
             RunStore(repo, resume_run)
@@ -951,9 +948,7 @@ async def run_graph(
         repo, store.run_id, takeover=resume_run is not None, session_owner=session_owner
     )
     events = EventLog(store.events_path)
-    coordinator = Coordinator(
-        repo, graph, config, store, events, registry, available, levels, versions
-    )
+    coordinator = Coordinator(repo, graph, config, store, events, registry, available, levels)
     coordinator.max_attempts = max_attempts
     coordinator.progress = progress
     monitor: asyncio.Task[None] | None = None

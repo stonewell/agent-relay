@@ -432,13 +432,13 @@ class SessionOwner:
         parent: int | None = None,
         expected_revision: int | None = None,
         base: dict[str, Any] | None = None,
-        proposer: dict[str, Any] | None = None,
+        proposer: str | None = None,
     ) -> int:
         """Persist an immutable plan revision and make it current; returns its number.
 
         `base` names the explicit retained base (checkpoint or integration) the round starts
         from; it is part of the digest the operator approves. None means the repository HEAD.
-        `proposer` is the exact coordinator profile that proposed the plan; when given it is
+        `proposer` is the agent name of the coordinator that proposed the plan; when given it is
         part of the digest too, so a changed coordinator cannot inherit the approval.
         """
         with self._mutex:

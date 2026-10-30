@@ -40,7 +40,7 @@ from .context_broker import (
     manifest_digest,
     retain,
 )
-from .coordinator import CoordinationLimits, Qualification
+from .coordinator import CoordinationLimits
 from .graph import _classification, task_for  # pyright: ignore[reportPrivateUsage]
 from .permissions import resolve_level
 from .platform.procid import process_identity
@@ -68,7 +68,6 @@ __all__ = [
     "PlanningEngine",
     "PlanningSetup",
     "TurnResult",
-    "proposer_record",
     "recover_turns",
     "validate_plan",
 ]
@@ -110,7 +109,6 @@ class Coordinate(Protocol):
         prompt: str,
         *,
         cwd: Path,
-        qualification: Qualification,
         model: str | None = None,
         effort: str | None = None,
         timeout_s: float | None = None,
@@ -120,7 +118,6 @@ class Coordinate(Protocol):
 @dataclass
 class PlanningSetup:
     coordinate: Coordinate
-    qualification: Qualification
     config: Config
     base_commit: str
     """The pinned commit repository context is read from (never a moving branch)."""
@@ -129,6 +126,7 @@ class PlanningSetup:
     cwd: Path
     model: str | None = None
     effort: str | None = None
+    agent: str = ""
     limits: CoordinationLimits = field(default_factory=CoordinationLimits)
 
 
@@ -544,9 +542,7 @@ class PlanningEngine:
             "turn_id": turn["turn_id"],
             "step": turn["steps_used"],
             "status": "started",
-            "agent": setup.qualification.profile.agent,
-            "profile_digest": setup.qualification.profile.config_digest,
-            "cli_version": setup.qualification.profile.cli_version,
+            "agent": setup.agent,
             "model": setup.model,
             "effort": setup.effort,
             "prompt_sha256": digest_of(prompt),
@@ -577,7 +573,6 @@ class PlanningEngine:
                 return await setup.coordinate(
                     prompt,
                     cwd=setup.cwd,
-                    qualification=setup.qualification,
                     model=setup.model,
                     effort=setup.effort,
                     timeout_s=remaining,
@@ -748,7 +743,7 @@ class PlanningEngine:
                 + (f"\nChanges: {action.change_summary}" if action.change_summary else ""),
                 parent=current or None,
                 base=self.plan_base,
-                proposer=proposer_record(self.setup.qualification),
+                proposer=self.setup.agent,
             )
             await _settled(
                 self.owner.append_message,
@@ -832,19 +827,6 @@ class PlanningEngine:
     def recover(self) -> dict[str, str]:
         """After owner death: prove old coordinator processes ended (see :func:`recover_turns`)."""
         return recover_turns(self.owner)
-
-
-def proposer_record(qualification: Qualification) -> dict[str, Any]:
-    """The exact coordinator profile and mode saved with (and digested into) a proposed plan."""
-    profile = qualification.profile
-    return {
-        "agent": profile.agent,
-        "cli_version": profile.cli_version,
-        "os": profile.os,
-        "auth_mode": profile.auth_mode,
-        "config_digest": profile.config_digest,
-        "mode": qualification.mode,
-    }
 
 
 def recover_turns(owner: SessionOwner) -> dict[str, str]:
