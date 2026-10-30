@@ -42,6 +42,11 @@ from .runtime import GatewayRuntime
 ModelState = Literal["observed", "undiscovered", "failed"]
 
 
+def _model_family(model: str) -> str:
+    base, _, variant = model.rpartition("-")
+    return base if base and variant in {"minimal", "low", "medium", "high"} else model
+
+
 @dataclass(frozen=True)
 class GatewayModel:
     id: str
@@ -62,7 +67,12 @@ class GatewayModel:
     @property
     def listed(self) -> bool:
         options = self.support.model_options.get(self.model)
-        return options is None or options.listed
+        family = _model_family(self.model)
+        return (
+            options is None
+            or options.listed
+            or (family != self.model and self.id == f"{self.agent}/{family}")
+        )
 
     def public(self, observed: ObservedModel | None) -> dict[str, Any]:
         return {
@@ -148,21 +158,7 @@ class ModelCatalog:
                     aliases = self.aliases
             # Model enumeration may establish per-model capabilities on the adapter.
             support = adapter.inspect()
-            if models is not None:
-                # Explicit selection publishes exactly those IDs, including legacy aliases.
-                support = replace(
-                    support,
-                    model_options={
-                        alias: replace(options, listed=True)
-                        for alias, options in support.model_options.items()
-                    },
-                )
             self._supports[name] = (adapter, support)
-            self.agent_aliases[name] = tuple(
-                model
-                for model in aliases
-                if model not in support.model_options or support.model_options[model].listed
-            )
             alias = GatewayModel(name, name, aliases[0], None, support, adapter, agent.cost)
             self._add(alias)
             self.defaults.append(alias)
@@ -170,6 +166,23 @@ class ModelCatalog:
                 self._add(
                     GatewayModel(f"{name}/{model}", name, model, None, support, adapter, agent.cost)
                 )
+            for model in aliases:
+                family_id = f"{name}/{_model_family(model)}"
+                if family_id not in self.models:
+                    # Keep the selected native ID behind the family alias. A stripped name
+                    # need not be accepted by the CLI, especially with a lone variant.
+                    self._add(replace(self.models[f"{name}/{model}"], id=family_id))
+            self.agent_aliases[name] = tuple(
+                dict.fromkeys(
+                    model.model
+                    for model in self.models.values()
+                    if model.agent == name
+                    and (
+                        model.id == name
+                        or (model.listed and model.id == f"{name}/{_model_family(model.model)}")
+                    )
+                )
+            )
 
     def _add(self, model: GatewayModel) -> None:
         if model.id in self.models or model.id == "relay/auto":
@@ -324,14 +337,20 @@ class ModelCatalog:
         return value
 
     def listing(self) -> dict[str, Any]:
-        """Named models only; limits are null until a probe observes them."""
+        """Named families only; limits are null until a probe observes them."""
         observed = self._observed
         ids = [
             model.id
             for model in self.models.values()
-            if model.listed and model.id != model.agent and model.model not in {"auto", "default"}
+            if model.listed
+            and model.id == f"{model.agent}/{_model_family(model.model)}"
+            and _model_family(model.model) not in {"auto", "default"}
         ]
         entries = [self._public(model_id, observed) for model_id in ids]
+        for entry in entries:
+            if entry is not None:
+                entry["relay"]["model_alias"] = entry["id"].split("/", 1)[1]
+                entry["relay"]["resolved_model"] = _model_family(entry["relay"]["resolved_model"])
         return {"object": "list", "data": [entry for entry in entries if entry is not None]}
 
     def candidates(self, request: ChatRequest) -> list[GatewayModel]:

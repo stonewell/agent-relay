@@ -322,6 +322,46 @@ def test_explicit_model_filter_does_not_enumerate_cli_models() -> None:
     assert not adapter.probes
 
 
+@pytest.mark.parametrize("agent", ["claude", "codex", "cursor", "agy"])
+def test_listing_groups_variants_and_keeps_native_routing(agent: str) -> None:
+    config = configuration()
+    config.agents[agent] = config.agents.pop("fake")
+    backend = FakeBackend(agent)
+    aliases = [
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high",
+        "claude-sonnet-5-5-high",
+        "gemini-3.8-flash-minimal",
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash",
+    ]
+    backend.limits = {alias: ObservedModel(alias, 100000, 10000) for alias in aliases}
+    catalog = ModelCatalog(config, {agent: backend}, models=aliases)
+    expected = {
+        f"{agent}/gemini-4-argon": "gemini-4-argon-medium",
+        f"{agent}/claude-sonnet-5-5": "claude-sonnet-5-5-high",
+        f"{agent}/gemini-3.8-flash": "gemini-3.8-flash",
+    }
+    for probe in (False, True):
+        catalog.observe(probe=probe)
+        listing = catalog.listing()["data"]
+        assert {row["id"] for row in listing} == set(expected)
+        for row in listing:
+            assert row["relay"]["model_alias"] == row["id"].split("/", 1)[1]
+            assert row["relay"]["resolved_model"] == row["id"]
+            assert row["relay"]["context_length"] == (100000 if probe else None)
+            request = parse_request(
+                {"model": row["id"], "messages": [{"role": "user", "content": "hi"}]}
+            )
+            assert catalog.candidates(request)[0].model == expected[row["id"]]
+    assert set(backend.probes) == set(expected.values())
+    for alias in aliases:
+        request = parse_request(
+            {"model": f"{agent}/{alias}", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert catalog.candidates(request)[0].model == alias
+
+
 def test_cursor_groups_verified_inventory_and_keeps_legacy_ids_routable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -400,8 +440,9 @@ def test_cursor_groups_verified_inventory_and_keeps_legacy_ids_routable(
 
 
 @pytest.mark.parametrize("reused", [False, True])
+@pytest.mark.parametrize("variant_only", [False, True])
 def test_explicit_cursor_filter_uses_inventory_without_publishing_unselected_aliases(
-    monkeypatch: pytest.MonkeyPatch, reused: bool
+    monkeypatch: pytest.MonkeyPatch, reused: bool, variant_only: bool
 ) -> None:
     from relay.adapters import cursor_completion
 
@@ -423,12 +464,13 @@ def test_explicit_cursor_filter_uses_inventory_without_publishing_unselected_ali
         assert not previous.models["cursor/gemini-3.8-flash-low"].listed
 
     selected = ["gemini-3.8-flash", "gemini-3.8-flash-low", "auto", "default"]
+    if variant_only:
+        selected = ["gemini-3.8-flash-low"]
     catalog = ModelCatalog(config, {"cursor": cursor}, models=selected)
     assert calls == 1
     assert "cursor/gemini-3.8-flash-high" not in catalog.models
     assert [entry["id"] for entry in catalog.listing()["data"]] == [
         "cursor/gemini-3.8-flash",
-        "cursor/gemini-3.8-flash-low",
     ]
     for model_id in ("cursor/gemini-3.8-flash", "cursor/gemini-3.8-flash-low"):
         assert catalog.models[model_id].reasoning_efforts == ("low", "high")

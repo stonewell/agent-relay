@@ -156,6 +156,7 @@ def test_agy_process_error_categories_do_not_expose_stderr(
 
 
 SLUGS = ("gemini-4-argon-medium", "claude-sonnet-5-5-high")
+FAMILIES = ("gemini-4-argon", "claude-sonnet-5-5")
 
 
 def test_default_adapters_and_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -184,7 +185,10 @@ def test_default_adapters_and_model_catalog(monkeypatch: pytest.MonkeyPatch) -> 
     # ModelCatalog per-agent aliases come from `agy models`
     catalog = ModelCatalog(cfg, adapters)
     assert catalog.agent_aliases["agy"] == ("default", *SLUGS)
-    assert set(catalog.models) == {"agy", *(f"agy/{slug}" for slug in ("default", *SLUGS))}
+    assert set(catalog.models) == {
+        "agy",
+        *(f"agy/{slug}" for slug in ("default", *SLUGS, *FAMILIES)),
+    }
 
     # With explicit models override
     catalog_explicit = ModelCatalog(cfg, adapters, models=["m1", "m2"])
@@ -202,7 +206,14 @@ def test_agy_catalog_lists_enumerated_models(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(agy_completion, "_enumerated_models", lambda *_, **__: SLUGS)
     cfg = Config.model_validate({"version": 1, "agents": {"agy": {"enabled": True, "cmd": "agy"}}})
     catalog = ModelCatalog(cfg, default_adapters(cfg))
-    assert set(catalog.models) == {"agy", "agy/default", *(f"agy/{slug}" for slug in SLUGS)}
+    assert set(catalog.models) == {
+        "agy",
+        "agy/default",
+        *(f"agy/{slug}" for slug in (*SLUGS, *FAMILIES)),
+    }
+    assert [row["id"] for row in catalog.listing()["data"]] == [
+        f"agy/{family}" for family in FAMILIES
+    ]
     for slug in SLUGS:
         relay = catalog.models[f"agy/{slug}"].public(None)["relay"]
         assert relay["context_length"] is None

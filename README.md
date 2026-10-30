@@ -52,9 +52,10 @@ concurrency, model aliases, and automatic-routing preferences. See
 [gateway qualification notes](docs/gateway-qualification.md) for backend behavior and operating
 limits.
 
-`GET /v1/models` lists named models as `<agent>/<alias>`, such as `claude/sonnet`. Model aliases
-come from built-in defaults or the configured CLI. You can limit the aliases offered by repeating
-`--model`:
+`GET /v1/models` lists model families as `<agent>/<family>`, such as `claude/sonnet` or
+`cursor/gemini-3.8-flash`. Reasoning variants such as `-low` and `-high` share one listed family;
+their exact IDs remain usable in completion requests. Models come from built-in defaults or the
+configured CLI. You can limit the models offered by repeating `--model`:
 
 ```sh
 uv run relay serve --model sonnet --model opus

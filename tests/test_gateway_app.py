@@ -25,6 +25,7 @@ from relay.adapters.completion import (
     CompletionRequest,
     CompletionResult,
     CompletionUsage,
+    ObservedModel,
 )
 from relay.gateway import app as gateway_app
 from relay.gateway.app import GatewayLimits, RequestSummaryMiddleware, create_app
@@ -203,6 +204,29 @@ def test_host_origin_and_slash_retrieval(client_backend: tuple[TestClient, FakeB
     )
     assert client.get("/v1/models", headers={"Origin": "http://localhost:3000"}).status_code == 200
     assert backend.calls == []
+
+
+def test_models_endpoint_exposes_family_and_routes_to_selected_variant() -> None:
+    backend = FakeBackend()
+    backend.limits = {"model-high": ObservedModel("model-high", 100000, 10000)}
+    app = create_app(
+        configuration(), token="test-token", adapters={"fake": backend}, models=["model-high"]
+    )
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.get("/v1/models")
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["data"]] == ["fake/model"]
+        assert "model-high" not in response.text
+        for model in ("fake/model", "fake/model-high"):
+            completion = client.post(
+                "/v1/chat/completions",
+                json={"model": model, "messages": [{"role": "user", "content": "hello"}]},
+            )
+            assert completion.status_code == 200
+            assert backend.calls[-1].model == "model-high"
+    assert backend.probes == ["model-high"]
 
 
 def test_plain_response_and_sse_identical(client_backend: tuple[TestClient, FakeBackend]) -> None:
