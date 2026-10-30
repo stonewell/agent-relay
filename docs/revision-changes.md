@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.36 |
-| `development-plan.md` | v0.18 |
+| `design.md` | v0.37 |
+| `development-plan.md` | v0.19 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.37 / plan v0.19: prioritize gateway correctness before pinned-client release acceptance, then optional fidelity improvements. Tasks 5.7 and 5.9 are P0 execution work, 5.8 is P1, and 5.5 explicitly gates M7 after those fixes. Instruction fidelity (5.10) becomes P2 to match its optional scope; Agy grouping, transport, metadata, structured output and streaming remain later work. Historical finding severities and task statuses are unchanged.
 
 v0.36 / plan v0.18: review of changes since 2026-10-29 reconciles configuration-derived availability, bounded streamed process capture, coordinator proposal provenance, lazy billed discovery, server logging and request-level reasoning effort with the implementation. Completed tasks and evidence are archived separately. Two confirmed gateway defects remain open: executable regex in supposedly bounded schema validation (5.7) and fabricated Agy model limits (5.8). No runtime fixes are claimed by this documentation revision.
 
@@ -675,3 +677,12 @@ Review date: 2026-10-30. Scope: changes from 2026-10-29 00:00 PDT, using `5836fc
 | The active plan no longer carries completed task output. | 59 completed definitions and their complete status/evidence rows moved verbatim to `completed-tasks.md`; active task IDs, dependencies and archive links remain in the development plan. |
 
 Validation and limits: reviewers used read-only code/test inspection and local in-memory reproductions; no paid agent calls or external live client tests ran. Core checks covered requested/default/sorted/empty coordinator selection, configuration-only availability, bounded long-line/overflow pumping and no Job termination after close; no new core regression was confirmed. The recent implementation pass reported 171 focused gateway/protocol/CLI/regression tests passing, Ruff checks and changed-source type checks passing, with one pre-existing unknown-list type error in an unchanged protocol test. Those checks were not repeated as a full suite by this review. The regex and Agy metadata findings remain unresolved; historical full-suite/live evidence above does not close them or the pinned OpenCode/Agy acceptance tasks.
+
+
+## Gateway task prioritization (2026-10-30; design v0.37, plan v0.19)
+
+The gateway execution order is 5.7 (bounded validation), 5.9 (truthful controls and terminal results), 5.8 (observed limits), then pinned OpenCode acceptance in 5.5. P0/P1 here describes execution priority, without changing historical finding severities. All four are explicit M7 gates alongside existing core acceptance and independent security review.
+
+Instruction/history fidelity (5.10) is P2 and leads the next optional improvements, followed by Agy stdin transport (5.11) and response metadata (5.12). Structured output/native controls (5.1c) and native streaming (5.13) depend on truthful handling in 5.9; 5.1c also retains the bounded-validation prerequisite in 5.7. Stateful sessions/Responses remain P3. Agy grouping (5.6) is an independent investigation required before changing Agy IDs, not a blanket gate for Claude-backed client acceptance.
+
+The active plan's priority labels, dependencies and M7 criteria now agree. Existing statuses and validation evidence remain unchanged; no runtime fixes or live acceptance are claimed. Independent M2/M3/M8, platform, CI and plugin work retains its existing gates and operator deferrals.
