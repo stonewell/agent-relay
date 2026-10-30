@@ -63,7 +63,8 @@ uv run relay serve --model sonnet --model opus
 
 `relay/auto` is available for automatic routing but is not listed as a named model. The first
 `GET /v1/models` request probes uncached aliases to discover model limits; this may incur model
-usage.
+usage. Each server instance runs discovery once, sharing it across concurrent requests. Later
+requests reuse its results, including failed probes; restarting the server permits another attempt.
 
 The gateway accepts OpenAI-compatible `POST /v1/chat/completions` requests. Streaming and tool
 proposals are supported; proposed tools are returned to the client and never executed by Relay.

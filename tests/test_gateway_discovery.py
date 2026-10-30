@@ -397,6 +397,62 @@ def test_gateway_reads_cache_and_probes_only_missing_aliases(tmp_path: Path) -> 
     assert listing["fake/opus"]["max_output_tokens"] == 10000
 
 
+def test_completed_discovery_is_reused_after_cache_eviction(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    cache = ModelCache(tmp_path / "models.json")
+    assert cache.store(backend.support.profile, OBSERVED)
+    app = create_app(
+        configuration(),
+        token="t",
+        adapters={"fake": backend},
+        models=["default", "opus"],
+        model_cache=cache,
+    )
+    with client(app) as http, ThreadPoolExecutor(max_workers=3) as pool:
+        first = http.get("/v1/models")
+        assert first.status_code == 200 and backend.probes == []
+        assert cache.store(backend.support.profile, {})
+        paths = ["/v1/models", "/v1/models/fake/opus", "/v1/models"]
+        responses = [
+            request.result(timeout=5) for request in [pool.submit(http.get, path) for path in paths]
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        assert responses[0].json() == responses[2].json() == first.json()
+        assert responses[1].json()["relay"]["context_length"] == OBSERVED["opus"].context_length
+        assert backend.probes == []
+
+    # A new server instance gets a new discovery run and may probe uncached models.
+    restarted = create_app(
+        configuration(),
+        token="t",
+        adapters={"fake": backend},
+        models=["default", "opus"],
+        model_cache=cache,
+    )
+    with client(restarted) as http:
+        assert http.get("/v1/models").status_code == 200
+    assert backend.probes == ["default", "opus"]
+
+
+def test_aborted_discovery_is_not_retried_and_keeps_models_available() -> None:
+    async def scenario() -> None:
+        backend = ScriptedBackend({"default": RuntimeError("unexpected probe failure")})
+        runtime = GatewayRuntime(GatewayLimits(), {"fake": 1})
+        catalog = ModelCatalog(configuration(), {"fake": backend}, models=["default", "opus"])
+        try:
+            with pytest.raises(RuntimeError, match="unexpected probe failure"):
+                await catalog.discover(runtime)
+            await asyncio.gather(catalog.discover(runtime), catalog.discover(runtime))
+            assert backend.probes == ["default"]
+            assert [entry["id"] for entry in catalog.listing()["data"]] == ["fake/opus"]
+            assert catalog.state("fake/opus") == "undiscovered"
+        finally:
+            await catalog.close()
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_probe_termination_uncertainty_quarantines_gateway() -> None:
     backend = ScriptedBackend({"default": CompletionTerminationError()})
     config = configuration()

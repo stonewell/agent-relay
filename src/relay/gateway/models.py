@@ -234,8 +234,10 @@ class ModelCatalog:
             self._observed, self._failed = observed, frozenset(failed)
 
     async def discover(self, runtime: GatewayRuntime) -> None:
-        """Single-flight lazy discovery; concurrent callers share one in-progress probe run."""
-        if self._task is None or self._task.done():
+        """Discover once per catalog; concurrent callers share the initial probe run."""
+        if self._task is not None and self._task.done():
+            return
+        if self._task is None:
             loop = asyncio.get_running_loop()
 
             async def run_probe(adapter: CompletionCapable, alias: str) -> ObservedModel | None:
