@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from harness import git, init_repo
-from relay.adapters.base import Invocation, Probe, ProcessResult
+from relay.adapters.base import Invocation, ProcessResult
 from relay.adapters.claude import ClaudeAdapter
 from relay.adapters.codex import CodexAdapter
 from relay.core import run as attempts
@@ -85,17 +85,12 @@ def test_production_reuse_and_retained_output_retry_admission(
     )
     calls: list[Invocation] = []
 
-    async def probe(_adapter: object) -> Probe:
-        return Probe(available=True, version="offline-1", levels=("full",))
-
     def execute(invocation: Invocation, *, timeout_s: float | None = None) -> ProcessResult:
         calls.append(invocation)
         assert invocation.cmd == "offline-claude"
         (invocation.cwd / "feature.txt").write_text("preserved", encoding="utf-8")
         return ProcessResult(exit_code=0, stdout=json.dumps({"type": "result", "result": "done"}))
 
-    monkeypatch.setattr(ClaudeAdapter, "probe", probe)
-    monkeypatch.setattr(CodexAdapter, "probe", probe)
     monkeypatch.setattr(attempts, "run_invocation", execute)
     parent = {"ANTHROPIC_API_KEY": "first-secret-value"} if comparable else {}
 

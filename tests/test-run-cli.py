@@ -109,7 +109,7 @@ def test_task_file_resolves_against_repo_and_overrides_are_validated(
         category="bugfix",
         acceptance=[{"run": check("raise SystemExit(1)")}, {"diff_scope": ["feature.txt"]}],
         commands={"build": check(), "test": check("raise SystemExit(1)")},
-        permissions="workspace",
+        permissions="readonly",
         budget={"max_attempts": 2, "timeout_s": 8},
     )
     if format == "json":
@@ -141,7 +141,7 @@ def test_task_file_resolves_against_repo_and_overrides_are_validated(
     task = store.read_spec(f"{store.read_run().nodes['n1'].dir}/task.spec.yaml", TaskSpec)
     assert task.category == "implement"
     assert task.routing.agent == "fake"
-    assert task.permissions == "workspace"
+    assert task.permissions == "readonly"
     assert task.acceptance == [ScopeCheck(diff_scope=["feature.txt"]), RunCheck(run=check())]
     assert task.commands is not None
     assert task.commands.build == check()

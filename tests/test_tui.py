@@ -23,7 +23,6 @@ from harness import command_line, git, init_repo  # noqa: E402
 from relay.adapters.coordination import CoordinatorCall  # noqa: E402
 from relay.adapters.fake import FakeAdapter  # noqa: E402
 from relay.adapters.fake_scenario import Scenario  # noqa: E402
-from relay.core.coordinator import CoordinatorProfile, Qualification  # noqa: E402
 from relay.core.registry import Config, validate_merged  # noqa: E402
 from relay.core.session_app import CoordinatorBackend, ServiceHost, SessionApp  # noqa: E402
 from relay.core.sessions import SessionStore  # noqa: E402
@@ -43,8 +42,6 @@ from relay.tui.screens import (  # noqa: E402
     help_text,
 )
 
-PROFILE = CoordinatorProfile("claude", "9.9.9", "test", "subscription", "digest")
-QUAL = Qualification(PROFILE, "tool-free", "qualified", "test")
 PASS = command_line([sys.executable, "-c", "pass"])
 CHECK = {"run": PASS}
 NARROW = (80, 24)
@@ -132,15 +129,16 @@ def service(
     keys: dict[str, str] | None = None,
 ) -> SessionApp:
     backends = {
-        "claude": CoordinatorBackend("claude", PROFILE, script),
-        "codex": CoordinatorBackend("codex", None, None, "Codex has no qualifying profile"),
+        "claude": CoordinatorBackend(
+            "claude", script if qualified else None, "" if qualified else "no coordinate capability"
+        ),
+        "codex": CoordinatorBackend("codex", None, "Codex has no coordinate capability"),
     }
     return SessionApp(
         repo,
         config=config(keys),
         adapters={"claude": adapter, "codex": adapter},
         coordinators=backends,
-        records=(QUAL,) if qualified else (),
         poll_s=0.05,
     )
 
@@ -564,7 +562,7 @@ def test_unavailable_coordinator_is_explained_not_fatal(repo: Path) -> None:
         await until(pilot, lambda: isinstance(app.screen, CoordinatorScreen))
         listed = app.screen.query_one("#coordinators")
         prompts = [str(o.prompt) for o in listed.options]  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
-        assert any("claude [unavailable]" in p and "qualification record" in p for p in prompts)
+        assert any("claude [unavailable]" in p and "no coordinate capability" in p for p in prompts)
         assert any("codex [unavailable]" in p for p in prompts)
         await pilot.press("escape")
         await pilot.press("ctrl+q")

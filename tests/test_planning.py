@@ -11,15 +11,13 @@ import pytest
 
 from harness import git, init_repo
 from relay.adapters.coordination import CoordinatorCall, CoordinatorInvalid
-from relay.core.coordinator import CoordinationLimits, CoordinatorProfile, Qualification
+from relay.core.coordinator import CoordinationLimits
 from relay.core.planning import PlanningEngine, PlanningSetup, validate_plan
 from relay.core.registry import Config, validate_merged
 from relay.core.sessions import SessionOwner, SessionStore
 from relay.core.specs import CoordinatorResponse, ResultSpec
 from relay.core.store import RunStore
 
-PROFILE = CoordinatorProfile("claude", "9.9.9", "test", "subscription", "digest")
-QUAL = Qualification(PROFILE, "tool-free", "qualified", "test")
 CHECK = {"run": "python -c pass", "expect_exit": 0}
 
 
@@ -83,7 +81,6 @@ def make(
     owner = SessionStore.create(repo).acquire_owner()
     setup = PlanningSetup(
         coordinate=script,
-        qualification=QUAL,
         config=config(),
         base_commit=git(repo, "rev-parse", "HEAD"),
         available={"claude": True, "codex": True},

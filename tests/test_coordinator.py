@@ -1,4 +1,4 @@
-"""Coordinator contracts and the qualification matrix (task 2.20; design 5.6, 7.4)."""
+"""Coordinator response contracts (task 2.20; design 5.6, 7.4)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from relay.core.coordinator import (
-    CoordinationLimits,
-    CoordinatorProfile,
-    Qualification,
-    select_coordinator,
-)
+from relay.core.coordinator import CoordinationLimits
 from relay.core.specs import SCHEMAS, CoordinatorResponse, parse_spec, schema_for
 
 GRAPH: dict[str, Any] = {
@@ -200,51 +195,3 @@ def test_project_config_overrides_coordination_limits(tmp_path: Any) -> None:
 def test_limits_must_be_positive_integers(bad: Any) -> None:
     with pytest.raises(ValueError):
         CoordinationLimits(max_steps=bad)
-
-
-# --- qualification matrix ------------------------------------------------------------------
-
-
-def profile(
-    agent: str = "claude", version: str = "2.1.310", digest: str = "d1"
-) -> CoordinatorProfile:
-    return CoordinatorProfile(agent, version, "win32", "subscription", digest)
-
-
-def record(p: CoordinatorProfile, status: str = "qualified") -> Qualification:
-    return Qualification(p, "tool-free", status, "canary-2026-10-26")  # type: ignore[arg-type]
-
-
-def test_no_records_means_unavailable_with_no_fallback() -> None:
-    choice = select_coordinator({"claude": profile(), "codex": profile("codex", "0.164.0")})
-    assert not choice.available
-    assert "select one explicitly (codex)" in choice.reason
-    codex = {"codex": profile("codex", "0.164.0")}
-    explicit = select_coordinator(codex, requested="codex", records=())
-    assert not explicit.available and "no qualification record" in explicit.reason
-
-
-def test_qualified_claude_is_the_default() -> None:
-    p = profile()
-    choice = select_coordinator({"claude": p}, records=(record(p),))
-    assert choice.available and choice.agent == "claude" and choice.mode == "tool-free"
-
-
-@pytest.mark.parametrize("changed", [{"version": "2.1.311"}, {"digest": "d2"}])
-def test_changed_profile_invalidates_qualification(changed: dict[str, str]) -> None:
-    qualified = record(profile())
-    assert not select_coordinator({"claude": profile(**changed)}, records=(qualified,)).available
-
-
-def test_default_never_switches_provider() -> None:
-    codex = profile("codex", "0.164.0")
-    records = (record(codex),)
-    assert not select_coordinator({"codex": codex}, records=records).available
-    assert select_coordinator({"codex": codex}, requested="codex", records=records).available
-
-
-def test_unqualified_record_is_unavailable() -> None:
-    p = profile()
-    unq = (record(p, "unqualified"),)
-    assert not select_coordinator({"claude": p}, requested="claude", records=unq).available
-    assert not select_coordinator({}, requested="claude", records=()).available

@@ -20,7 +20,6 @@ from relay.adapters.completion import (
     DEFAULT_MODEL_ALIASES,
     CompletionError,
     CompletionProfile,
-    CompletionQualification,
     CompletionRequest,
     CompletionResult,
     CompletionTerminationError,
@@ -70,7 +69,7 @@ def test_ambiguous_or_incomplete_model_usage_is_unknown(usage: object) -> None:
     assert result.content == "OK" and result.observed is None
 
 
-def test_probe_uses_qualified_complete_path_in_fresh_scratch(
+def test_probe_uses_complete_path_in_fresh_scratch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launches: list[dict[str, Any]] = []
@@ -89,13 +88,8 @@ def test_probe_uses_qualified_complete_path_in_fresh_scratch(
     monkeypatch.setattr(module, "run_process", run)
     parent = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "RELAY_GATEWAY_TOKEN": "x"}
     agent = Agent(cmd="claude")
-    unqualified = ClaudeCompletionAdapter(agent, parent_env=parent)
+    adapter = ClaudeCompletionAdapter(agent, parent_env=parent)
     cancel = threading.Event()
-    # Qualification gates probes too: an unreviewed profile launches no model call.
-    assert probe(unqualified, "sonnet", cancel=cancel) is None
-    assert launches == []
-    record = CompletionQualification(unqualified.profile(), "offline test only")
-    adapter = ClaudeCompletionAdapter(agent, parent_env=parent, qualifications=[record])
     assert probe(adapter, "sonnet", cancel=cancel, timeout_s=7) == ObservedModel(
         "claude-sonnet-5-5", 1000000, 128000
     )
@@ -264,9 +258,13 @@ def test_discovery_is_lazy_and_single_flight(tmp_path: Path) -> None:
         assert all(listing == listings[0] for listing in listings)
         assert backend.probes == list(DEFAULT_MODEL_ALIASES)
         ids = {entry["id"] for entry in listings[0]["data"]}
-        assert ids == {"fake", "fake/default", "fake/opus", "relay/auto"}
+        assert ids == {
+            "fake",
+            *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES),
+            "relay/auto",
+        }
         assert http.get("/v1/models/fake/opus").json()["relay"]["context_length"] == 100000
-        assert http.get("/v1/models/fake/sonnet").status_code == 404
+        assert http.get("/v1/models/fake/sonnet").json()["relay"]["context_length"] is None
         assert backend.probes == list(DEFAULT_MODEL_ALIASES)
     assert cache.load(backend.support.profile if backend.support else PROFILE) == OBSERVED
 
@@ -301,7 +299,13 @@ def test_probe_termination_uncertainty_quarantines_gateway() -> None:
         assert response.json()["error"]["code"] == "termination_unknown"
         assert not app.state.runtime.healthy
         # A quarantined gateway admits no work and launches no further probes.
-        assert http.get("/v1/models").json() == {"object": "list", "data": []}
+        listing = http.get("/v1/models").json()
+        assert {entry["id"] for entry in listing["data"]} == {
+            "claude",
+            *(f"claude/{alias}" for alias in DEFAULT_MODEL_ALIASES),
+            "relay/auto",
+        }
+        assert all(entry["relay"]["context_length"] is None for entry in listing["data"])
         chat = http.post(
             "/v1/chat/completions",
             json={"model": "claude", "messages": [{"role": "user", "content": "x"}]},

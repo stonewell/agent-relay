@@ -31,7 +31,7 @@ class FakeBackend:
 
     def __init__(self, name: str = "fake", *, tools: bool = True) -> None:
         self.id = name
-        self.support: CompletionSupport | None = CompletionSupport(
+        self.support: CompletionSupport = CompletionSupport(
             CompletionProfile(name, "test", "test", "test", "test"), supports_tools=tools
         )
         self.calls: list[CompletionRequest] = []
@@ -39,7 +39,7 @@ class FakeBackend:
         self.limits: dict[str, ObservedModel] = dict(OBSERVED)
         self.results = [CompletionResult(content="hello\n雪", raw="hello\n雪")]
 
-    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport | None:
+    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport:
         return self.support
 
     def complete(
@@ -100,16 +100,26 @@ def test_alias_ids_bare_default_and_pinning() -> None:
     assert backend.probes == [] and backend.calls == []
 
 
-def test_listing_advertises_only_observed_limits() -> None:
+def test_listing_includes_configured_aliases_with_null_limits() -> None:
     backend = FakeBackend()
     catalog = ModelCatalog(configuration(), {"fake": backend})
-    # Nothing is advertised before discovery: limits are never null and never invented.
-    assert catalog.listing() == {"object": "list", "data": []}
+    # Every configured alias is listed before discovery; limits stay null until observed.
+    before = {entry["id"]: entry["relay"] for entry in catalog.listing()["data"]}
+    assert set(before) == {
+        "fake",
+        *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES),
+        "relay/auto",
+    }
+    assert all(value["context_length"] is None for value in before.values())
     assert catalog.state("fake/opus") == "undiscovered"
     catalog.observe(probe=True)
     assert backend.probes == list(DEFAULT_MODEL_ALIASES)
     listing = {entry["id"]: entry["relay"] for entry in catalog.listing()["data"]}
-    assert set(listing) == {"fake", "fake/default", "fake/opus", "relay/auto"}
+    assert set(listing) == {
+        "fake",
+        *(f"fake/{alias}" for alias in DEFAULT_MODEL_ALIASES),
+        "relay/auto",
+    }
     assert listing["fake/opus"]["resolved_model"] == "fake/m-opus"
     assert listing["fake/opus"]["model_alias"] == "opus"
     assert (listing["fake/opus"]["context_length"], listing["fake/opus"]["max_output_tokens"]) == (
@@ -117,10 +127,11 @@ def test_listing_advertises_only_observed_limits() -> None:
         10000,
     )
     assert listing["fake"]["resolved_model"] == "fake/m-default"
-    assert all(value["context_length"] and value["max_output_tokens"] for value in listing.values())
+    assert listing["fake/sonnet"]["context_length"] is None
+    assert listing["fake/fable"]["max_output_tokens"] is None
     assert catalog.state("fake/sonnet") == "failed"
-    with pytest.raises(GatewayError, match="unknown model"):
-        catalog.public("fake/sonnet")
+    public = catalog.public("fake/sonnet")
+    assert public["relay"]["context_length"] is None
     # Tried aliases are not probed again by the same catalog.
     catalog.observe(probe=True)
     assert backend.probes == list(DEFAULT_MODEL_ALIASES)
@@ -139,16 +150,7 @@ def test_configured_aliases_replace_defaults_and_are_validated() -> None:
     assert model_aliases() == DEFAULT_MODEL_ALIASES
 
 
-def test_unqualified_backends_never_advertised_or_probed() -> None:
-    backend = FakeBackend()
-    backend.support = None
-    catalog = ModelCatalog(configuration(), {"fake": backend})
-    catalog.observe(probe=True)
-    assert catalog.listing() == {"object": "list", "data": []}
-    assert backend.probes == []
-
-
-def test_native_output_limits_fail_closed() -> None:
+def test_native_output_limits_are_not_refused_by_capability() -> None:
     catalog = observed_catalog(configuration(), {"fake": FakeBackend()})
     request = parse_request(
         {
@@ -157,14 +159,11 @@ def test_native_output_limits_fail_closed() -> None:
             "max_completion_tokens": 10,
         }
     )
-    with pytest.raises(GatewayError) as caught:
-        catalog.candidates(request)
-    assert caught.value.param == "max_completion_tokens"
+    assert catalog.candidates(request)[0].agent == "fake"
 
 
 def test_observed_output_limit_rejected_and_auto_filters_candidates() -> None:
     backend = FakeBackend()
-    assert backend.support is not None
     backend.support = replace(backend.support, native_max_tokens=True)
     catalog = observed_catalog(configuration(), {"fake": backend})
     request = parse_request(
@@ -195,7 +194,9 @@ def test_auto_reports_minimum_observed_limits_or_is_omitted() -> None:
     assert (auto["context_length"], auto["max_output_tokens"]) == (50000, 32000)
     other.limits = {}
     catalog = observed_catalog(config, {"fake": FakeBackend(), "other": other})
-    assert "relay/auto" not in {entry["id"] for entry in catalog.listing()["data"]}
+    auto = catalog.public("relay/auto")["relay"]
+    assert auto["context_length"] is None and auto["max_output_tokens"] is None
+    assert "relay/auto" in {entry["id"] for entry in catalog.listing()["data"]}
     assert catalog.state("relay/auto") == "failed"
 
 
@@ -223,4 +224,4 @@ def test_auto_classifies_and_filters_only_qualified_capabilities() -> None:
             ],
         }
     )
-    assert [model.agent for model in catalog.candidates(request)] == ["fake"]
+    assert [model.agent for model in catalog.candidates(request)] == ["debugger", "fake"]

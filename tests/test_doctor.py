@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import stat
 from pathlib import Path
 
 import pytest
@@ -16,7 +14,6 @@ from relay.core.doctor import (
     CheckRegistry,
     CheckResult,
     DoctorContext,
-    agent_cli_check,
     default_registry,
     run_checks,
 )
@@ -182,8 +179,7 @@ def test_default_checks_pass_on_a_clean_project(
     assert by_id["python"].status == "pass"
     assert by_id["git"].status == "pass"
     assert by_id["config"].status == "pass"
-    assert "agent.claude.cli" in by_id  # one per enabled agent
-    assert "agent.cursor.cli" not in by_id  # disabled by default
+    assert {"python", "git", "config", "git.exclude", "session.locks"} == set(by_id)
     assert all(c.status in ("pass", "unsupported") for c in report.checks)
 
 
@@ -201,41 +197,6 @@ def test_invalid_config_fails_with_a_remedy_and_skips_agent_checks(
     assert "null" in config.remedy
     assert not any(c.id.startswith("agent.") for c in report.checks)
     assert report.exit_code == 1
-
-
-def stub_cli(directory: Path, name: str, version: str, exit_code: int = 0) -> Path:
-    """A fake agent CLI: a `.cmd` shim on Windows (like Cursor's), a shell script elsewhere."""
-    if os.name == "nt":
-        path = directory / f"{name}.cmd"
-        path.write_text(f"@echo off\r\necho {version}\r\nexit /b {exit_code}\r\n")
-    else:
-        path = directory / name
-        path.write_text(f"#!/bin/sh\necho {version}\nexit {exit_code}\n")
-        path.chmod(path.stat().st_mode | stat.S_IEXEC)
-    return path
-
-
-def test_agent_cli_check_reports_version_of_a_shim(tmp_path: Path) -> None:
-    shim = stub_cli(tmp_path, "stubagent", "stubagent 1.2.3")
-    result = asyncio.run(agent_cli_check("stub", str(shim)).run(ctx(tmp_path)))
-    assert result.status == "pass"
-    assert result.data["version"] == "stubagent 1.2.3"
-
-
-def test_agent_cli_check_flags_a_missing_command_as_unsupported(tmp_path: Path) -> None:
-    result = asyncio.run(
-        agent_cli_check("ghost", "definitely-not-installed-xyz").run(ctx(tmp_path))
-    )
-    assert result.status == "unsupported"
-    assert result.remedy is not None
-    assert "enabled: false" in result.remedy
-
-
-def test_agent_cli_check_fails_when_version_command_fails(tmp_path: Path) -> None:
-    shim = stub_cli(tmp_path, "brokenagent", "boom", exit_code=3)
-    result = asyncio.run(agent_cli_check("broken", str(shim)).run(ctx(tmp_path)))
-    assert result.status == "fail"
-    assert "exited 3" in result.summary
 
 
 def test_git_exclude_check_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

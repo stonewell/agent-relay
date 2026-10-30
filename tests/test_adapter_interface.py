@@ -259,16 +259,3 @@ def test_invocation_is_frozen_with_a_prompt_file(tmp_path: Path) -> None:
     inv = Invocation(cmd="x", args=(), cwd=tmp_path, stdin="p", prompt_file=tmp_path / "p.txt")
     with pytest.raises(AttributeError):
         inv.prompt_file = None  # type: ignore[misc]
-
-
-def test_advertised_levels_follow_verified_platforms(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`readonly` is advertised only where its canary was enforced (task 2.30); never `workspace`."""
-    from relay.adapters.base import advertised_levels
-
-    monkeypatch.setattr("relay.adapters.base.sys.platform", "win32")
-    assert advertised_levels("claude") == ("full", "readonly")
-    assert advertised_levels("codex") == ("full", "readonly")
-    assert advertised_levels("agy") == ("full",)
-    monkeypatch.setattr("relay.adapters.base.sys.platform", "linux")
-    assert advertised_levels("claude") == ("full",)
-    assert advertised_levels("codex") == ("full",)

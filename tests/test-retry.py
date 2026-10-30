@@ -314,6 +314,8 @@ def test_failed_unpinned_agent_becoming_unavailable_can_fallback_on_retry(tmp_pa
     store = RunStore(repo, RUN)
     resumed = load_spec(TaskSpec, store.node_dir("a") / "task.spec.yaml")
     resumed.budget.max_attempts = 2
+    # The first agent became unavailable between attempts; retry must fall back to codex.
+    cfg.agents["claude"].enabled = False
     replacement = FakeAdapter()
     result = asyncio.run(
         run_foreground(
@@ -322,7 +324,7 @@ def test_failed_unpinned_agent_becoming_unavailable_can_fallback_on_retry(tmp_pa
             config=cfg,
             resume_run=RUN,
             retry_failed=True,
-            adapters={"claude": FakeAdapter(available=False), "codex": replacement},
+            adapters={"claude": FakeAdapter(), "codex": replacement},
         )
     )
     assert result.exit_code == 0, result.to_json()

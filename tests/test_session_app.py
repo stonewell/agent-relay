@@ -18,8 +18,7 @@ from relay.adapters.coordination import CoordinatorCall
 from relay.adapters.fake import FakeAdapter
 from relay.adapters.fake_scenario import Scenario
 from relay.core.controller import SessionController
-from relay.core.coordinator import CoordinatorProfile, Qualification
-from relay.core.planning import PlanningEngine, PlanningSetup, proposer_record, recover_turns
+from relay.core.planning import PlanningEngine, PlanningSetup, recover_turns
 from relay.core.registry import Config, validate_merged
 from relay.core.runlock import lock_path
 from relay.core.session_app import (
@@ -46,8 +45,6 @@ from relay.core.store import RunStore, runs_dir
 from relay.tui.projection import composer_mode, node_label, pending_actions, project
 
 PASS = command_line([sys.executable, "-c", "pass"])
-PROFILE = CoordinatorProfile("claude", "9.9.9", "test", "subscription", "digest")
-QUAL = Qualification(PROFILE, "tool-free", "qualified", "test")
 
 
 def config() -> Config:
@@ -331,7 +328,7 @@ def test_a_crash_mid_deletion_resumes_and_leaves_no_orphans(
     with pytest.raises(SessionError, match="was interrupted"):
         SessionOwner.acquire(repo, sid)  # no new work until the deletion is finished
     svc_summary = asyncio.run(
-        SessionApp(repo, config=config(), coordinators={}, records=()).sessions()
+        SessionApp(repo, config=config(), coordinators={}).sessions()
     )
     assert [(x.session_id, x.state) for x in svc_summary] == [(sid, "deleting")]
 
@@ -426,7 +423,7 @@ def test_a_retained_plan_base_is_saved_and_covered_by_the_digest(tmp_path: Path)
         levels: dict[str, Any] = {"claude": ("full", "readonly"), "codex": ("full", "readonly")}
         setup = PlanningSetup(
             coordinate=Scripted(proposal(), proposal()),
-            qualification=QUAL,
+            agent="claude",
             config=config(),
             base_commit=git(repo, "rev-parse", "HEAD"),
             available={"claude": True, "codex": True},
@@ -446,63 +443,6 @@ def test_a_retained_plan_base_is_saved_and_covered_by_the_digest(tmp_path: Path)
 
 
 # --- the service and its host ------------------------------------------------------------------
-
-
-def test_approval_refuses_a_plan_from_a_changed_coordinator(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    (repo / "src").mkdir()
-    backends = {"claude": CoordinatorBackend("claude", PROFILE, Scripted(proposal()))}
-    svc = SessionApp(
-        repo,
-        config=config(),
-        adapters={"claude": FakeAdapter(), "codex": FakeAdapter()},
-        coordinators=backends,
-        records=(QUAL,),
-    )
-    host = ServiceHost().start()
-    try:
-        host.submit(svc.start()).result(30)
-        host.submit(svc.open(None)).result(30)
-        result = host.submit(svc.submit("add it")).result(30)
-        assert result.status == "awaiting_approval" and result.plan_revision == 1
-        # Same agent and configuration digest, another CLI version: still a different profile.
-        changed = CoordinatorProfile("claude", "9.9.10", "test", "subscription", "digest")
-        svc._backends = {"claude": CoordinatorBackend("claude", changed, Scripted())}  # pyright: ignore[reportPrivateUsage]
-        svc._records = (Qualification(changed, "tool-free", "qualified", "test"),)  # pyright: ignore[reportPrivateUsage]
-        with pytest.raises(SessionConflict, match="coordinator or its configuration changed"):
-            host.submit(svc.approve(1)).result(30)
-        assert SessionStore(repo, str(svc.session_id)).read().intent is None
-    finally:
-        host.close(svc.shutdown)
-
-
-def test_unqualified_coordination_explains_and_changes_nothing(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    svc = SessionApp(
-        repo,
-        config=config(),
-        adapters={"claude": FakeAdapter(), "codex": FakeAdapter()},
-        coordinators={
-            "claude": CoordinatorBackend("claude", PROFILE, Scripted()),
-            "codex": CoordinatorBackend("codex", None, None, "no qualifying profile"),
-        },
-        records=(),
-    )
-    host = ServiceHost().start()
-    try:
-        host.submit(svc.start()).result(30)
-        options = {o.agent: o for o in svc.coordinator_options()}
-        assert (
-            not options["claude"].available and "qualification record" in options["claude"].reason
-        )
-        assert not options["codex"].available and options["codex"].reason == "no qualifying profile"
-        with pytest.raises(Exception, match="coordination is unavailable"):
-            host.submit(svc.submit("hello")).result(30)
-        with pytest.raises(Exception, match="cannot coordinate"):
-            host.submit(svc.select_coordinator("codex")).result(30)
-        assert SessionStore.list_sessions(repo) == []
-    finally:
-        host.close(svc.shutdown)
 
 
 def test_cancelling_the_caller_never_cancels_the_operation() -> None:
@@ -619,8 +559,7 @@ def test_limit_exhaustion_shows_the_retained_answer_and_needs_a_policy_change(
         repo,
         config=config(),
         adapters={"claude": adapter, "codex": adapter},
-        coordinators={"claude": CoordinatorBackend("claude", PROFILE, Scripted())},
-        records=(QUAL,),
+        coordinators={"claude": CoordinatorBackend("claude", Scripted())},
         poll_s=0.05,
     )
     host = ServiceHost().start()
@@ -632,7 +571,7 @@ def test_limit_exhaustion_shows_the_retained_answer_and_needs_a_policy_change(
         spec = proposal()["graph"]
         revision = host.submit(
             asyncio.to_thread(
-                owner.save_plan, spec, explanation="t", proposer=proposer_record(QUAL)
+                owner.save_plan, spec, explanation="t", proposer="claude"
             )
         ).result()
         host.submit(svc.approve(revision)).result(30)
@@ -674,8 +613,7 @@ def make_service(repo: Path, adapter: FakeAdapter, script: Scripted) -> SessionA
         repo,
         config=config(),
         adapters={"claude": adapter, "codex": adapter},
-        coordinators={"claude": CoordinatorBackend("claude", PROFILE, script)},
-        records=(QUAL,),
+        coordinators={"claude": CoordinatorBackend("claude", script)},
         poll_s=0.05,
     )
 
@@ -963,7 +901,7 @@ def test_approval_refuses_a_plan_without_a_recorded_proposer(tmp_path: Path) -> 
             host.submit(svc.approve(first)).result(30)
         second = host.submit(
             asyncio.to_thread(
-                owner.save_plan, spec, explanation="t", proposer=proposer_record(QUAL)
+                owner.save_plan, spec, explanation="t", proposer="claude"
             )
         ).result()
         assert owner.store.plan(first)["digest"] != owner.store.plan(second)["digest"]
@@ -990,7 +928,7 @@ def test_coordinator_answers_and_turn_resumes_wait_while_a_round_executes(
                 owner.save_plan,
                 proposal()["graph"],
                 explanation="t",
-                proposer=proposer_record(QUAL),
+                proposer="claude",
             )
         ).result()
         host.submit(svc.approve(revision)).result(30)
@@ -1018,7 +956,7 @@ def test_context_requests_never_sweep_a_runs_temp_files(tmp_path: Path) -> None:
         owner,
         PlanningSetup(
             coordinate=Scripted(),
-            qualification=QUAL,
+            agent="claude",
             config=config(),
             base_commit=git(repo, "rev-parse", "HEAD"),
             available={"claude": True, "codex": True},

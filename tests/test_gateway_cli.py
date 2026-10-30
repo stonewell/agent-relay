@@ -148,6 +148,68 @@ def test_existing_token_is_never_printed(
     assert capsys.readouterr().out == ""
 
 
+def test_gateway_token_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RELAY_GATEWAY_TOKEN", raising=False)
+    generated_token, is_gen = serve.gateway_token(generate=True)
+    assert is_gen is True
+    assert len(generated_token) >= 43
+    assert all(33 <= ord(c) <= 126 for c in generated_token)
+
+    with pytest.raises(ValueError, match="bearer token must be a nonempty printable ASCII token"):
+        serve.gateway_token(generate=False)
+
+    assert serve.gateway_token(key="explicit-key", generate=True) == ("explicit-key", False)
+    assert serve.gateway_token(key="explicit-key", generate=False) == ("explicit-key", False)
+
+    monkeypatch.setenv("RELAY_GATEWAY_TOKEN", "env-token")
+    assert serve.gateway_token(key="override-key", generate=True) == ("override-key", False)
+    assert serve.gateway_token(generate=True) == ("env-token", False)
+
+
+def test_server_cli_with_key_option(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import uvicorn
+
+    fake_app = ModuleType("relay.gateway.app")
+    calls: dict[str, object] = {}
+
+    def limits(**kwargs: object) -> dict[str, object]:
+        return kwargs
+
+    def create_app(config: object, **kwargs: object) -> object:
+        calls.update(kwargs)
+        return "application"
+
+    def launch(app: object, **kwargs: object) -> None:
+        calls["app"] = app
+        calls["uvicorn"] = kwargs
+
+    def config_loader(*, project_root: Path | None) -> object:
+        assert project_root is None
+        return load_config(user_config=None)
+
+    fake_app.GatewayLimits = limits  # type: ignore[attr-defined]
+    fake_app.create_app = create_app  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "relay.gateway.app", fake_app)
+    monkeypatch.setattr(serve, "load_config", config_loader)
+    monkeypatch.setattr(uvicorn, "run", launch)
+    monkeypatch.setenv("RELAY_GATEWAY_TOKEN", "ignored-env-token")
+    monkeypatch.setattr(discovery, "default_cache_path", lambda: tmp_path / "cache.json")
+
+    assert main(["serve", "--key", "cli-key-123"]) == 0
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == ""
+    assert calls["token"] == "cli-key-123"
+
+    assert main(["serve", "--key", "invalid with spaces"]) == 2
+    err_output = capsys.readouterr().err
+    assert "relay serve: bearer token must be a nonempty printable ASCII token" in err_output
+
+
 @pytest.mark.parametrize("catalog", [None, [], {}, {"data": None}])
 def test_config_rejects_invalid_catalogs(catalog: object) -> None:
     with pytest.raises(ValueError, match="invalid model catalog"):
@@ -165,8 +227,10 @@ def test_ipv6_config_url_is_canonical() -> None:
 @pytest.mark.parametrize("token", ["", "has space", "line\nbreak", "nonascii-é"])
 def test_invalid_tokens_are_rejected(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
     monkeypatch.setenv("RELAY_GATEWAY_TOKEN", token)
-    with pytest.raises(ValueError, match="RELAY_GATEWAY_TOKEN"):
+    with pytest.raises(ValueError, match="bearer token must be a nonempty printable ASCII token"):
         serve.gateway_token(generate=True)
+    with pytest.raises(ValueError, match="bearer token must be a nonempty printable ASCII token"):
+        serve.gateway_token(key=token, generate=True)
 
 
 @pytest.mark.parametrize(
@@ -226,7 +290,15 @@ def test_config_without_cache_reports_undiscovered_models_and_never_probes(
     assert main(["-C", str(tmp_path), "opencode-config"]) == 0
     output = capsys.readouterr()
     provider = json.loads(output.out)["provider"]["relay"]
-    assert provider["models"] == {}
+    assert set(provider["models"]) == {
+        "claude",
+        "claude/default",
+        "claude/sonnet",
+        "claude/opus",
+        "claude/fable",
+        "relay/auto",
+    }
+    assert all("limit" not in model for model in provider["models"].values())
     assert provider["options"] == {
         "baseURL": "http://127.0.0.1:8765/v1",
         "apiKey": "{env:RELAY_GATEWAY_TOKEN}",
@@ -250,11 +322,18 @@ def test_config_refresh_probes_caches_and_later_reads_cache(
         "tool_call": True,
         "limit": {"context": 100000, "output": 10000},
     }
-    assert set(models) == {"claude", "claude/default", "claude/opus", "relay/auto"}
+    assert set(models) == {
+        "claude",
+        "claude/default",
+        "claude/sonnet",
+        "claude/opus",
+        "claude/fable",
+        "relay/auto",
+    }
     assert models["relay/auto"]["limit"] == models["claude"]["limit"]
     assert models["claude"]["limit"] == {"context": 200000, "output": 32000}
-    # Failed probes are omitted, never given null or invented limits.
-    assert "omitted models whose probe reported no context/output limits" in output.err
+    # Failed probes keep their entry without limits; limits are never invented.
+    assert "listed without observed context/output limits (probe failed)" in output.err
     assert "claude/sonnet" in output.err and "claude/fable" in output.err
     assert "not yet discovered" not in output.err
     assert cache.is_file()

@@ -35,16 +35,7 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-# --- probe and invocation ---------------------------------------------------------------------
-
-
-def test_probe_reports_availability_and_levels() -> None:
-    probe = asyncio.run(FakeAdapter().probe())
-    assert (probe.available, probe.version) == (True, "fake-1.0")
-    assert probe.levels == ("full", "workspace", "readonly")
-    only_full = asyncio.run(FakeAdapter(levels=("full",)).probe())
-    assert only_full.levels == ("full",)
-    assert asyncio.run(FakeAdapter(available=False).probe()).available is False
+# --- invocation -------------------------------------------------------------------------------
 
 
 def test_invocation_runs_the_stub_in_the_worktree(repo: Path) -> None:

@@ -10,7 +10,6 @@ import asyncio
 import json
 import os
 import shutil
-import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -19,7 +18,7 @@ from typing import Any, cast
 import pytest
 
 from harness import context, git
-from relay.adapters.base import ProcessResult, RunContext, advertised_levels
+from relay.adapters.base import ProcessResult, RunContext
 from relay.adapters.codex import CodexAdapter, ResultInvalid, drop_nulls, strict_schema
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
 from relay.core.specs.task import Routing
@@ -130,23 +129,6 @@ def test_build_invocation_fails_closed_for_unadvertised_level(tmp_path: Path) ->
     ctx = replace(context(tmp_path), permission="workspace")
     with pytest.raises(ValueError, match="cannot honour"):
         adapter.build_invocation(_spec(), ctx)
-
-
-# --- probe ------------------------------------------------------------------------------------
-
-
-def test_probe_reports_missing_executable() -> None:
-    probe = asyncio.run(CodexAdapter(cmd="no-such-codex-9f3a").probe())
-    assert probe.available is False
-    assert probe.levels == ("full",)
-
-
-def test_probe_parses_version_and_levels() -> None:
-    probe = asyncio.run(CodexAdapter(cmd=sys.executable).probe())
-    assert probe.available is True
-    assert probe.version is not None and probe.version.count(".") >= 1
-    assert probe.levels == advertised_levels("codex")  # only canary-verified platforms (2.30)
-    assert "workspace" not in probe.levels
 
 
 # --- strict schema conversion (design 5.4) ----------------------------------------------------

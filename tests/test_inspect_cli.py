@@ -373,14 +373,16 @@ def test_agents_lists_config_without_secrets(
     by_name = {entry["name"]: entry for entry in data["agents"]}
     assert data["count"] == len(data["agents"])
     assert data["count"] >= 3
-    assert by_name["fake"]["available"] is True
-    assert by_name["fake"]["version"]
+    assert by_name["fake"]["enabled"] is True
     assert by_name["fake"]["categories"] == ["implement"]
     assert by_name["fake"]["models"] == {"fast": "fake-model"}
-    assert by_name["absent"]["available"] is False
-    assert by_name["absent"]["note"] == "command not found on PATH"
-    assert by_name["disabled"]["available"] is None
-    assert by_name["disabled"]["note"] == "agent disabled"
+    assert by_name["absent"]["enabled"] is True
+    assert by_name["absent"]["cmd"] == "definitely-not-a-relay-cli"
+    assert by_name["disabled"]["enabled"] is False
+    for entry in by_name.values():
+        assert "available" not in entry
+        assert "version" not in entry
+        assert "note" not in entry
 
     # No environment value, prompt or secret may leak into the listing.
     out = capsys.readouterr().out

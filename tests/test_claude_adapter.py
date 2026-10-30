@@ -10,7 +10,6 @@ import asyncio
 import json
 import os
 import secrets
-import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -22,7 +21,6 @@ from relay.adapters.base import (
     Invocation,
     ProcessResult,
     RunContext,
-    advertised_levels,
 )
 from relay.adapters.claude import ClaudeAdapter, PermissionUnsupported, ResultInvalid
 from relay.core.registry import Agent
@@ -187,36 +185,6 @@ def test_workspace_fails_closed(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(agent(), parent_env={})
     with pytest.raises(PermissionUnsupported, match="workspace"):
         adapter.build_invocation(spec(), ctx(tmp_path, permission="workspace"))
-
-
-def test_probe_advertises_only_verified_levels(tmp_path: Path) -> None:
-    adapter = ClaudeAdapter(agent(), cmd=sys.executable, parent_env=dict(os.environ))
-    probe = asyncio.run(adapter.probe())
-    assert probe.available is True
-    assert probe.levels == advertised_levels("claude")
-    assert "workspace" not in probe.levels
-    assert probe.version is not None
-    assert probe.version.startswith("Python")
-
-
-def test_probe_records_the_auth_mode() -> None:
-    plain = ClaudeAdapter(agent(), cmd=sys.executable, parent_env=dict(os.environ))
-    assert "auth-mode=subscription" in asyncio.run(plain.probe()).notes
-    keyed = ClaudeAdapter(
-        agent(),
-        cmd=sys.executable,
-        parent_env={**os.environ, "ANTHROPIC_API_KEY": "sk-ant-probe"},
-    )
-    assert "auth-mode=api-key" in asyncio.run(keyed.probe()).notes
-
-
-def test_probe_unavailable_when_command_missing() -> None:
-    adapter = ClaudeAdapter(
-        agent(), cmd="definitely-not-installed-xyz", parent_env=dict(os.environ)
-    )
-    probe = asyncio.run(adapter.probe())
-    assert probe.available is False
-    assert probe.levels == ("full",)
 
 
 # --- auth mode: `--bare` only with an API key (section 7.2) -------------------------------
@@ -490,7 +458,7 @@ def test_usage_uses_the_model_that_actually_ran(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.environ.get("RELAY_LIVE") != "1", reason="live smoke needs RELAY_LIVE=1")
-def test_live_smoke_probe_and_parse(tmp_path: Path) -> None:
+def test_live_smoke_parse(tmp_path: Path) -> None:
     import shutil
 
     from relay.adapters.base import run_invocation
@@ -498,9 +466,6 @@ def test_live_smoke_probe_and_parse(tmp_path: Path) -> None:
     if shutil.which("claude") is None:
         pytest.skip("claude is not installed")
     adapter = ClaudeAdapter(agent(), parent_env=dict(os.environ))
-    probe = asyncio.run(adapter.probe())
-    assert probe.available is True
-    assert probe.levels == advertised_levels("claude")
     token = "smoke-" + secrets.token_hex(6)
     task = spec()
     task.goal = (

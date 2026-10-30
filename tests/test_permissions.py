@@ -1,22 +1,16 @@
 """Permission levels: precedence, fail-closed checks and the run-start banner (task 1.20 part A).
 
-Pure unit tests: no network, no real CLIs. The adapter honesty checks drive ``probe()`` with
-a missing command (or ``sys.executable``), so no agent binary is ever invoked beyond
-``python --version``.
+Pure unit tests: no network, no real CLIs, no availability probing.
 """
 
 from __future__ import annotations
 
-import asyncio
-import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from harness import context, task
-from relay.adapters.antigravity import AntigravityAdapter
-from relay.adapters.base import advertised_levels
 from relay.adapters.claude import ClaudeAdapter
 from relay.adapters.claude import PermissionUnsupported as ClaudeUnsupported
 from relay.adapters.codex import CodexAdapter
@@ -195,41 +189,26 @@ def test_decision_is_a_frozen_dataclass_with_expected_shape() -> None:
     assert decision.source == "task"
 
 
-# --- probe().levels honest against the mapping ----------------------------------------------
+# --- permission mapping keeps the restricted flags -------------------------------------------
 
 
 def _claude_agent() -> Agent:
     return Agent(cmd="claude", env={})
 
 
-def test_claude_probe_advertises_only_full() -> None:
-    adapter = ClaudeAdapter(_claude_agent(), cmd="no-such-claude-x", parent_env={})
-    assert asyncio.run(adapter.probe()).levels == ("full",)
-
-
-def test_antigravity_probe_advertises_only_full() -> None:
-    adapter = AntigravityAdapter(_claude_agent(), cmd="no-such-agy-x", parent_env={})
-    assert asyncio.run(adapter.probe()).levels == ("full",)
-
-
-def test_codex_probe_advertises_only_full() -> None:
-    assert asyncio.run(CodexAdapter(cmd="no-such-codex-x").probe()).levels == ("full",)
-
-
-def test_codex_mapping_keeps_restricted_flags_but_advertises_only_full(tmp_path: Path) -> None:
-    # The mapping still expresses every level (section 7.2) with unchanged flags…
+def test_codex_mapping_keeps_restricted_flags(
+    tmp_path: Path,
+) -> None:
+    # The mapping still expresses every level (section 7.2) with unchanged flags.
     adapter = CodexAdapter(levels=("full", "workspace", "readonly"))
     workspace = adapter.build_invocation(task(), replace(context(tmp_path), permission="workspace"))
     assert "-s" in workspace.args and "workspace-write" in workspace.args
     readonly = adapter.build_invocation(task(), replace(context(tmp_path), permission="readonly"))
     assert "-s" in readonly.args and "read-only" in readonly.args
-    # …but the default adapter advertises only the proven subset, `full`.
-    assert asyncio.run(CodexAdapter(cmd="no-such-codex-x").probe()).levels == ("full",)
 
 
-def test_claude_mapping_keeps_readonly_but_advertises_only_full(tmp_path: Path) -> None:
-    # `readonly` is still mapped (for the future profile) but unadvertised; `workspace` fails
-    # closed in the mapping itself.
+def test_claude_mapping_keeps_readonly(tmp_path: Path) -> None:
+    # `workspace` still fails closed in the mapping itself.
     adapter = ClaudeAdapter(_claude_agent(), parent_env={})
     full = adapter.build_invocation(task(), replace(context(tmp_path), permission="full"))
     assert "--dangerously-skip-permissions" in full.args
@@ -237,16 +216,6 @@ def test_claude_mapping_keeps_readonly_but_advertises_only_full(tmp_path: Path) 
     assert "--permission-mode" in readonly.args and "plan" in readonly.args
     with pytest.raises(ClaudeUnsupported):
         adapter.build_invocation(task(), replace(context(tmp_path), permission="workspace"))
-    assert asyncio.run(
-        ClaudeAdapter(_claude_agent(), cmd="no-such-claude-x", parent_env={}).probe()
-    ).levels == ("full",)
-
-
-def test_probe_levels_parse_from_a_real_python_binary() -> None:
-    # `sys.executable --version` succeeds, so `probe()` runs end-to-end without an agent CLI.
-    probe = asyncio.run(CodexAdapter(cmd=sys.executable).probe())
-    assert probe.available is True
-    assert probe.levels == advertised_levels("codex")
 
 
 # --- banner (design sections 9.4, 14) -------------------------------------------------------

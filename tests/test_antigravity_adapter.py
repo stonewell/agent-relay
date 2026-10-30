@@ -1,6 +1,6 @@
 """Antigravity CLI (`agy`) adapter (task 4.1, design sections 7.2, 7.3, 5.4, 9.3, 9.4).
 
-Deterministic tests only: invocation snapshots, probe detection, envelope parsing, the
+Deterministic tests only: invocation snapshots, envelope parsing, the
 four-step parsing order, usage normalization, and environment allowlisting. No network and
 no live CLI. Every `agy` behavioural claim is **[verify]** (the CLI is not installed on the
 reference machine), so the live smoke test is intentionally skipped.
@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -172,38 +171,7 @@ def test_workspace_fails_closed(tmp_path: Path) -> None:
         adapter.build_invocation(spec(), ctx(tmp_path, permission="workspace"))
 
 
-def test_probe_advertises_only_full() -> None:
-    adapter = AntigravityAdapter(agent(), cmd=sys.executable, parent_env=dict(os.environ))
-    probe = asyncio.run(adapter.probe())
-    assert probe.available is True
-    assert probe.levels == ("full",)
-    assert probe.version is not None
-    assert probe.version.startswith("Python")
-
-
-def test_probe_unavailable_when_command_missing() -> None:
-    adapter = AntigravityAdapter(
-        agent(), cmd="definitely-not-installed-xyz", parent_env=dict(os.environ)
-    )
-    probe = asyncio.run(adapter.probe())
-    assert probe.available is False
-    assert probe.levels == ("full",)
-
-
-def test_probe_records_the_auth_mode() -> None:
-    plain = AntigravityAdapter(
-        agent(), cmd=sys.executable, parent_env={"PATH": "/bin", "HOME": "/tmp"}
-    )
-    assert "auth-mode=keyring" in asyncio.run(plain.probe()).notes
-    keyed = AntigravityAdapter(
-        agent(),
-        cmd=sys.executable,
-        parent_env={"PATH": "/bin", "HOME": "/tmp", "GEMINI_API_KEY": "AIza-probe"},
-    )
-    assert "auth-mode=api-key" in asyncio.run(keyed.probe()).notes
-
-
-# --- resume -------------------------------------------------------------------------------
+# --- resume ---------------------------------------------------------------------------------
 
 
 def test_resume_flag_when_resume_session_is_set(tmp_path: Path) -> None:
