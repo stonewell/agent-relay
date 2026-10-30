@@ -3,6 +3,13 @@
 These instructions configure Codex coordination in this project. Agent definitions
 are in `.codex/agents/`; `.codex/config.toml` sets the coordinator and concurrency.
 
+## Scope
+
+Do only what the prompt asks for. No over-design: no
+new modules, config options, flags, or protocol fields, no unrequested refactors,
+doc rewrites, or test re-architecture. Implement the smallest change that satisfies
+the request, then stop. Ask before expanding scope.
+
 ## Delegation
 
 The primary Codex agent must delegate substantive implementation, investigation,
