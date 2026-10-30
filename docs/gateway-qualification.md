@@ -2,10 +2,11 @@
 
 Agent-CLI verification has been removed: relay no longer qualifies, probes or fingerprints an
 installed CLI before using it. An agent is usable exactly when it is `enabled` in configuration and
-has a gateway adapter, so availability is configuration-driven. `GET /v1/models` lists every
-configured model alias with `null` limits until they are observed, plus `relay/auto` when defaults
-exist. `agy` models are enumerated from `agy models` (TSV `<slug>\t<name>`, cached per process,
-falling back to `agents.agy.models` and then `("default",)`).
+has a gateway adapter, so availability is configuration-driven. `GET /v1/models` lists named
+configured model aliases with `null` limits until they are observed. `relay/auto` remains available
+for internal routing but is not included in the list. `agy` models are enumerated from `agy models`
+(TSV `<slug>\\t<name>`, cached per process, falling back to `agents.agy.models` and then
+`("default",)`).
 
 The requirement was that relay run whatever CLI the operator registers and let the operator resolve
 CLI-level problems. Pre-flight verification contradicted that: it added a gate that made correctly
@@ -24,8 +25,7 @@ followed.
 
 1. Register the agent in `~/.config/relay/agents.yaml` and set `enabled: true`.
 2. Confirm the CLI itself works (installed, authenticated, able to answer); relay does not check.
-3. Use `relay serve` or `relay opencode-config` to check the generated output and the listed
-   models. Limits stay `null` until observed.
+3. Start `relay serve` and inspect `GET /v1/models`. Limits stay `null` until observed.
 4. Send a request. If the CLI is missing, broken or misconfigured, relay reports a detailed error at
    invocation — command, exit code and a redacted stderr tail — on stderr and in the OpenAI-shaped
    HTTP error body, leaving the CLI-level diagnosis to the operator.

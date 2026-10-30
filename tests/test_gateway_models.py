@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -68,7 +67,6 @@ def configuration() -> Config:
                 "fake": {
                     "cmd": "never-called",
                     "models": {"deep": "m/deep", "fast": "m/fast"},
-                    "model_routing": {"default": {"model": "deep", "effort": "high"}},
                 }
             },
         }
@@ -292,7 +290,7 @@ def test_default_registry_adds_codex_and_opt_in_cursor_with_backend_specific_ali
 
     monkeypatch.setattr(codex_completion, "_enumerated_models", codex_models)
     monkeypatch.setattr(cursor_completion, "_enumerated_models", cursor_models)
-    config = load_config(user_config=None, project_root=None).config
+    config = load_config(user_config=None).config
     adapters = default_adapters(config)
     assert "codex" in adapters and "cursor" not in adapters
     assert adapters["codex"].id == "codex"
@@ -328,7 +326,6 @@ def test_cursor_groups_verified_inventory_and_keeps_legacy_ids_routable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from relay.adapters import cursor_completion
-    from relay.cli.commands.opencode_config import provider_config
 
     config = configuration()
     config.agents["cursor"] = config.agents["fake"].model_copy(deep=True)
@@ -387,26 +384,6 @@ def test_cursor_groups_verified_inventory_and_keeps_legacy_ids_routable(
     assert [model.agent for model in catalog.candidates(request)] == ["fake"]
     request.reasoning_effort = None
     assert {model.agent for model in catalog.candidates(request)} == {"fake", "cursor"}
-    snippet = provider_config(
-        listing,
-        "http://127.0.0.1:8765/v1",
-        effort_models={name: model.reasoning_efforts for name, model in catalog.models.items()},
-    )
-    generated = json.loads(json.dumps(snippet))["provider"]["relay"]["models"]
-    assert generated["cursor/gemini-3.8-flash"]["variants"] == {
-        "low": {"reasoningEffort": "low"},
-        "high": {"reasoningEffort": "high"},
-    }
-    assert "cursor/gemini-3.8-flash-low" not in generated
-    assert generated["cursor/gemini-3.7-flash"]["variants"] == {
-        "low": {"reasoningEffort": "low"},
-        "high": {"reasoningEffort": "high"},
-    }
-    assert generated["cursor/gemini-3.6-flash"]["variants"] == {
-        "minimal": {"reasoningEffort": "minimal"},
-        "high": {"reasoningEffort": "high"},
-    }
-    assert "variants" not in generated["cursor/gemini-3.1-pro"]
     request.model = "cursor/gemini-3.6-flash"
     request.reasoning_effort = "minimal"
     assert catalog.candidates(request)[0].reasoning_efforts == ("minimal", "high")

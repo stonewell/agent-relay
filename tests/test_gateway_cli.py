@@ -2,34 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-from relay.adapters.completion import DEFAULT_MODEL_ALIASES, CompletionModelOptions, ObservedModel
-from relay.cli.commands import opencode_config, serve
+from relay.cli.commands import serve
 from relay.cli.main import main
-from relay.cli.phases import COMMAND_PHASE, EARLY_ACCESS, IMPLEMENTED, availability_error
 from relay.core.registry import load_config
-from relay.core.specs.common import CURRENT_PHASE
 from relay.gateway import discovery
-from test_gateway_models import FakeBackend
-
-
-def test_gateway_commands_do_not_advance_other_phase_gates() -> None:
-    assert CURRENT_PHASE == 2
-    assert availability_error("serve") is None
-    assert availability_error("opencode-config") is None
-    assert availability_error("replay") == "relay replay: available from phase 4"
-    # The exemption lives in the phase table and must stay a real, implemented early access.
-    assert {"serve", "opencode-config"} == EARLY_ACCESS
-    assert EARLY_ACCESS <= IMPLEMENTED
-    assert all(COMMAND_PHASE[command] > CURRENT_PHASE for command in EARLY_ACCESS)
 
 
 @pytest.mark.parametrize(
@@ -44,8 +27,6 @@ def test_gateway_commands_do_not_advance_other_phase_gates() -> None:
         ["serve", "--log-level", "verbose"],
         ["serve", "--model", "--dangerously-skip-permissions"],
         ["serve", "--model", ""],
-        ["opencode-config", "--model", "a b"],
-        ["opencode-config", "--timeout", "0"],
     ],
 )
 def test_unsafe_server_options_are_rejected(arguments: list[str]) -> None:
@@ -72,7 +53,7 @@ assert not any(name.startswith('relay.gateway') for name in sys.modules)
         [sys.executable, "-c", code], cwd=tmp_path, text=True, capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
-    assert "agent-relay[serve]" in result.stderr
+    assert "server dependencies" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -112,8 +93,7 @@ def test_server_uses_global_config_and_fixed_process_options(
         calls["app"] = app
         calls["uvicorn"] = kwargs
 
-    def config_loader(*, project_root: Path | None) -> object:
-        assert project_root is None
+    def config_loader() -> object:
         return load_config(user_config=None)
 
     fake_app.GatewayLimits = limits  # type: ignore[attr-defined]
@@ -199,8 +179,7 @@ def test_server_cli_with_key_option(
         calls["app"] = app
         calls["uvicorn"] = kwargs
 
-    def config_loader(*, project_root: Path | None) -> object:
-        assert project_root is None
+    def config_loader() -> object:
         return load_config(user_config=None)
 
     fake_app.GatewayLimits = limits  # type: ignore[attr-defined]
@@ -222,20 +201,6 @@ def test_server_cli_with_key_option(
     assert "relay serve: bearer token must be a nonempty printable ASCII token" in err_output
 
 
-@pytest.mark.parametrize("catalog", [None, [], {}, {"data": None}])
-def test_config_rejects_invalid_catalogs(catalog: object) -> None:
-    with pytest.raises(ValueError, match="invalid model catalog"):
-        opencode_config.provider_config(catalog, "http://127.0.0.1:8765/v1")
-
-
-def test_ipv6_config_url_is_canonical() -> None:
-    assert opencode_config.validate_base_url("http://[::1]:1234/v1/") == (
-        "http://[::1]:1234/v1",
-        "::1",
-        1234,
-    )
-
-
 @pytest.mark.parametrize("token", ["", "has space", "line\nbreak", "nonascii-é"])
 def test_invalid_tokens_are_rejected(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
     monkeypatch.setenv("RELAY_GATEWAY_TOKEN", token)
@@ -246,218 +211,42 @@ def test_invalid_tokens_are_rejected(monkeypatch: pytest.MonkeyPatch, token: str
 
 
 @pytest.mark.parametrize(
-    "url",
+    "command",
     [
-        "http://example.com/v1",
-        "http://localhost/v1",
-        "https://127.0.0.1/v1",
-        "http://127.0.0.1:0/v1",
-        "http://127.0.0.1:65536/v1",
-        "http://secret@127.0.0.1/v1",
-        "http://127.0.0.1/v1?token=secret",
-        "http://127.0.0.1/v1#secret",
-        "http://127.0.0.1/other",
-        "http://127.1/v1",
+        "tui",
+        "run",
+        "graph",
+        "plan",
+        "resume",
+        "reply",
+        "apply",
+        "clean",
+        "doctor",
+        "result",
+        "routes",
+        "explain",
+        "status",
+        "agents",
+        "opencode-config",
+        "replay",
+        "cancel",
     ],
 )
-def test_config_rejects_unsafe_urls_before_probing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], url: str
-) -> None:
-    def forbidden(*args: object) -> object:
-        pytest.fail("invalid URL must never load backends or probe")
-
-    monkeypatch.setattr(discovery, "default_adapters", forbidden)
-    assert main(["opencode-config", "--base-url", url, "--refresh", "--json"]) == 2
-    output = capsys.readouterr()
-    assert output.out == ""
-    assert "base URL must" in json.loads(output.err)["error"]
+def test_removed_commands_are_rejected(command: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main([command])
+    assert exc.value.code == 2
 
 
-def config_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> tuple[list[FakeBackend], Path]:
-    """opencode-config against fake backends and a private cache; no CLI or model call."""
-    backends: list[FakeBackend] = []
-    cache = tmp_path / "state" / "gateway-models.json"
-
-    def adapters(config: object) -> dict[str, FakeBackend]:
-        backends.append(FakeBackend("claude"))
-        return {"claude": backends[-1]}
-
-    def config_loader(*, project_root: Path | None) -> object:
-        assert project_root is None
-        return load_config(user_config=None)
-
-    monkeypatch.setattr(opencode_config, "load_config", config_loader)
-    monkeypatch.setattr(discovery, "default_adapters", adapters)
-    monkeypatch.setattr(discovery, "default_cache_path", lambda: cache)
-    monkeypatch.delenv("RELAY_GATEWAY_TOKEN", raising=False)
-    return backends, cache
+def test_help_only_lists_serve(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "serve" in output
+    assert "tui" not in output and "opencode-config" not in output
 
 
-def test_config_without_cache_reports_undiscovered_models_and_never_probes(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    backends, cache = config_environment(monkeypatch, tmp_path)
-    assert main(["-C", str(tmp_path), "opencode-config"]) == 0
-    output = capsys.readouterr()
-    provider = json.loads(output.out)["provider"]["relay"]
-    assert set(provider["models"]) == {
-        "claude/sonnet",
-        "claude/opus",
-        "claude/fable",
-    }
-    assert all("limit" not in model for model in provider["models"].values())
-    assert all(
-        model["variants"]
-        == {
-            "low": {"reasoningEffort": "low"},
-            "medium": {"reasoningEffort": "medium"},
-            "high": {"reasoningEffort": "high"},
-        }
-        for model in provider["models"].values()
-    )
-    assert provider["options"] == {
-        "baseURL": "http://127.0.0.1:8765/v1",
-        "apiKey": "{env:RELAY_GATEWAY_TOKEN}",
-    }
-    assert "not yet discovered" in output.err and "--refresh" in output.err
-    assert "claude/opus" in output.err and "relay/auto" in output.err
-    assert backends[0].probes == [] and backends[0].calls == []
-    assert not cache.exists() and not (tmp_path / ".agents").exists()
-
-
-def test_config_refresh_probes_caches_and_later_reads_cache(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    backends, cache = config_environment(monkeypatch, tmp_path)
-    assert main(["opencode-config", "--refresh"]) == 0
-    output = capsys.readouterr()
-    assert backends[0].probes == list(DEFAULT_MODEL_ALIASES)
-    models = json.loads(output.out)["provider"]["relay"]["models"]
-    assert models["claude/opus"] == {
-        "name": "claude/opus",
-        "tool_call": True,
-        "limit": {"context": 100000, "output": 10000},
-        "variants": {
-            "low": {"reasoningEffort": "low"},
-            "medium": {"reasoningEffort": "medium"},
-            "high": {"reasoningEffort": "high"},
-        },
-    }
-    assert set(models) == {
-        "claude/sonnet",
-        "claude/opus",
-        "claude/fable",
-    }
-    # Failed probes keep their entry without limits; limits are never invented.
-    assert "listed without observed context/output limits (probe failed)" in output.err
-    assert "claude/sonnet" in output.err and "claude/fable" in output.err
-    assert "not yet discovered" not in output.err
-    assert cache.is_file()
-
-    assert main(["opencode-config"]) == 0
-    cached = capsys.readouterr()
-    assert backends[1].probes == []
-    assert json.loads(cached.out)["provider"]["relay"]["models"] == models
-    assert "claude/sonnet" in cached.err and "--refresh" in cached.err
-
-    assert main(["opencode-config", "--model", "opus", "--json"]) == 0
-    selected = capsys.readouterr()
-    assert backends[2].probes == []
-    assert set(json.loads(selected.out)["provider"]["relay"]["models"]) == {"claude/opus"}
-    assert selected.err == ""
-
-    # An added alias is undiscovered until refreshed; refresh probes only what is asked.
-    assert main(["opencode-config", "--model", "opus", "--model", "haiku", "--json"]) == 0
-    added = capsys.readouterr()
-    warnings = [json.loads(line)["warning"] for line in added.err.splitlines()]
-    assert len(warnings) == 1 and "claude/haiku" in warnings[0]
-    assert backends[3].probes == []
-    backends_before = len(backends)
-    assert main(["opencode-config", "--model", "haiku", "--refresh"]) == 0
-    capsys.readouterr()
-    assert backends[backends_before].probes == ["haiku"]
-
-
-def test_config_refresh_replaces_changed_observations(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    backends, _cache = config_environment(monkeypatch, tmp_path)
-    assert main(["opencode-config", "--refresh", "--model", "opus"]) == 0
-    capsys.readouterr()
-    original = FakeBackend.__init__
-
-    def upgraded(self: FakeBackend, name: str = "fake", *, tools: bool = True) -> None:
-        original(self, name, tools=tools)
-        self.limits = {"opus": ObservedModel("m-opus-2", 400000, 20000)}
-
-    monkeypatch.setattr(FakeBackend, "__init__", upgraded)
-    assert main(["opencode-config", "--refresh", "--model", "opus"]) == 0
-    models = json.loads(capsys.readouterr().out)["provider"]["relay"]["models"]
-    assert models["claude/opus"]["limit"] == {"context": 400000, "output": 20000}
-    assert backends[-1].probes == ["opus"]
-
-
-def test_opencode_config_omits_cursor_effort_variants_without_new_catalog_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from relay.adapters import cursor_completion
-    from relay.gateway.models import ModelCatalog
-
-    def enumerated_models(*_: object) -> tuple[str, ...]:
-        return ("named",)
-
-    monkeypatch.setattr(cursor_completion, "_enumerated_models", enumerated_models)
-
-    config = load_config(user_config=None, project_root=None).config
-    config.agents["cursor"].enabled = True
-    catalog = ModelCatalog(config, discovery.default_adapters(config), models=["named"])
-    supported = {name: model.reasoning_efforts for name, model in catalog.models.items()}
-    snippet = opencode_config.provider_config(
-        catalog.listing(), "http://127.0.0.1:8765/v1", effort_models=supported
-    )
-    models = json.loads(json.dumps(snippet))["provider"]["relay"]["models"]
-    assert "variants" not in models["cursor/named"]
-    assert set(models["codex/named"]["variants"]) == {"low", "medium", "high"}
-    assert not {"cursor", "cursor/default", "codex", "relay/auto"} & models.keys()
-
-
-def test_config_discovery_notices_exclude_private_group_variants_after_refresh(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    config_environment(monkeypatch, tmp_path)
-
-    class GroupedBackend(FakeBackend):
-        default_aliases = ("default", "group", "group-low", "group-high")
-
-    backend = GroupedBackend("claude")
-    backend.support = replace(
-        backend.support,
-        model_options={
-            "group": CompletionModelOptions(("low", "high")),
-            "group-low": CompletionModelOptions(("low", "high"), listed=False),
-            "group-high": CompletionModelOptions(("low", "high"), listed=False),
-        },
-    )
-    backend.limits["group"] = ObservedModel("actual-group", 100000, 10000)
-
-    def adapters(_: object) -> dict[str, FakeBackend]:
-        return {"claude": backend}
-
-    monkeypatch.setattr(discovery, "default_adapters", adapters)
-    assert main(["opencode-config"]) == 0
-    initial = capsys.readouterr()
-    assert "claude/group" in initial.err and "relay/auto" in initial.err
-    assert "claude/default" in initial.err
-    assert "claude/group-low" not in initial.err and "claude/group-high" not in initial.err
-    assert "--refresh" in initial.err
-
-    assert main(["opencode-config", "--refresh"]) == 0
-    refreshed = capsys.readouterr()
-    assert backend.probes == ["default", "group"]
-    assert refreshed.err == ""
-    assert set(json.loads(refreshed.out)["provider"]["relay"]["models"]) == {"claude/group"}
-    assert main(["opencode-config"]) == 0
-    assert capsys.readouterr().err == ""
-    assert backend.probes == ["default", "group"]
+def test_bare_relay_requires_serve(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([]) == 2
+    assert "choose a command" in capsys.readouterr().err

@@ -1,4 +1,4 @@
-"""Foreground loopback-only completion gateway; optional dependencies stay lazy."""
+"""Foreground loopback-only completion gateway; server imports stay lazy."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def gateway_token(*, generate: bool = False, key: str | None = None) -> tuple[st
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:  # pyright: ignore[reportPrivateUsage]
-    parser = subparsers.add_parser("serve", help="run the optional local completion gateway")
+    parser = subparsers.add_parser("serve", help="run the local completion gateway")
     parser.add_argument("--host", choices=("127.0.0.1", "::1"), default="127.0.0.1")
     parser.add_argument("--port", type=positive_int, default=8765)
     parser.add_argument(
@@ -93,11 +93,11 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         from relay.gateway.discovery import ModelCache, default_cache_path
     except ImportError:
         return report_error(
-            "relay serve: install the optional agent-relay[serve] extra", Exit.INVALID, False
+            "relay serve: install agent-relay with its server dependencies", Exit.INVALID, False
         )
     try:
         token, generated = gateway_token(generate=True, key=args.key)
-        config = load_config(project_root=None).config
+        config = load_config().config
         limits = GatewayLimits(
             concurrency=args.concurrency or config.defaults.concurrency,
             timeout_s=args.timeout or config.defaults.timeout_s,

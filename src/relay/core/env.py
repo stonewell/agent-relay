@@ -7,9 +7,8 @@ override — all copied only when present in the parent environment. ``env:`` ad
 ``agents.yaml`` and per-invocation extras are layered on top. Anything else in the parent
 environment, including the supervisor's own secrets, is never forwarded.
 
-Redaction helpers turn an environment (or arbitrary text) into something safe to log:
-values of token-bearing and proxy/CA variables are masked, and credentials embedded in
-URLs (userinfo in ``http(s)://user:pass@host``) are stripped.
+Redaction helpers mask supplied secret values and credentials embedded in URLs
+(userinfo in ``http(s)://user:pass@host``).
 """
 
 from __future__ import annotations
@@ -193,12 +192,6 @@ REDACTED = "<redacted>"
 # `scheme://` followed by userinfo up to `@`: user:pass, user, or :pass are all masked.
 _URL_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<userinfo>[^/@\s]+)@")
 
-# Token-bearing name patterns, matched case-insensitively anywhere in a variable name.
-_SECRET_NAME = re.compile(
-    r"(?:token|secret|password|passwd|pwd|credential|api[_-]?key|bearer|cookie|auth|authorization)",
-    re.IGNORECASE,
-)
-
 # Values this short are never value-substituted: replacing "1" or "on" would corrupt logs.
 _MIN_SECRET_LEN = 4
 
@@ -206,14 +199,6 @@ _MIN_SECRET_LEN = 4
 def redact_url(value: str) -> str:
     """Mask userinfo credentials in URLs inside `value` (``http://user:pass@host``)."""
     return _URL_USERINFO.sub(lambda m: f"{m.group('scheme')}{REDACTED}@", value)
-
-
-def is_secret_name(name: str) -> bool:
-    """True when `name` denotes a secret or a proxy/CA variable (never safe to log)."""
-    upper = name.upper()
-    if upper in PROXY_VARS or name in CA_VARS:
-        return True
-    return _SECRET_NAME.search(name) is not None
 
 
 def redact(text: str, *, secrets: Mapping[str, str] | None = None) -> str:
@@ -227,14 +212,3 @@ def redact(text: str, *, secrets: Mapping[str, str] | None = None) -> str:
         if len(value) >= _MIN_SECRET_LEN:
             result = result.replace(value, REDACTED)
     return result
-
-
-def redact_env(env: Mapping[str, str]) -> dict[str, str]:
-    """A logging-safe copy of an environment.
-
-    Values of secret-named variables are replaced with :data:`REDACTED`; every other value
-    has URL credentials masked, so a proxy URL never leaks even under a harmless name.
-    """
-    return {
-        name: REDACTED if is_secret_name(name) else redact_url(value) for name, value in env.items()
-    }

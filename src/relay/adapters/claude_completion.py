@@ -1,7 +1,6 @@
 """Claude tool-free completion backend.
 
-This is separate from ClaudeAdapter's repository worker and coordinator paths. The only
-streaming exposed by this backend is buffered HTTP streaming after final JSON validation.
+Streaming is buffered until the final JSON response has been validated.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from relay.adapters.claude import COORDINATOR_FLAGS
 from relay.adapters.completion import (
     DEFAULT_MODEL_ALIASES,
     CompletionError,
@@ -42,6 +40,18 @@ from relay.core.platform.proc import (
     stream_output,
 )
 from relay.core.registry import Agent
+
+COMPLETION_FLAGS: tuple[str, ...] = (
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--disable-slash-commands",
+    "--setting-sources",
+    "",
+    "--no-session-persistence",
+)
 
 
 def _capture(_: str) -> None:
@@ -96,7 +106,7 @@ class ClaudeCompletionAdapter:
 
     @staticmethod
     def arguments(request: CompletionRequest) -> tuple[str, ...]:
-        args = ["-p", "--output-format", "json", *COORDINATOR_FLAGS]
+        args = ["-p", "--output-format", "json", *COMPLETION_FLAGS]
         if request.output_schema is not None:
             args += ["--json-schema", json.dumps(request.output_schema, separators=(",", ":"))]
         if request.model != "default":
@@ -127,9 +137,7 @@ class ClaudeCompletionAdapter:
                 proc = run_process(
                     command, cwd=cwd, env=env, stdin=request.prompt, timeout_s=remaining
                 )
-            return parse_completion(
-                proc, structured=request.output_schema is not None, secrets=env
-            )
+            return parse_completion(proc, structured=request.output_schema is not None, secrets=env)
         except CommandNotFound as exc:
             message = (
                 f"Claude CLI not found: command {self._agent.cmd!r} (resolved via PATH); "

@@ -1,12 +1,14 @@
 [project]
 name = "agent-relay"
 version = "0.0.0"
-description = "Routes programming tasks to agent CLIs and passes context between them as specs"
+description = "Serves agent CLIs through a local OpenAI-compatible completion API"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.8",
     "pyyaml>=6",
-    "textual>=8.0,<9",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "jsonschema>=4.23",
 ]
 
 [project.scripts]

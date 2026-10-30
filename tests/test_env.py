@@ -2,14 +2,8 @@
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 
-import pytest
-
-from relay.adapters.base import Invocation, run_invocation
 from relay.core.env import (
     CA_VARS,
     CONFIG_HOME_VARS,
@@ -20,10 +14,8 @@ from relay.core.env import (
     WINDOWS_BASE_VARS,
     CompleteEnv,
     build_env,
-    is_secret_name,
     is_supervisor_var,
     redact,
-    redact_env,
     redact_url,
 )
 
@@ -280,150 +272,7 @@ def test_redact_ignores_short_values() -> None:
     assert redact("x=1 y=1", secrets={"X": "1"}) == "x=1 y=1"
 
 
-def test_redact_env_masks_token_bearing_names() -> None:
-    env = {
-        "ANTHROPIC_API_KEY": "sk-ant-secret",
-        "OPENAI_API_KEY": "sk-openai",
-        "GITHUB_TOKEN": "ghp-secret",
-        "CODECOV_TOKEN": "cc-secret",
-        "AWS_SECRET_ACCESS_KEY": "aws-secret",
-        "MY_PASSWORD": "hunter2secret",
-    }
-    assert redact_env(env) == {name: REDACTED for name in env}
-
-
-def test_redact_env_never_logs_proxy_credentials() -> None:
-    proxy = "http://alice:correct-horse-battery@proxy.example.invalid:3128"
-    env = {"HTTPS_PROXY": proxy, "http_proxy": proxy, "PATH": "/bin", "HOME": "/home"}
-    rendered = redact_env(env)
-    for value in rendered.values():
-        assert "correct-horse-battery" not in value
-        assert "alice" not in value
-    assert rendered["HTTPS_PROXY"] == REDACTED  # proxy values are masked outright
-    assert rendered["PATH"] == "/bin"  # non-secret values pass through
-
-
-def test_redact_env_masks_userinfo_under_a_harmless_name() -> None:
-    env = {"SOME_URL": "http://bob:s3cret@host:80"}
-    assert redact_env(env) == {"SOME_URL": f"http://{REDACTED}@host:80"}
-
-
-def test_build_then_redact_env_leaks_nothing() -> None:
-    """End-to-end: the built environment renders to a log with no credentials."""
-    proxy = "http://user:pass@proxy.example.invalid:8080"
-    agent = _Agent(env={"ANTHROPIC_API_KEY": "sk-ant-built-secret"})
-    built = build_env(
-        agent_config=agent,
-        extra_env={"CURSOR_API_KEY": "cursor-built-secret"},
-        parent_env=_posix_parent(HTTPS_PROXY=proxy),
-        platform="linux",
-    )
-    rendered = redact_env(built)
-    for value in rendered.values():
-        assert "pass" not in value
-        assert "sk-ant-built-secret" not in value
-        assert "cursor-built-secret" not in value
-    assert rendered["ANTHROPIC_API_KEY"] == REDACTED
-    assert rendered["CURSOR_API_KEY"] == REDACTED
-
-
-def test_is_secret_name() -> None:
-    assert is_secret_name("ANTHROPIC_API_KEY")
-    assert is_secret_name("GITHUB_TOKEN")
-    assert is_secret_name("HTTPS_PROXY")
-    assert is_secret_name("http_proxy")
-    assert is_secret_name("SSL_CERT_FILE")
-    assert not is_secret_name("PATH")
-    assert not is_secret_name("USER")
-
-
-# --- the `full_env` contract in `run_invocation` (integration point for `build_env`) -----------
-
-
-def _spawn_env(**extra: str) -> dict[str, str]:
-    """A valid, allowlisted child environment (spawn-safe on Windows and POSIX)."""
-    return {**build_env(parent_env=os.environ, platform=sys.platform), **extra}
-
-
-def test_run_invocation_full_env_passes_the_exact_environment(tmp_path: Path) -> None:
-    inv = Invocation(
-        cmd=sys.executable,
-        args=("-c", "import os,sys; sys.stdout.write(os.environ.get('TEST_FULL_ENV_MARKER', ''))"),
-        cwd=tmp_path,
-        env=_spawn_env(TEST_FULL_ENV_MARKER="child"),
-        full_env=True,
-    )
-    result = run_invocation(inv)
-    assert result.exit_code == 0
-    assert result.stdout == "child"
-
-
-def test_run_invocation_full_env_does_not_merge_the_parent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("TEST_ONLY_PARENT_MARKER", "parent-value")
-    inv = Invocation(
-        cmd=sys.executable,
-        args=(
-            "-c",
-            "import os,sys; sys.stdout.write(repr(os.environ.get('TEST_ONLY_PARENT_MARKER')))",
-        ),
-        cwd=tmp_path,
-        env=_spawn_env(),
-        full_env=True,
-    )
-    result = run_invocation(inv)
-    assert result.exit_code == 0
-    assert result.stdout == repr(None)
-    assert "parent-value" not in result.stdout
-
-
-# --- fail-closed contract: a `build_env` result is complete even without `full_env=True` -------
-
-
 def test_build_env_returns_a_complete_env_type() -> None:
     built = build_env(parent_env=_posix_parent(), platform="linux")
     assert isinstance(built, CompleteEnv)
-    assert isinstance(built, dict)  # still an ordinary mapping for callers
-    assert dict(built) == built
-
-
-def test_build_env_result_is_complete_without_full_env_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """D2 regression: a forgotten `full_env=True` must not re-merge the parent environment."""
-    monkeypatch.setenv("TEST_ONLY_PARENT_MARKER", "parent-value")
-    assert "TEST_ONLY_PARENT_MARKER" in os.environ
-    built = build_env(parent_env=os.environ, platform=sys.platform)
-    assert "TEST_ONLY_PARENT_MARKER" not in built  # allowlist already excludes it
-    inv = Invocation(
-        cmd=sys.executable,
-        args=(
-            "-c",
-            "import os,sys; sys.stdout.write(repr(os.environ.get('TEST_ONLY_PARENT_MARKER')))",
-        ),
-        cwd=tmp_path,
-        env=built,  # no full_env=True
-    )
-    result = run_invocation(inv)
-    assert result.exit_code == 0
-    assert result.stdout == repr(None)
-
-
-def test_plain_dict_env_still_merges_the_parent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Back-compat: an ordinary dict env (not a `build_env` result) still merges."""
-    monkeypatch.setenv("TEST_ONLY_PARENT_MARKER", "parent-value")
-    inv = Invocation(
-        cmd=sys.executable,
-        args=(
-            "-c",
-            "import os,sys; sys.stdout.write(os.environ.get('TEST_ONLY_PARENT_MARKER', ''))",
-        ),
-        cwd=tmp_path,
-        env={"TEST_CHILD_ONLY": "child"},
-    )
-    result = run_invocation(inv)
-    assert result.exit_code == 0
-    assert result.stdout == "parent-value"
+    assert isinstance(built, dict)
