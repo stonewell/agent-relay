@@ -102,10 +102,24 @@ def test_plain_response_and_sse_identical(client_backend: tuple[TestClient, Fake
 def test_validation_happens_before_dispatch(client_backend: tuple[TestClient, FakeBackend]) -> None:
     client, backend = client_backend
     body = {"model": "fake", "messages": [{"role": "user", "content": "hello"}]}
-    response = client.post("/v1/chat/completions", json={**body, "stop": "bad"})
-    assert response.status_code == 400 and response.json()["error"]["param"] == "stop"
+    response = client.post("/v1/chat/completions", json={**body, "n": 2})
+    assert response.status_code == 400 and response.json()["error"]["param"] == "n"
     assert client.post("/v1/chat/completions", content="{").status_code == 400
     assert backend.calls == []
+
+
+def test_unknown_request_fields_are_ignored(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    body = {
+        "model": "fake",
+        "messages": [{"role": "user", "content": "hello"}],
+        "metadata": {"k": "v"},
+        "stop": ["x"],
+        "user": "u1",
+    }
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200
+    assert len(backend.calls) == 1
 
 
 def test_envelope_repair_usage_aggregation(client_backend: tuple[TestClient, FakeBackend]) -> None:

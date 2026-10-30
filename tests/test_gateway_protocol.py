@@ -108,8 +108,6 @@ def test_invalid_history_rejected(messages: object) -> None:
         ("n", 2),
         ("n", True),
         ("stream", 1),
-        ("functions", []),
-        ("stop", ["stop"]),
         ("max_tokens", 0),
         ("response_format", {"type": "json_object"}),
     ],
@@ -117,6 +115,60 @@ def test_invalid_history_rejected(messages: object) -> None:
 def test_unsupported_or_wrong_parameters(field: str, value: object) -> None:
     with pytest.raises(GatewayError):
         parse_request(tool_request(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("metadata", {"k": "v"}),
+        ("user", "u1"),
+        ("seed", 7),
+        ("stop", ["stop"]),
+        ("presence_penalty", 0.5),
+        ("frequency_penalty", 0.5),
+        ("store", False),
+        ("service_tier", "auto"),
+        ("logprobs", True),
+        ("top_logprobs", 2),
+        ("functions", []),
+    ],
+)
+def test_unknown_parameters_are_ignored(field: str, value: object) -> None:
+    request = parse_request(tool_request(**{field: value}))
+    assert request.model == "fake"
+
+
+def test_unknown_nested_fields_are_ignored() -> None:
+    request = parse_request(
+        tool_request(
+            stream=True,
+            stream_options={"include_usage": True, "include_obfuscation": True},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hello", "annotations": []},
+                    ],
+                    "annotations": [],
+                    "refusal": None,
+                    "audio": {"id": "a"},
+                }
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "parameters": {"type": "object"},
+                        "strict_variant": "x",
+                    },
+                }
+            ],
+        )
+    )
+    assert request.messages[0].text() == "hello"
+    assert request.stream_options is not None and request.stream_options.include_usage
+    assert request.tools is not None and request.tools[0].function.name == "edit"
 
 
 @pytest.mark.parametrize(

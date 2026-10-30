@@ -37,7 +37,7 @@ class GatewayError(Exception):
 
 
 class Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
 
 
 class TextPart(Strict):
