@@ -51,12 +51,12 @@ def add_model_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def gateway_token(*, generate: bool = False) -> tuple[str, bool]:
-    token = os.environ.get("RELAY_GATEWAY_TOKEN")
+def gateway_token(*, generate: bool = False, key: str | None = None) -> tuple[str, bool]:
+    token = key if key is not None else os.environ.get("RELAY_GATEWAY_TOKEN")
     if token is None and generate:
         return secrets.token_urlsafe(32), True
-    if not token or any(ord(char) < 33 or ord(char) > 126 for char in token):
-        raise ValueError("set RELAY_GATEWAY_TOKEN to a nonempty printable ASCII bearer token")
+    if not token or not all(33 <= ord(c) <= 126 for c in token):
+        raise ValueError("bearer token must be a nonempty printable ASCII token")
     return token, False
 
 
@@ -64,6 +64,11 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     parser = subparsers.add_parser("serve", help="run the optional local completion gateway")
     parser.add_argument("--host", choices=("127.0.0.1", "::1"), default="127.0.0.1")
     parser.add_argument("--port", type=positive_int, default=8765)
+    parser.add_argument(
+        "--key",
+        metavar="KEY",
+        help="fixed API bearer token (overrides RELAY_GATEWAY_TOKEN; generated if omitted)",
+    )
     parser.add_argument("--concurrency", type=positive_int)
     parser.add_argument("--timeout", type=positive_float)
     parser.add_argument("--max-request-bytes", type=positive_int, default=8 * 1024 * 1024)
@@ -84,7 +89,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
             "relay serve: install the optional agent-relay[serve] extra", Exit.INVALID, False
         )
     try:
-        token, generated = gateway_token(generate=True)
+        token, generated = gateway_token(generate=True, key=args.key)
         config = load_config(project_root=None).config
         limits = GatewayLimits(
             concurrency=args.concurrency or config.defaults.concurrency,
