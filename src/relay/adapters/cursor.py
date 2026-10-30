@@ -23,14 +23,10 @@ Invocation shape:
   has no verified mapping (Cursor uses bracket overrides such as ``model[effort=high]`` on
   some models), so ``routing.effort`` is not passed **[verify]**.
 - Permission mapping (design 7.2 / 9.3): ``full`` -> ``--force`` (``--trust`` is passed for
-  ``full`` only, see ``_trust_args``); ``readonly`` -> ``--mode plan`` without ``--force``,
-  mapped but advertised only where :data:`relay.adapters.base.READONLY_VERIFIED_PLATFORMS`
-  lists Cursor (``build_invocation`` refuses an unadvertised level); ``workspace``
-  fails closed. On Windows the 2026.10.22 CLI reports its sandbox helper as "proxy-only, no
-  filesystem sandbox" and exits when ``--sandbox enabled`` is requested, so the candidate
-  cannot confine writes there; it is unverified elsewhere. The 2026-10-27 doctor canaries
-  (``tests/fixtures/recorded/cursor_doctor_canaries.json``) classified both restricted
-  profiles ``inconclusive``.
+  ``full`` only, see ``_trust_args``); ``readonly`` -> ``--mode plan`` without ``--force``;
+  ``workspace`` fails closed. On Windows the 2026.10.22 CLI reports its sandbox helper as
+  "proxy-only, no filesystem sandbox" and exits when ``--sandbox enabled`` is requested, so
+  the candidate cannot confine writes there; it is unverified elsewhere.
 - ``--resume <session_id>`` when ``ctx.resume_session`` is set (the ``session_id`` field and
   context retention were confirmed on 2026.10.19, design 7.3, and observed again by the
   session canary on 2026.10.22).
@@ -51,16 +47,14 @@ routable. It has no ``coordinate`` capability: it is not a phase-2c coordinator 
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
 from collections.abc import Mapping
-from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from relay.core.env import build_env
-from relay.core.platform.proc import CommandNotFound, ResolvedCommand, resolve_command, run_process
+from relay.core.platform.proc import CommandNotFound, resolve_command
 from relay.core.registry import Agent
 from relay.core.specs import ResultSpec, TaskSpec
 from relay.core.specs.common import PermissionLevel
@@ -68,11 +62,9 @@ from relay.core.specs.result import Session, Usage
 
 from .base import (
     Invocation,
-    Probe,
     ProcessResult,
     RunContext,
     WorkerHandle,
-    advertised_levels,
     task_prompt,
 )
 from .parsing import (
@@ -87,7 +79,6 @@ from .parsing import (
 )
 
 __all__ = [
-    "AuthMode",
     "CursorAdapter",
     "LEGACY_COMMAND",
     "PermissionUnsupported",
@@ -96,8 +87,6 @@ __all__ = [
     "result_instructions",
     "schema_instructions",
 ]
-
-AuthMode = Literal["api-key", "account-login"]
 
 # The only auth key this adapter forwards from the parent environment (design 9.4).
 AUTH_KEYS: tuple[str, ...] = ("CURSOR_API_KEY",)
@@ -112,9 +101,6 @@ _DEFAULT_MODEL = "default"
 # PowerShell 5.1): no quotes, `!`, `%`, `^`, whitespace or shell operators. Model ids such
 # as `claude-opus-4-8[context=1m,effort=high]` and UUID session ids fit.
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=,\[\]-]*")
-
-# Cursor versions look like `2026.10.22-27dcf5f`.
-_CURSOR_VERSION = re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}(?:-[0-9A-Za-z.-]+)?")
 
 _PERMISSION_FLAGS: dict[PermissionLevel, tuple[str, ...]] = {
     "full": ("--force",),
@@ -142,13 +128,6 @@ def resolve_cursor_command(cmd: str, env: Mapping[str, str]) -> str:
 
 class PermissionUnsupported(ValueError):
     """A requested permission level has no verified Cursor profile (design section 9.3)."""
-
-
-def _auth_mode(parent: Mapping[str, str], agent: Agent) -> AuthMode:
-    """``api-key`` when ``CURSOR_API_KEY`` is configured, else the stored account login."""
-    if parent.get("CURSOR_API_KEY") or agent.env.get("CURSOR_API_KEY"):
-        return "api-key"
-    return "account-login"
 
 
 def _auth_env(parent: Mapping[str, str]) -> dict[str, str]:
@@ -243,9 +222,8 @@ class CursorAdapter:
         self._agent = agent
         self._cmd = cmd or agent.cmd
         self._parent_env: Mapping[str, str] = dict(os.environ) if parent_env is None else parent_env
-        # Default: what the canaries verified on this platform (design 9.3); `full` only
-        # until Cursor appears in READONLY_VERIFIED_PLATFORMS.
-        self._levels = levels if levels is not None else advertised_levels(self.id)
+        # Default: `full` and `readonly` are both advertised; `workspace` still fails closed.
+        self._levels = levels if levels is not None else ("full", "readonly")
 
     # --- command resolution (design 7.2) ---------------------------------------------
 
@@ -266,38 +244,6 @@ class CursorAdapter:
         )
 
     # --- AgentAdapter -----------------------------------------------------------------
-
-    async def probe(self) -> Probe:
-        notes: tuple[str, ...] = (f"auth-mode={_auth_mode(self._parent_env, self._agent)}",)
-        env = build_env(agent_config=self._agent, parent_env=self._parent_env)
-        cmd = self.command(env)
-        if cmd != self._cmd:
-            notes = (*notes, f"using legacy alias {cmd}")
-        try:
-            resolved = resolve_command(cmd, ("--version",), env=env)
-        except CommandNotFound:
-            return Probe(available=False, levels=self._levels, notes=(*notes, "command not found"))
-        version = await asyncio.to_thread(self._run_version, resolved, env)
-        if version is None:
-            notes = (*notes, "--version produced no output")
-            return Probe(available=False, levels=self._levels, notes=notes)
-        if not _CURSOR_VERSION.search(version):
-            # `agent` is a generic name: another tool may own it.
-            notes = (
-                *notes,
-                f"--version output {version!r} does not look like a Cursor CLI version; "
-                f"`{cmd}` is probably not the Cursor CLI",
-            )
-            return Probe(available=False, version=version, levels=self._levels, notes=notes)
-        return Probe(available=True, version=version, levels=self._levels, notes=notes)
-
-    @staticmethod
-    def _run_version(resolved: ResolvedCommand, env: Mapping[str, str]) -> str | None:
-        result = run_process(resolved, cwd=Path.cwd(), env=env, timeout_s=30.0)
-        if result.exit_code != 0:
-            return None
-        text = (result.stdout or result.stderr).strip()
-        return text.splitlines()[0] if text else None
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
         args = ["-p", "--output-format", "json"]

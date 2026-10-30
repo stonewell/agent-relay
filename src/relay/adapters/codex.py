@@ -23,24 +23,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from collections.abc import Sequence
 from typing import Any, cast
 
 from relay.core.env import AgentEnv, build_env
-from relay.core.platform.proc import (
-    CommandNotFound,
-    ProcessResult,
-    resolve_command,
-    run_process,
-)
+from relay.core.platform.proc import ProcessResult
 from relay.core.progress import CodexEventParser, ProgressParser
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
 from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 from relay.core.store import read_text
 
-from .base import Invocation, Probe, RunContext, WorkerHandle, advertised_levels, task_prompt
+from .base import Invocation, RunContext, WorkerHandle, task_prompt
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -75,9 +69,8 @@ _DEFAULT_MODEL = "default"
 # Auth keys Codex needs, passed only when present in the parent environment (design 9.4).
 _CODEX_AUTH_KEYS: tuple[str, ...] = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
-# Permission flag mapping (design 7.2). `readonly` and `workspace` are mapped here so a
-# canary (task 1.20 / design 9.3) can advertise them once the enforcement profile passes;
-# until then `probe()` advertises `full` only and the router fails closed before dispatch.
+# Permission flag mapping (design 7.2). `full` and `readonly` are accepted; `workspace` is
+# mapped but rejected by `build_invocation`, so the router fails closed before dispatch.
 _PERMISSION_FLAGS: dict[PermissionLevel, tuple[str, ...]] = {
     "full": ("--dangerously-bypass-approvals-and-sandbox",),
     "readonly": ("-s", "read-only"),
@@ -99,26 +92,14 @@ class CodexAdapter:
     ) -> None:
         self.cmd = cmd
         self._agent = agent
-        # Default: what the canaries verified on this platform (task 2.30).
-        self._levels = levels if levels is not None else advertised_levels(self.id)
+        # Default: `full` and `readonly` are both advertised; `workspace` still fails closed.
+        self._levels = levels if levels is not None else ("full", "readonly")
 
     def progress_parser(self) -> ProgressParser | None:
         """`codex exec --json` is already a public JSONL stream; no invocation change needed."""
         return CodexEventParser()
 
     # --- AgentAdapter ---------------------------------------------------------------------
-
-    async def probe(self) -> Probe:
-        try:
-            resolved = resolve_command(self.cmd, ("--version",))
-        except CommandNotFound:
-            return Probe(available=False, notes=("codex executable not found",))
-        result = run_process(resolved, cwd=os.getcwd(), env=dict(os.environ))
-        if result.exit_code != 0:
-            return Probe(available=False, notes=(f"codex --version exited {result.exit_code}",))
-        return Probe(
-            available=True, version=self._parse_version(result.stdout), levels=self._levels
-        )
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
         if ctx.permission not in self._levels:
@@ -187,14 +168,6 @@ class CodexAdapter:
     def _auth_env(self) -> dict[str, str]:
         """Only the known Codex auth keys, and only when set in the parent environment."""
         return {name: os.environ[name] for name in _CODEX_AUTH_KEYS if name in os.environ}
-
-    @staticmethod
-    def _parse_version(stdout: str) -> str | None:
-        for line in stdout.splitlines():
-            match = re.search(r"\d+\.\d+\.\d+", line)
-            if match:
-                return match.group(0)
-        return stdout.strip() or None
 
     # --- parsing --------------------------------------------------------------------------
 

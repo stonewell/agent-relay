@@ -6,7 +6,6 @@ import contextlib
 import json
 import os
 import secrets
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,46 +27,17 @@ __all__ = [
     "AgentAdapter",
     "CommandNotFound",
     "Invocation",
-    "Probe",
     "ProcessResult",
     "RESULT_FILE",
-    "READONLY_VERIFIED_PLATFORMS",
     "RunContext",
     "ProgressCapable",
     "WorkerHandle",
-    "advertised_levels",
     "archive_previous_result",
     "resolveCommand",
     "run_invocation",
     "start_attempt",
     "task_prompt",
 ]
-
-
-# Platforms where the `readonly` enforcement canary (doctor `permission.<adapter>.readonly`,
-# design 9.3) returned `enforced`, per adapter. Promotion is a manual edit made only after a
-# canary run on that platform (task 2.30); every other platform advertises `full` only and
-# routing fails closed for read-access nodes. Evidence: spike 0.12, Windows 11, Claude Code
-# 2.1.310 (`--permission-mode plan`) and Codex 0.164.0 (`-s read-only`).
-READONLY_VERIFIED_PLATFORMS: dict[str, tuple[str, ...]] = {
-    "claude": ("win32",),
-    "codex": ("win32",),
-}
-
-
-def advertised_levels(adapter_id: str) -> tuple[PermissionLevel, ...]:
-    """The permission levels an adapter may advertise on this platform (design 9.3)."""
-    if sys.platform in READONLY_VERIFIED_PLATFORMS.get(adapter_id, ()):
-        return ("full", "readonly")
-    return ("full",)
-
-
-@dataclass(frozen=True)
-class Probe:
-    available: bool
-    version: str | None = None
-    levels: tuple[PermissionLevel, ...] = ("full",)
-    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,8 +131,6 @@ class WorkerHandle(Protocol):
 
 class AgentAdapter(Protocol):
     id: str
-
-    async def probe(self) -> Probe: ...
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation: ...
 

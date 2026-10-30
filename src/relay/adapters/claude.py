@@ -7,8 +7,7 @@ back into a result spec. Permission enforcement and environment handling follow 
   ``--permission-mode plan``; ``workspace`` has no verified profile yet (task 1.20), so it
   fails closed instead of running unconfined.
 - ``--bare`` is added only when Anthropic API-key auth is configured (``ANTHROPIC_API_KEY``
-  in the parent environment or the agent's ``env:``), never for subscription/OAuth logins,
-  and the detected mode is recorded by :meth:`probe`.
+  in the parent environment or the agent's ``env:``), never for subscription/OAuth logins.
 - The child environment is built with :func:`relay.core.env.build_env` (allowlist, section
   9.4) and passed as the *complete* environment (``Invocation.full_env``), so the parent
   environment never leaks wholesale.
@@ -21,19 +20,15 @@ native-payload extraction (``structured_output``) and enrichment (session id, mo
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import json
 import os
-import re
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from relay.core.coordinator import CoordinatorProfile, Qualification
 from relay.core.env import build_env
-from relay.core.platform.proc import CommandNotFound, ResolvedCommand, resolve_command, run_process
+from relay.core.platform.proc import CommandNotFound, resolve_command, run_process
 from relay.core.progress import ClaudeStreamParser, ProgressParser
 from relay.core.registry import Agent
 from relay.core.specs import ResultSpec, TaskSpec
@@ -42,11 +37,9 @@ from relay.core.specs.result import Session, Usage
 
 from .base import (
     Invocation,
-    Probe,
     ProcessResult,
     RunContext,
     WorkerHandle,
-    advertised_levels,
     task_prompt,
 )
 from .coordination import (
@@ -77,8 +70,7 @@ AUTH_KEYS: tuple[str, ...] = ("ANTHROPIC_API_KEY",)
 
 # Tool-free coordinator profile (design 7.4; spike 2.31, Claude Code 2.1.310): no model tools,
 # no MCP servers, no skills/commands and no user/project/local settings sources (so no
-# startup hooks or CLAUDE.md-driven customization), and no persisted session. This is a
-# candidate until a qualification record exists for the exact profile.
+# startup hooks or CLAUDE.md-driven customization), and no persisted session.
 COORDINATOR_FLAGS: tuple[str, ...] = (
     "--tools",
     "",
@@ -94,12 +86,6 @@ COORDINATOR_FLAGS: tuple[str, ...] = (
 
 class PermissionUnsupported(ValueError):
     """A requested permission level has no verified Claude profile (design section 9.3)."""
-
-
-def _bare_version(raw: str | None) -> str:
-    """The version number alone, so a record matches `2.1.312 (Claude Code)` and `2.1.312`."""
-    match = re.search(r"\d+(?:\.\d+)+", raw or "")
-    return match.group(0) if match else "unknown"
 
 
 def _auth_mode(parent: Mapping[str, str], agent: Agent) -> AuthMode:
@@ -207,30 +193,6 @@ class ClaudeAdapter:
             key.encode(), b"relay.execution-fingerprint.v1\0" + payload, "sha256"
         ).hexdigest()
 
-    async def probe(self) -> Probe:
-        parent = self._parent_env
-        auth = _auth_mode(parent, self._agent)
-        notes = (f"auth-mode={auth}",)
-        env = build_env(agent_config=self._agent, parent_env=parent)
-        try:
-            resolved = resolve_command(self._cmd, ("--version",), env=env)
-        except CommandNotFound:
-            return Probe(available=False, levels=("full",), notes=(*notes, "command not found"))
-        version = await asyncio.to_thread(self._run_version, resolved, env)
-        if version is None:
-            notes = (*notes, "--version produced no output")
-        # `readonly` only where its canary returned `enforced` (task 2.30); never `workspace`.
-        return Probe(
-            available=True, version=version, levels=advertised_levels(self.id), notes=notes
-        )
-
-    def _run_version(self, resolved: ResolvedCommand, env: Mapping[str, str]) -> str | None:
-        result = run_process(resolved, cwd=Path.cwd(), env=env)
-        if result.exit_code != 0:
-            return None
-        text = (result.stdout or result.stderr).strip()
-        return text.splitlines()[0] if text else None
-
     def progress_parser(self) -> ProgressParser | None:
         return ClaudeStreamParser() if self._stream_progress else None
 
@@ -247,44 +209,18 @@ class ClaudeAdapter:
             args += ["--effort", effort]
         return args
 
-    def coordinator_profile(self, cli_version: str | None) -> CoordinatorProfile:
-        """The exact profile qualification is specific to (section 7.4).
-
-        The digest covers the restriction flags, the command and the names of configured
-        environment overrides. It cannot see managed policy or helpers the CLI loads on its
-        own, which is why qualification stays an opt-in, reviewed record.
-        """
-        canonical = json.dumps(
-            {
-                "flags": list(COORDINATOR_FLAGS),
-                "cmd": self._cmd,
-                "env_keys": sorted(self._agent.env),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return CoordinatorProfile(
-            agent=self.id,
-            cli_version=_bare_version(cli_version),
-            os=sys.platform,
-            auth_mode=_auth_mode(self._parent_env, self._agent),
-            config_digest=hashlib.sha256(canonical.encode()).hexdigest(),
-        )
-
     async def coordinate(
         self,
         prompt: str,
         *,
         cwd: Path,
-        qualification: Qualification,
         model: str | None = None,
         effort: str | None = None,
         timeout_s: float | None = None,
     ) -> CoordinatorCall:
-        """One bounded call returning a validated response; fails closed when unqualified.
+        """One bounded call returning a validated response.
 
-        Raises :class:`CoordinatorUnavailable` unless `qualification` is a qualified record for
-        exactly this CLI version, OS, auth mode and configuration, and
+        Raises :class:`CoordinatorUnavailable` when the command cannot be resolved and
         :class:`~relay.adapters.coordination.CoordinatorInvalid` for a malformed response
         (the controller decides on its single schema repair).
         """
@@ -294,19 +230,11 @@ class ClaudeAdapter:
             parent_env=self._parent_env,
         )
         try:
-            resolved = resolve_command(self._cmd, ("--version",), env=env)
+            call = resolve_command(
+                self._cmd, self.coordinator_args(model=model, effort=effort), env=env
+            )
         except CommandNotFound as exc:
             raise CoordinatorUnavailable(f"`{self._cmd}` not found on PATH") from exc
-        version = await asyncio.to_thread(self._run_version, resolved, env)
-        profile = self.coordinator_profile(version)
-        if qualification.status != "qualified" or qualification.profile != profile:
-            raise CoordinatorUnavailable(
-                f"no qualified coordinator profile for claude {profile.cli_version} on "
-                f"{profile.os} ({profile.auth_mode}); coordination is unavailable"
-            )
-        call = resolve_command(
-            self._cmd, self.coordinator_args(model=model, effort=effort), env=env
-        )
         proc = await asyncio.to_thread(
             run_process, call, cwd=cwd, env=env, stdin=prompt, timeout_s=timeout_s
         )
@@ -320,8 +248,8 @@ class ClaudeAdapter:
             response=response,
             agent=self.id,
             model=_model(payload) if payload is not None else None,
-            cli_version=version,
-            profile_digest=profile.config_digest,
+            cli_version=None,
+            profile_digest=None,
             schema_version=response.spec_version,
             duration_s=proc.duration_s,
             tokens_in=usage.tokens_in if usage else None,

@@ -28,7 +28,7 @@ __all__ = [
 
 
 class CoordinatorUnavailable(RuntimeError):
-    """No qualification record matches this CLI profile; coordination fails closed (7.4)."""
+    """The coordinator CLI could not be invoked; coordination fails closed (7.4)."""
 
 
 class CoordinatorInvalid(ValueError):
@@ -47,7 +47,7 @@ class CoordinatorCall:
     agent: str
     model: str | None
     cli_version: str | None
-    profile_digest: str
+    profile_digest: str | None
     schema_version: int
     duration_s: float
     tokens_in: int | None = None

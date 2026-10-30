@@ -19,35 +19,6 @@ class CompletionProfile:
     config_digest: str
 
 
-@dataclass(frozen=True)
-class CompletionQualification:
-    profile: CompletionProfile
-    evidence: str
-    supports_tools: bool = False
-
-
-# Reviewed completion records only. Coordinator records are deliberately not imported.
-QUALIFICATIONS: tuple[CompletionQualification, ...] = (
-    CompletionQualification(
-        profile=CompletionProfile(
-            agent="claude",
-            cli_version="2.1.312",
-            platform="win32",
-            auth_mode="subscription",
-            config_digest="49d8e0ee09a8f4f1318b17eedebc6c8d2c85885f082989334416aa3d393ab2d9",
-        ),
-        evidence=(
-            "docs/gateway-qualification.md: 2026-10-29 reviewed plain-text promotion after "
-            "revision-2 live canaries (2 passed, 25.22 s; identity stable before/after and "
-            "across both modes; read/write/shell/network/hook/MCP/instruction traps not "
-            "triggered). Managed-policy and keychain/backend state remain operator-reviewed "
-            "assumptions. Empty-call envelope evidence does not qualify client tool calls."
-        ),
-        supports_tools=False,
-    ),
-)
-
-
 DEFAULT_MODEL_ALIASES: tuple[str, ...] = ("default", "sonnet", "opus", "fable")
 """CLI model aliases the gateway offers unless the operator passes ``--model``.
 
@@ -183,7 +154,7 @@ class CompletionTerminationError(CompletionError):
 class CompletionCapable(Protocol):
     id: str
 
-    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport | None: ...
+    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport: ...
 
     def complete(
         self,

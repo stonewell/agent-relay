@@ -9,9 +9,8 @@ from typing import Any, cast
 
 from relay.core.progress import ProgressParser, Update
 from relay.core.specs import ResultSpec, TaskSpec
-from relay.core.specs.common import PermissionLevel
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle, task_prompt
+from .base import Invocation, ProcessResult, RunContext, WorkerHandle, task_prompt
 from .fake_scenario import Scenario
 from .parsing import (
     ABSENT,
@@ -45,8 +44,6 @@ class FakeAdapter:
         self,
         scenarios: ScenarioSource | None = None,
         *,
-        available: bool = True,
-        levels: tuple[PermissionLevel, ...] = ("full", "workspace", "readonly"),
         version: str = "fake-1.0",
         progress: bool = False,
     ) -> None:
@@ -60,8 +57,6 @@ class FakeAdapter:
                 self.script(node_id, *_as_list(scripted))
         elif scenarios is not None:
             self.script("*", *_as_list(scenarios))
-        self._available = available
-        self._levels = levels
         self._version = version
         self.invocations: list[Invocation] = []
         self.cancelled: list[WorkerHandle] = []
@@ -89,11 +84,6 @@ class FakeAdapter:
 
     def reuse_fingerprint(self, task: TaskSpec) -> str:
         return self._version
-
-    async def probe(self) -> Probe:
-        if not self._available:
-            return Probe(available=False, notes=("fake adapter marked unavailable",))
-        return Probe(available=True, version=self._version, levels=self._levels)
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
         scenario = self.scenario_for(task, ctx)

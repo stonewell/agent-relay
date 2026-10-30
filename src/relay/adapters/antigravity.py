@@ -17,9 +17,9 @@ Invocation shape:
 - ``--model <slug>`` when the routed model is not the ``default`` sentinel; ``--effort
   low|medium|high`` when set.
 - Permission mapping (design 7.2 / 9.3): ``full`` -> ``--dangerously-skip-permissions``;
-  ``readonly`` -> ``--mode plan`` (mapped but **unadvertised** until a canary proves it
-  prevents repository mutation **[verify]**); ``workspace`` fails closed (``--sandbox``
-  containment is unverified **[verify]**).
+  ``readonly`` -> ``--mode plan`` (whether it prevents repository mutation is unverified
+  **[verify]**); ``workspace`` fails closed (``--sandbox`` containment is unverified
+  **[verify]**).
 - ``--conversation <conversation_id>`` when ``ctx.resume_session`` is set; context retention
   across resume is unverified **[verify]** (design 7.3).
 - ``--print-timeout`` is deliberately not passed: ``RunContext`` does not expose the node
@@ -35,21 +35,18 @@ never logged.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from collections.abc import Mapping
-from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from relay.core.env import build_env
-from relay.core.platform.proc import CommandNotFound, ResolvedCommand, resolve_command, run_process
 from relay.core.registry import Agent
 from relay.core.specs import ResultSpec, TaskSpec, schema_for
 from relay.core.specs.common import PermissionLevel
 from relay.core.specs.result import Session, Usage
 
-from .base import Invocation, Probe, ProcessResult, RunContext, WorkerHandle, task_prompt
+from .base import Invocation, ProcessResult, RunContext, WorkerHandle, task_prompt
 from .parsing import (
     ABSENT,
     ResultInvalid,
@@ -60,9 +57,13 @@ from .parsing import (
     validate_result,
 )
 
-__all__ = ["AntigravityAdapter", "AuthMode", "PermissionUnsupported", "ResultInvalid"]
-
-AuthMode = Literal["api-key", "keyring"]
+__all__ = [
+    "AntigravityAdapter",
+    "PermissionUnsupported",
+    "ResultInvalid",
+    "agy_envelope",
+    "envelope_error",
+]
 
 # The only auth key this adapter forwards from the parent environment (design section 9.4:
 # "variables each CLI needs for auth"). It is never logged (section 9.4).
@@ -85,17 +86,6 @@ _TERMINAL_STATUSES = frozenset({"ERROR", "INVALID"})
 
 class PermissionUnsupported(ValueError):
     """A requested permission level has no verified Antigravity profile (design section 9.3)."""
-
-
-def _auth_mode(parent: Mapping[str, str], agent: Agent) -> AuthMode:
-    """Detect the Antigravity auth mode: ``api-key`` when ``GEMINI_API_KEY`` is configured.
-
-    Otherwise the CLI is expected to use its interactive system-keyring sign-in (design
-    section 7.2). The key may come from the parent environment or the agent's ``env:``.
-    """
-    if parent.get("GEMINI_API_KEY") or agent.env.get("GEMINI_API_KEY"):
-        return "api-key"
-    return "keyring"
 
 
 def _auth_env(parent: Mapping[str, str]) -> dict[str, str]:
@@ -164,6 +154,10 @@ def _error_text(payload: dict[str, Any]) -> str | None:
     return None
 
 
+agy_envelope = _agy_payload
+envelope_error = _error_text
+
+
 class AntigravityAdapter:
     """The `agy` adapter. Translates, never decides routing or permissions (design 7.1)."""
 
@@ -181,29 +175,6 @@ class AntigravityAdapter:
         self._parent_env: Mapping[str, str] = dict(os.environ) if parent_env is None else parent_env
 
     # --- AgentAdapter -----------------------------------------------------------------
-
-    async def probe(self) -> Probe:
-        parent = self._parent_env
-        auth = _auth_mode(parent, self._agent)
-        notes = (f"auth-mode={auth}",)
-        env = build_env(agent_config=self._agent, parent_env=parent)
-        try:
-            resolved = resolve_command(self._cmd, ("--version",), env=env)
-        except CommandNotFound:
-            return Probe(available=False, levels=("full",), notes=(*notes, "command not found"))
-        version = await asyncio.to_thread(self._run_version, resolved, env)
-        if version is None:
-            notes = (*notes, "--version produced no output")
-        # Only `full` is verified in this phase; `readonly`/`workspace` await a canary
-        # (task 1.20): `--mode plan` and `--sandbox` confinement are unverified **[verify]**.
-        return Probe(available=True, version=version, levels=("full",), notes=notes)
-
-    def _run_version(self, resolved: ResolvedCommand, env: Mapping[str, str]) -> str | None:
-        result = run_process(resolved, cwd=Path.cwd(), env=env)
-        if result.exit_code != 0:
-            return None
-        text = (result.stdout or result.stderr).strip()
-        return text.splitlines()[0] if text else None
 
     def build_invocation(self, task: TaskSpec, ctx: RunContext) -> Invocation:
         parent = self._parent_env
