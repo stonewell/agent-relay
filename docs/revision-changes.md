@@ -643,3 +643,12 @@ This revision records local validation already performed; it does not claim a ne
 | CU3 / P3 | `agent` is a generic command name, but `probe()` only noted an unrecognised `--version` output and still reported the agent available. | A non-Cursor version makes the probe unavailable, with the output in its note. |
 | CU4 / P3 | `--trust` was passed for every level, so a `readonly` run would trust (and so run project code from) an untrusted repository. | `--trust` is passed at `full` only; `readonly` fails closed at the trust gate. |
 | CU5 / P3 | `build_invocation` built a `--mode plan` invocation for `readonly` even though `readonly` is mapped but not advertised. | Unadvertised levels raise `PermissionUnsupported`. |
+
+## Removal of agent-CLI verification (2026-10-29)
+
+| What changed | Where |
+|---|---|
+| All agent-CLI verification is removed: qualification records and profiles, configuration digests, pinned CLI version/platform/auth mode, `inspect()` gating, `probe()` and `--version` checks, permission/adapter/coordinator canaries, `advertised_levels`/`READONLY_VERIFIED_PLATFORMS`, and the doctor's agent CLI checks. An agent is usable when it is `enabled` and has a gateway adapter; relay never interrogates the CLI and invokes it only when work runs. `relay doctor` now runs only `python`, `git`, `config`, `git.exclude` and `session.locks`. Rationale: relay must run whatever CLI the operator registers and leave CLI-level problems to the operator; the gates made correctly configured agents appear to have no models and required re-review whenever a CLI changed. | Design 7.2, 9.3, 14; plan 2.32, 4.11 |
+| `GET /v1/models` lists every configured model alias with `null` limits until observed, plus `relay/auto` when defaults exist. `agy` models are enumerated from `agy models` (TSV `<slug>\t<name>`, cached per process, falling back to `agents.agy.models` then `("default",)`). `relay agents` and `opencode-config` likewise report configuration without invoking a binary. | Design 13.2; plan 5.0–5.2 |
+| A missing, broken or misconfigured CLI fails at invocation with the command, exit code and a redacted stderr tail, on stderr and in the OpenAI-shaped HTTP error body. Kept: `--key` bearer auth on `/v1/*`, Host/Origin checks, process launching and environment allowlists. | Design 13.2, 14 |
+| Tests: verification-only tests and fixtures are deleted, and expectations updated for configuration-based availability and listing, `agy models` enumeration, and detailed launch errors. | `tests/` |

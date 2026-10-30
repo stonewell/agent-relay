@@ -20,8 +20,8 @@ uv run relay doctor --json
 The command reference and request-intake limits are in
 [design section 14](docs/design.md#14-relay-cli). Read those limits before attempting a write
 run. Agent authentication, permission support and verification policy are defined in design
-sections 7, 9 and 10. `doctor` runs model-calling checks only when explicitly selected as described
-in the command reference.
+sections 7, 9 and 10. `doctor` checks the local environment and configuration only; it never runs
+an agent CLI.
 
 Completed tasks, validation evidence and remaining release work are recorded only in the
 [task status](docs/development-plan.md#task-status) section. For sequencing, use the plan's
@@ -31,10 +31,12 @@ provide different evidence from live runs; see the [fixture guide](tests/fixture
 ## Run a task and apply it
 
 Start from this checkout after `uv sync`. Install and authenticate the Claude CLI separately;
-the run below invokes that CLI and can incur model usage. Check that Relay can find it:
+the run below invokes that CLI and can incur model usage. Relay does not check the CLI up front:
+it runs the configured command when work starts and reports a failure with the command, its exit
+code and a redacted stderr tail. Confirm the configured agent with:
 
 ```sh
-uv run relay doctor --check adapter.claude.version --json
+uv run relay agents
 ```
 
 Create a sibling demo repository so the walkthrough does not change Relay's source files:
@@ -261,8 +263,8 @@ Ctrl+C does not quit or stop anything (in a Windows console it reaches the inter
 in the composer it copies the selection). Interrupts while the interface drains on exit do not cut the drain
 short. A stopped round stays interrupted until you continue it explicitly.
 
-Planning needs a coordinator with a reviewed qualification record for your exact CLI version,
-OS and authentication mode (F9 lists them and explains unavailable ones); without one, saved
+Planning uses an enabled agent that offers a coordinator: one you request, otherwise `claude`,
+otherwise the first agent in sorted order, with no qualification record. Without one, saved
 sessions stay inspectable and the headless commands above work as before. The interface is
 accepted on Windows; Linux and macOS acceptance is still pending. The interaction rules are in
 [section 14.1](docs/design.md#141-conversational-terminal-interface-phase-2c).
@@ -280,7 +282,7 @@ accepted on Windows; Linux and macOS acceptance is still pending. The interactio
 
 | Symptom | Next step |
 |---|---|
-| Agent command unavailable | Run `relay doctor --check adapter.claude.version --json` and check the agent's `cmd` setting. |
+| Agent command unavailable | Check the agent's `cmd` in `agents.yaml` (and `relay agents --json`); the failure names the command, exit code and a redacted stderr tail. |
 | No eligible agent (exit 3) | Check `relay agents --json`, the requested category and the permission profiles in section 9. |
 | Missing executable verification (exit 2) | Supply your authorized test command with `--check`; see section 10. |
 | Verification failed (exit 5) | Inspect the run and result, fix the failing check or implementation, and start a new run. |
@@ -306,18 +308,22 @@ and user configuration once, without the current project's `.agents/agents.yaml`
 `--concurrency`, `--timeout`, `--max-request-bytes` and `--max-output-bytes` control admission
 and request resource limits. Stop the foreground process with Ctrl+C.
 
-The gateway offers each qualified agent's CLI model aliases as `<agent>/<alias>` (for example
-`claude/opus`), plus `<agent>` for the first alias and `relay/auto`. The default aliases are
-`default` (the CLI's own default model), `sonnet`, `opus` and `fable`; repeat `--model ALIAS`
-to choose others. The Claude CLI has no model-listing command, so model ids and limits are
-discovered from the CLI itself: on the first `/v1/models` request (never at startup) each alias
-is probed once with a minimal prompt, and the model the CLI reports running, with its context
-window and output limit, is cached in `~/.config/relay/gateway-models.json` for that CLI
-version and configuration. **Each probe is a short billed model call.** An alias whose probe
-fails is not listed; it can still be requested by id.
+The gateway offers every enabled agent with a gateway adapter (`claude`, `agy`) its CLI model
+aliases as `<agent>/<alias>` (for example `claude/opus`), plus `<agent>` for the first alias and
+`relay/auto` whenever defaults exist. The Claude aliases default to `default` (the CLI's own
+default model), `sonnet`, `opus` and `fable`; repeat `--model ALIAS` to choose others. `agy`
+aliases are enumerated at runtime from `agy models` (TSV slug and display name), falling back to
+the `agents.agy.models` values and then to `default`; a non-`default` alias is passed as
+`--model <slug>`, and `default` passes no `--model`. `GET /v1/models` lists every configured alias
+with `null` context and output limits until they are observed. On the first `/v1/models` request
+(never at startup) each uncached alias is probed once with a minimal prompt, and the model the CLI
+reports running, with its context window and output limit, is cached in
+`~/.config/relay/gateway-models.json`. **Each probe is a short billed model call.** Probe failures
+are non-fatal: they are reported on stderr and leave that alias listed without limits.
 
-Set `RELAY_GATEWAY_TOKEN` before startup to choose the bearer token. Otherwise the server
-generates a token and prints it once on stderr. Supply that same token to client processes
+Pass `--key KEY` or set `RELAY_GATEWAY_TOKEN` before startup to choose the bearer token
+(`--key` overrides the environment variable). Otherwise the server generates a token and
+prints it once on stderr. Supply that same token to client processes
 through their environment; the gateway never writes it into project files. For example,
 in a second PowerShell terminal:
 
@@ -329,22 +335,24 @@ uv run relay opencode-config --base-url http://127.0.0.1:8765/v1 --refresh
 On POSIX shells, use `export RELAY_GATEWAY_TOKEN='<token>'` before starting OpenCode.
 `opencode-config` builds the same catalog as `serve` locally (it does not contact the server
 or need the token) and prints a `provider.relay` JSON snippet with an environment reference for
-the token. Without `--refresh` it reads only cached discoveries and makes no model call; models
-not yet discovered are left out and named on stderr with a hint to rerun with `--refresh`, which
-probes every alias (billed) and updates the shared cache. Pass the same `--model` options given
-to `serve`; `--timeout` bounds each probe (default 120 s). Review and merge the snippet into
-your OpenCode configuration yourself. It includes only models with CLI-reported context/output
-limits and enables tool calling only when advertised by the qualified profile.
+the token. Without `--refresh` it reads only cached discoveries and makes no model call; every
+configured model is still listed, any not yet discovered without limits and named on stderr with
+a hint to rerun with `--refresh`, which probes every alias (billed) and updates the shared cache.
+Pass the same `--model` options given to `serve`; `--timeout` bounds each probe (default 120 s).
+Review and merge the snippet into your OpenCode configuration yourself. Limits appear only where
+the CLI reported them, and `tool_call` follows the adapter's completion support.
 The configuration fields follow the [OpenCode provider documentation](https://opencode.ai/docs/providers/)
 and its [environment substitution syntax](https://opencode.ai/docs/config/#env-vars).
 
-This build includes one reviewed plain-text profile for Claude Code 2.1.312 on Windows with
-subscription authentication and an exact configuration fingerprint. Text models appear only
-when that profile matches; other installations/configurations remain unavailable. Client tool
-calling is not qualified, so generated OpenCode models have `tool_call: false`; their limits are
-those the CLI reported during discovery. See the [gateway qualification guide](docs/gateway-qualification.md)
-for the observed evidence and qualification procedure. Pinned OpenCode acceptance remains a
-release gate; installing the CLI alone does not establish compatibility.
+An agent is served by the gateway when it is `enabled` and has a gateway adapter (`claude`,
+`agy`). There is no reviewed qualification profile or CLI fingerprint, and Relay does not check
+the CLI version, platform or authentication mode up front. The CLI's own failure is reported in
+detail when a request runs: the error names the command, the exit code and a redacted stderr
+tail, both on stderr and in the OpenAI-style HTTP error body. Client tools and requested output
+tokens are passed through rather than refused. See the
+[gateway guide](docs/gateway-qualification.md) for the current behavior and the historical
+qualification note. Pinned OpenCode acceptance remains a release gate; installing a CLI alone
+does not establish compatibility.
 
 ## Layout
 
