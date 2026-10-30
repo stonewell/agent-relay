@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.37 |
-| `development-plan.md` | v0.19 |
+| `design.md` | v0.38 |
+| `development-plan.md` | v0.20 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.38 / plan v0.20: separate Codex and opt-in Cursor completion backends and registry support. Codex automatic aliases use visible slugs from `codex debug models` JSON; Cursor aliases use account-listed IDs from `agent models`. These bounded inventory calls are cached per process and do not bill model usage; failures warn and fall back to configured IDs then `default`. Explicit model selection bypasses automatic inventory. The public model catalog contains named IDs only; bare-agent defaults and `relay/auto` remain internal routing aliases. The integrated gateway suite passes 406 tests (one skipped); Ruff lint, formatting of 11 files, focused Pyright and diff check pass. An unfiltered real `relay serve` run with `--timeout 900` and `curl GET /v1/models` returned HTTP 200 with 24 named entries: Claude 3, Codex 8 and Cursor 13, with no bare-agent, `relay/auto` or exact `auto`/`default` ids. All named-model probes succeeded; two internal Cursor `auto`/`default` probes warned on account policy and processing continued. No Codex or Cursor context/output limits were reported, so they remain null. The service shut down normally and configuration was restored to absent. Real HTTP completion requests for `codex/default` and the account-allowed `cursor/gemini-3.8-flash-low` each returned HTTP 200 with one validated `relay_probe` client tool proposal; Codex native schema arguments and Cursor prompt/schema response were verified. Cursor `auto` discovery was denied by account policy; unreported model limits remain null. The CLI-mediated read-only/deny controls are not OS isolation, and client tool proposals are not executed by Relay. Pinned OpenCode acceptance remains outstanding.
 
 v0.37 / plan v0.19: prioritize gateway correctness before pinned-client release acceptance, then optional fidelity improvements. Tasks 5.7 and 5.9 are P0 execution work, 5.8 is P1, and 5.5 explicitly gates M7 after those fixes. Instruction fidelity (5.10) becomes P2 to match its optional scope; Agy grouping, transport, metadata, structured output and streaming remain later work. Historical finding severities and task statuses are unchanged.
 

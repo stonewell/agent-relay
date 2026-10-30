@@ -308,13 +308,36 @@ and user configuration once, without the current project's `.agents/agents.yaml`
 `--concurrency`, `--timeout`, `--max-request-bytes` and `--max-output-bytes` control admission
 and request resource limits. Stop the foreground process with Ctrl+C.
 
-The gateway offers every enabled agent with a gateway adapter (`claude`, `agy`) its CLI model
-aliases as `<agent>/<alias>` (for example `claude/opus`), plus `<agent>` for the first alias and
-`relay/auto` whenever defaults exist. The Claude aliases default to `default` (the CLI's own
-default model), `sonnet`, `opus` and `fable`; repeat `--model ALIAS` to choose others. `agy`
-aliases are enumerated at runtime from `agy models` (TSV slug and display name), falling back to
-the `agents.agy.models` values and then to `default`; a non-`default` alias is passed as
-`--model <slug>`, and `default` passes no `--model`. `GET /v1/models` lists every configured alias
+`GET /v1/models` lists named backend-specific model aliases as `<agent>/<alias>` (for example
+`claude/opus`) for each enabled agent with a completion adapter (`claude`, `agy`, `codex`, and
+`cursor`). Bare-agent defaults and `relay/auto` remain available for internal routing, but are
+not published in the model list. Cursor remains disabled by default. To enable it and list an
+account-allowed model, add this to
+`~/.config/relay/agents.yaml` in your Relay user configuration. Replace the example model with
+one allowed by your Cursor account:
+
+```yaml
+agents:
+  cursor:
+    enabled: true
+    models:
+      preferred: gemini-3.8-flash-low
+```
+
+Gateway configuration is loaded from built-in and user configuration, not the project's
+`.agents/agents.yaml`. Claude's named aliases include `sonnet`, `opus` and `fable`; its `default`
+alias remains available for internal routing but is not published in the model list.
+Codex aliases come from visible slugs in `codex debug models` JSON, and Cursor aliases come from
+account-listed IDs in `agent models`. These bounded, read-only inventory queries are cached per
+process and make no model calls. A failed query warns and falls back to configured model IDs, then
+`default`; it does not disable the backend. An explicit `--model` selection bypasses automatic
+inventory. Cursor's `auto` probe may be denied by
+your organization's model policy; configure an allowed model and select its `cursor/<model-id>`
+entry. Discovery errors leave the alias listed without limits. Repeat `--model ALIAS` to choose
+the aliases for the enabled backends. `agy` aliases are enumerated at runtime from `agy models` (TSV
+slug and display name), falling back to the `agents.agy.models` values and then to `default`; a
+non-`default` alias is passed as `--model <slug>`, and `default` passes no `--model`.
+`GET /v1/models` lists named aliases
 with `null` context and output limits until they are observed. On the first `/v1/models` request
 (never at startup) each uncached alias is probed once with a minimal prompt, and the model the CLI
 reports running, with its context window and output limit, is cached in
@@ -341,8 +364,10 @@ a hint to rerun with `--refresh`, which probes every alias (billed) and updates 
 Pass the same `--model` options given to `serve`; `--timeout` bounds each probe (default 120 s).
 Review and merge the snippet into your OpenCode configuration yourself. Limits appear only where
 the CLI reported them, and `tool_call` follows the adapter's completion support.
-Generated models offer `low`, `medium` and `high` reasoning variants. The same effort can be
-selected directly by an OpenAI-compatible client without changing the model ID; for example:
+Generated models whose backends support reasoning effort offer `low`, `medium` and `high`
+variants; Cursor entries omit these variants, and a non-null `reasoning_effort` for Cursor returns
+HTTP 400 as unsupported. The same supported effort can be selected directly by an
+OpenAI-compatible client without changing the model ID; for example:
 
 ```json
 {"model":"claude/opus","reasoning_effort":"high","messages":[{"role":"user","content":"Review this code"}]}
@@ -356,11 +381,18 @@ The configuration fields follow the [OpenCode provider documentation](https://op
 and its [environment substitution syntax](https://opencode.ai/docs/config/#env-vars).
 
 An agent is served by the gateway when it is `enabled` and has a gateway adapter (`claude`,
-`agy`). There is no reviewed qualification profile or CLI fingerprint, and Relay does not check
+`agy`, `codex`, `cursor`). Cursor remains opt-in. Codex and Cursor use fixed CLI-mediated
+read-only/tool-denial controls, private scratch and denial hooks; these controls are not OS
+filesystem isolation. A denied or reported CLI tool action fails the completion; Relay returns
+validated client tool proposals but does not execute them. Reasoning effort, output-token limits
+and reported metadata are backend-specific: unsupported effort returns an error, token limits
+are not claimed unless natively enforced, and unknown model limits stay unknown. There is no
+reviewed qualification profile or CLI fingerprint, and Relay does not check
 the CLI version, platform or authentication mode up front. The CLI's own failure is reported in
 detail when a request runs: the error names the command, the exit code and a redacted stderr
-tail, both on stderr and in the OpenAI-style HTTP error body. Client tools and requested output
-tokens are passed through rather than refused. See the
+tail, both on stderr and in the OpenAI-style HTTP error body. Client tool calls are validated and
+returned to the client; the CLIs do not execute those calls. Output-token enforcement and
+reasoning-effort support vary by backend, and unavailable model limits remain unknown. See the
 [gateway guide](docs/gateway-qualification.md) for the current behavior and the historical
 qualification note. Pinned OpenCode acceptance remains a release gate; installing a CLI alone
 does not establish compatibility.
