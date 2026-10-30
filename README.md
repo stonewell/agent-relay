@@ -23,8 +23,8 @@ run. Agent authentication, permission support and verification policy are define
 sections 7, 9 and 10. `doctor` checks the local environment and configuration only; it never runs
 an agent CLI.
 
-Completed tasks, validation evidence and remaining release work are recorded only in the
-[task status](docs/development-plan.md#task-status) section. For sequencing, use the plan's
+Completed task definitions and validation evidence are in the [completed-tasks archive](docs/completed-tasks.md); current status and remaining release work are in the
+[development plan task status](docs/development-plan.md#task-status). For sequencing, use the plan's
 [remaining-work order](docs/development-plan.md#remaining-work-in-order). Offline tests and recorded outputs
 provide different evidence from live runs; see the [fixture guide](tests/fixtures/recorded/README.md).
 
@@ -150,7 +150,7 @@ uv run relay -C ../your-project resume RUN --max-attempts 3 --json
 For questions or interruption, use `reply` and `resume`; cancel a live graph with
 `relay cancel RUN --yes`. See [graph intake](docs/design.md#14-relay-cli) for the full contract
 and [section 6](docs/design.md#6-context-exchange-and-run-store) for the reuse rule, plus the
-[task status](docs/development-plan.md#task-status) for validation and release gates.
+[development plan task status](docs/development-plan.md#task-status) for active validation and release gates; completed evidence is in the [archive](docs/completed-tasks.md).
 
 ## Answer a blocked task
 
@@ -341,6 +341,17 @@ a hint to rerun with `--refresh`, which probes every alias (billed) and updates 
 Pass the same `--model` options given to `serve`; `--timeout` bounds each probe (default 120 s).
 Review and merge the snippet into your OpenCode configuration yourself. Limits appear only where
 the CLI reported them, and `tool_call` follows the adapter's completion support.
+Generated models offer `low`, `medium` and `high` reasoning variants. The same effort can be
+selected directly by an OpenAI-compatible client without changing the model ID; for example:
+
+```json
+{"model":"claude/opus","reasoning_effort":"high","messages":[{"role":"user","content":"Review this code"}]}
+```
+
+OpenCode exposes the generated variants through its model variant selector. Agy aliases remain
+the CLI-reported slugs; grouping aliases by effort suffix is deferred until the underlying model
+metadata and invocation behavior are verified (task 5.6).
+
 The configuration fields follow the [OpenCode provider documentation](https://opencode.ai/docs/providers/)
 and its [environment substitution syntax](https://opencode.ai/docs/config/#env-vars).
 
@@ -363,6 +374,7 @@ does not establish compatibility.
 | `schemas/` | Generated JSON schemas |
 | `docs/design.md` | Current specification |
 | `docs/development-plan.md` | Tasks, milestones and task status |
+| `docs/completed-tasks.md` | Archived task definitions and completion evidence |
 | `docs/revision-changes.md` | Document revisions and review resolutions |
 | `plugin/` | OpenCode integration directory; see its README |
 

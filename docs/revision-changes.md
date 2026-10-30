@@ -1,6 +1,6 @@
 # Revision changes
 
-The history of changes to the project documents: version summaries, review findings and resolutions, and restructures. It is the only place that records *what changed and why*; the documents themselves state only the current design (`design.md`) and the current tasks (`development-plan.md`). Which file holds what is defined in the documentation rules of the root `AGENTS.md`.
+The history of changes to the project documents: version summaries, review findings and resolutions, and restructures. The design states current rules (`design.md`), the development plan holds active tasks (`development-plan.md`), and completed task definitions and validation evidence live in `completed-tasks.md`. Repository task-routing instructions are in the root `AGENTS.md`.
 
 Section references (`section N`) in older entries point into `design.md` as it was at that revision, and may have moved since. The per-version regression scenarios are consolidated into the test plan in design.md section 16; the original per-version wording is kept here for traceability.
 
@@ -8,11 +8,13 @@ Section references (`section N`) in older entries point into `design.md` as it w
 
 | Document | Version |
 |---|---|
-| `design.md` | v0.35 |
-| `development-plan.md` | v0.17 |
+| `design.md` | v0.36 |
+| `development-plan.md` | v0.18 |
 | `AGENTS.md` | v4 |
 
 ## Version summaries
+
+v0.36 / plan v0.18: review of changes since 2026-10-29 reconciles configuration-derived availability, bounded streamed process capture, coordinator proposal provenance, lazy billed discovery, server logging and request-level reasoning effort with the implementation. Completed tasks and evidence are archived separately. Two confirmed gateway defects remain open: executable regex in supposedly bounded schema validation (5.7) and fabricated Agy model limits (5.8). No runtime fixes are claimed by this documentation revision.
 
 v0.35 / plan v0.17: independent-review follow-ups to 2.29 (TU19–TU22): headless `apply` refuses while the run's owner is alive or uncheckable and runners publish `done` only after `run.finished`; purges never delete a run branch a kept worktree has checked out; coordinator cancellation is bounded and its bookkeeping cannot replace the cancellation. Cursor follow-ups to 4.2/4.11 (CU2–CU5): shared command resolution, a version check in `probe()`, `--trust` at `full` only, and refusal of unadvertised levels. Details are recorded below.
 
@@ -652,3 +654,24 @@ This revision records local validation already performed; it does not claim a ne
 | `GET /v1/models` lists every configured model alias with `null` limits until observed, plus `relay/auto` when defaults exist. `agy` models are enumerated from `agy models` (TSV `<slug>\t<name>`, cached per process, falling back to `agents.agy.models` then `("default",)`). `relay agents` and `opencode-config` likewise report configuration without invoking a binary. | Design 13.2; plan 5.0–5.2 |
 | A missing, broken or misconfigured CLI fails at invocation with the command, exit code and a redacted stderr tail, on stderr and in the OpenAI-shaped HTTP error body. If that diagnostic contains a rate-limit marker (`429`, `rate limit`, `rate-limit`, `too many requests` or `quota`), the body is HTTP 429 `rate_limit_exceeded` with `Retry-After: 1`; otherwise 502 `completion_failed`. Kept: `--key` bearer auth on `/v1/*`, Host/Origin checks, process launching and environment allowlists. | Design 13.2, 14 |
 | Tests: verification-only tests and fixtures are deleted, and expectations updated for configuration-based availability and listing, `agy models` enumeration, and detailed launch errors. | `tests/` |
+
+
+## Review of changes since 2026-10-29 (design v0.36, plan v0.18)
+
+Review date: 2026-10-30. Scope: changes from 2026-10-29 00:00 PDT, using `5836fc3` (the parent of the first included commit, `8c01ee2`) as baseline, through `ba4a496`, plus the working-tree reasoning-effort and documentation/archive changes. The committed range contains 21 commits. Two independent reviewers covered the gateway/completion/client integration and the changed core/adapters/process supervision. This review updates documentation and records open work; it does not fix runtime code.
+
+| ID / severity | Finding | Disposition |
+|---|---|---|
+| GW36-1 / P1 | `gateway/envelope.py` accepts `pattern` as an annotation, but `Draft202012Validator` executes it during tool-argument validation. The small expression `^(a+)+$` with a failing argument shows exponential backtracking despite the schema-times-instance work counter. A local in-memory `asyncio.wait_for(asyncio.to_thread(validate_envelope, ...), timeout=0.02)` with 24 `a` characters plus `!` did not return `TimeoutError` until about 0.758 s: a worker-thread deadline does not interrupt the GIL-holding regex. | Open, task 5.7. Retain the bounded-schema requirement; reject executable regex before dispatch or provide genuinely bounded validation. Add adversarial schema/deadline/shutdown regressions. No runtime fix in this revision. |
+| GW36-2 / P2 | `adapters/agy_completion.py` substitutes context/output limits of 1,048,576/65,536 when a successful response has no reported limits, including a request for `claude-sonnet-5-5-high`. These Gemini defaults become apparent observations in discovery and generated client budgets, without per-model evidence. | Open, task 5.8. Retain the observed-only contract; absent metadata must remain unknown for Gemini and Claude slugs. Preserve genuine observations and omit unobserved client limits. No runtime fix in this revision. |
+
+| Documentation correction | Current behavior / boundary |
+|---|---|
+| Model and effort are independent. | `reasoning_effort` accepts low/medium/high or null, overrides the selected catalog effort when non-null and is shared by transcript rendering and completion/repair. IDs are preserved. Generated OpenCode v1 entries declare those variants; real-client acceptance and Agy suffix/grouping remain open tasks 5.5 and 5.6. |
+| Logging describes the implemented summaries. | `serve --log-level` defaults to INFO. DEBUG/TRACE summaries contain method/path, status, transmitted bytes, completion and duration; error and interrupted responses are included. Relay summaries omit bodies, headers and query strings. Uvicorn TRACE diagnostics are separate. |
+| Discovery and compatibility wording match the current implementation. | Starting the service permits lazy billed probes on authenticated model GET requests; probes use shared runtime admission. `opencode-config --refresh` separately requests billed discovery. Unmodeled request fields are intentionally ignored; modeled fields retain validation. Claude sends prompt text on stdin; Agy uses a bounded `-p` argument. |
+| Proposal provenance is not a removed profile gate. | The proposing agent name remains immutable plan provenance and a missing proposer blocks approval. Changing the coordinator for later turns does not itself invalidate a saved proposal; approval is bound to the exact saved revision and revalidates its execution envelope. |
+| Process supervision reflects the new capture path. | Streamed capture bounds unterminated lines, forwards the final captured tail once, and reports undrained pipe/feed threads as `ProcessDrainError`. Windows Job termination and close are serialized. The non-streaming `communicate()` path is outside this bounded-capture claim. |
+| The active plan no longer carries completed task output. | 59 completed definitions and their complete status/evidence rows moved verbatim to `completed-tasks.md`; active task IDs, dependencies and archive links remain in the development plan. |
+
+Validation and limits: reviewers used read-only code/test inspection and local in-memory reproductions; no paid agent calls or external live client tests ran. Core checks covered requested/default/sorted/empty coordinator selection, configuration-only availability, bounded long-line/overflow pumping and no Job termination after close; no new core regression was confirmed. The recent implementation pass reported 171 focused gateway/protocol/CLI/regression tests passing, Ruff checks and changed-source type checks passing, with one pre-existing unknown-list type error in an unchanged protocol test. Those checks were not repeated as a full suite by this review. The regex and Agy metadata findings remain unresolved; historical full-suite/live evidence above does not close them or the pinned OpenCode/Agy acceptance tasks.
