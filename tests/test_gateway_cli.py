@@ -310,6 +310,15 @@ def test_config_without_cache_reports_undiscovered_models_and_never_probes(
         "relay/auto",
     }
     assert all("limit" not in model for model in provider["models"].values())
+    assert all(
+        model["variants"]
+        == {
+            "low": {"reasoningEffort": "low"},
+            "medium": {"reasoningEffort": "medium"},
+            "high": {"reasoningEffort": "high"},
+        }
+        for model in provider["models"].values()
+    )
     assert provider["options"] == {
         "baseURL": "http://127.0.0.1:8765/v1",
         "apiKey": "{env:RELAY_GATEWAY_TOKEN}",
@@ -332,6 +341,11 @@ def test_config_refresh_probes_caches_and_later_reads_cache(
         "name": "claude/opus",
         "tool_call": True,
         "limit": {"context": 100000, "output": 10000},
+        "variants": {
+            "low": {"reasoningEffort": "low"},
+            "medium": {"reasoningEffort": "medium"},
+            "high": {"reasoningEffort": "high"},
+        },
     }
     assert set(models) == {
         "claude",

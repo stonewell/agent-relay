@@ -47,11 +47,15 @@ def test_auto_skips_busy_agent_but_explicit_alias_stays_pinned() -> None:
             pinned = client.post("/v1/chat/completions", json={**body, "model": "fake"})
             assert pinned.status_code == 429
             assert pinned.headers["Retry-After"] == "1"
-            automatic = client.post("/v1/chat/completions", json={**body, "model": "relay/auto"})
+            automatic = client.post(
+                "/v1/chat/completions",
+                json={**body, "model": "relay/auto", "reasoning_effort": "medium"},
+            )
             assert automatic.status_code == 200, automatic.text
             assert automatic.headers["X-Relay-Resolved-Model"] == "backup/default"
             assert automatic.json()["model"] == "relay/auto"
             assert len(backup.calls) == 1
+            assert backup.calls[0].effort == "medium"
         finally:
             busy.release.set()
         assert first.result(timeout=3).status_code == 200

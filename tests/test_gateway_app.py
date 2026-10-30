@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from relay.adapters.completion import (
 )
 from relay.gateway import app as gateway_app
 from relay.gateway.app import GatewayLimits, RequestSummaryMiddleware, create_app
+from relay.gateway.models import ModelCatalog
 from relay.gateway.runtime import GatewayRuntime
 from test_gateway_models import FakeBackend, configuration
 
@@ -218,6 +220,64 @@ def test_plain_response_and_sse_identical(client_backend: tuple[TestClient, Fake
     assert content == response.json()["choices"][0]["message"]["content"]
     assert frames[-1] == "[DONE]"
     assert len(backend.calls) == 2
+    assert all(invocation.effort is None for invocation in backend.calls)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["fake/opus", "fake", "relay/auto"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_reasoning_effort_keeps_model_identity(
+    client_backend: tuple[TestClient, FakeBackend], stream: bool, model: str, effort: str
+) -> None:
+    client, backend = client_backend
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model,
+            "reasoning_effort": effort,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    invocation = backend.calls[0]
+    assert invocation.model == ("opus" if model == "fake/opus" else "default")
+    assert invocation.effort == effort
+    header = json.loads(invocation.prompt.splitlines()[1])
+    assert header["model"] == invocation.model
+    assert header["effort"] == effort
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert all(chunk["model"] == model for chunk in chunks)
+    else:
+        assert response.json()["model"] == model
+
+
+@pytest.mark.parametrize("changes", [{}, {"reasoning_effort": None}, {"reasoning_effort": "low"}])
+def test_reasoning_effort_overrides_catalog_default(changes: dict[str, object]) -> None:
+    backend = FakeBackend()
+    config = configuration()
+    catalog = ModelCatalog(config, {"fake": backend})
+    catalog.models["fake/opus"] = replace(catalog.models["fake/opus"], effort="high")
+    app = create_app(config, token="test-token", adapters={"fake": backend}, catalog=catalog)
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "fake/opus",
+                "messages": [{"role": "user", "content": "hello"}],
+                **changes,
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert backend.calls[0].effort == (changes.get("reasoning_effort") or "high")
+    assert catalog.models["fake/opus"].effort == "high"
 
 
 def test_validation_happens_before_dispatch(client_backend: tuple[TestClient, FakeBackend]) -> None:
@@ -225,6 +285,9 @@ def test_validation_happens_before_dispatch(client_backend: tuple[TestClient, Fa
     body = {"model": "fake", "messages": [{"role": "user", "content": "hello"}]}
     response = client.post("/v1/chat/completions", json={**body, "n": 2})
     assert response.status_code == 400 and response.json()["error"]["param"] == "n"
+    response = client.post("/v1/chat/completions", json={**body, "reasoning_effort": "unknown"})
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "reasoning_effort"
     assert client.post("/v1/chat/completions", content="{").status_code == 400
     assert backend.calls == []
 
@@ -286,6 +349,7 @@ def test_envelope_repair_usage_aggregation(client_backend: tuple[TestClient, Fak
         "/v1/chat/completions",
         json={
             "model": "fake",
+            "reasoning_effort": "high",
             "messages": [{"role": "user", "content": "edit"}],
             "tools": [
                 {
@@ -309,6 +373,7 @@ def test_envelope_repair_usage_aggregation(client_backend: tuple[TestClient, Fak
     assert response.json()["usage"]["total_tokens"] == 35
     assert len(backend.calls) == 2
     assert backend.calls[0].model == backend.calls[1].model
+    assert backend.calls[0].effort == backend.calls[1].effort == "high"
 
 
 def test_bounded_chunked_body() -> None:

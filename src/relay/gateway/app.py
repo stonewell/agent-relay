@@ -399,10 +399,13 @@ def create_app(
             )
 
         for model in candidates:
+            effort = (
+                parsed.reasoning_effort if parsed.reasoning_effort is not None else model.effort
+            )
             invocation = CompletionRequest(
-                render_transcript(parsed, model.model, model.effort),
+                render_transcript(parsed, model.model, effort),
                 model.model,
-                model.effort,
+                effort,
                 schema,
                 parsed.output_tokens,
             )

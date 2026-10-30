@@ -87,6 +87,9 @@ def provider_config(
         model: dict[str, object] = {
             "name": model_id,
             "tool_call": metadata.get("supports_tools") is True,
+            "variants": {
+                effort: {"reasoningEffort": effort} for effort in ("low", "medium", "high")
+            },
         }
         if type(context) is int and type(output) is int and context > 0 and output > 0:
             model["limit"] = {"context": context, "output": output}
