@@ -30,6 +30,15 @@ def _is_envelope(data: dict[str, Any]) -> bool:
     return "conversation_id" in data or "structured_output" in data
 
 
+def _unwrap_envelope(data: dict[str, Any]) -> dict[str, Any] | None:
+    if data.get("event") == "result" and isinstance(data.get("result"), dict):
+        inner = cast("dict[str, Any]", data["result"])
+        return inner if _is_envelope(inner) else None
+    if _is_envelope(data):
+        return data
+    return None
+
+
 def _agy_payload(stdout: str) -> dict[str, Any] | None:
     """Parse the `agy` ``--output-format json`` envelope from stdout, or None.
 
@@ -40,15 +49,19 @@ def _agy_payload(stdout: str) -> dict[str, Any] | None:
     if not text:
         return None
     data = _try_json(text)
-    if data is not None and _is_envelope(data):
-        return data
+    if data is not None:
+        unwrapped = _unwrap_envelope(data)
+        if unwrapped is not None:
+            return unwrapped
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
             continue
         data = _try_json(line)
-        if data is not None and _is_envelope(data):
-            return data
+        if data is not None:
+            unwrapped = _unwrap_envelope(data)
+            if unwrapped is not None:
+                return unwrapped
     return None
 
 
