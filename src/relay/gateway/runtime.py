@@ -7,6 +7,7 @@ the route must call ``handle.drain()`` after sending or abandoning its response.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import shutil
 import tempfile
@@ -24,9 +25,12 @@ from relay.adapters.completion import (
     CompletionResult,
     CompletionTerminationError,
     aggregate_usage,
+    stream_completion_chunks,
 )
 
 from .render import render_repair
+
+logger = logging.getLogger("uvicorn.error")
 
 DRAIN_GRACE_S = 15.0
 
@@ -56,6 +60,8 @@ class CompletionHandle:
         self._cancel = threading.Event()
         self._released = False
         self._quarantined = False
+        self.chunks: asyncio.Queue[str | None] = asyncio.Queue()
+        self.streamed_content: str = ""
         self.result: asyncio.Task[CompletionResult]
 
     def cancel(self) -> None:
@@ -115,9 +121,7 @@ class GatewayRuntime:
         # No await between checking capacity and reserving both counters.
         if self._closed:
             # Shutdown aborts request waiters; discovery must not mistake it for a missing CLI.
-            raise CompletionError(
-                "Gateway is shutting down", status=503, code="request_cancelled"
-            )
+            raise CompletionError("Gateway is shutting down", status=503, code="request_cancelled")
         if not self._healthy:
             raise CompletionError(
                 "Gateway is not accepting requests", status=503, code="unavailable"
@@ -215,14 +219,35 @@ class GatewayRuntime:
         if cancellation.is_set():
             raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
 
+        loop = asyncio.get_running_loop()
+        streamed: list[str] = []
+        unicode_error: CompletionError | None = None
+
+        def on_chunk(text: str) -> None:
+            nonlocal unicode_error
+            if not text or cancellation.is_set() or unicode_error is not None:
+                return
+            try:
+                text.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                unicode_error = CompletionError("completion contains invalid Unicode")
+                cancellation.set()
+                return
+            streamed.append(text)
+            loop.call_soon_threadsafe(handle.chunks.put_nowait, text)
+
         def invoke_and_validate() -> CompletionResult:
-            result = backend.complete(
-                request,
-                cwd=cwd,
-                cancel=cancellation,
-                timeout_s=remaining,
-                max_output_bytes=max_output_bytes,
-            )
+            sink = on_chunk if request.output_schema is None else None
+            with stream_completion_chunks(sink):
+                result = backend.complete(
+                    request,
+                    cwd=cwd,
+                    cancel=cancellation,
+                    timeout_s=remaining,
+                    max_output_bytes=max_output_bytes,
+                )
+            if unicode_error is not None:
+                raise unicode_error
             if cancellation.is_set():
                 raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
             # A result that finished in time is validated even if the deadline passes meanwhile.
@@ -260,6 +285,11 @@ class GatewayRuntime:
                     lambda task: task.exception() if not task.cancelled() else None
                 )
                 raise CompletionTerminationError()
+        if unicode_error is not None and not expired and not interrupted:
+            failure = worker.exception()
+            if isinstance(failure, CompletionTerminationError):
+                raise failure
+            raise unicode_error
         if expired or interrupted or cancellation.is_set():
             # Consume the worker exception, but preserve termination failures over cancellation.
             failure = worker.exception()
@@ -268,6 +298,7 @@ class GatewayRuntime:
             if expired:
                 raise CompletionError("Completion deadline expired", status=504, code="timeout")
             raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
+        handle.streamed_content = "".join(streamed)
         return worker.result()
 
     async def _execute(
@@ -309,13 +340,25 @@ class GatewayRuntime:
                     )
             raise AssertionError("completion repair loop exhausted")
         except CompletionTerminationError:
+            # Fail closed, but never silently: the operator must be able to attribute the lockout.
+            logger.error(
+                "completion termination unconfirmed; quarantining gateway backend=%s",
+                handle._agent,  # pyright: ignore[reportPrivateUsage]
+            )
             self._healthy = False
             handle._quarantined = True  # pyright: ignore[reportPrivateUsage]
             raise
         finally:
+            handle.chunks.put_nowait(None)
             if directory is not None and not handle._quarantined:  # pyright: ignore[reportPrivateUsage]
                 try:
                     shutil.rmtree(directory)
-                except OSError:
-                    # Retain private residue, stop admission rather than silently lose cleanup.
-                    self._healthy = False
+                except OSError as exc:
+                    # The child has already exited here (otherwise _call raised above), so a failed
+                    # cleanup of the private scratch dir is not grounds to stop serving. Retain the
+                    # residue and warn with its path and error type only — never its contents.
+                    logger.warning(
+                        "scratch cleanup failed; retaining residue path=%s error=%s",
+                        directory,
+                        type(exc).__name__,
+                    )

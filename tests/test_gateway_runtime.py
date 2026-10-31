@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -179,15 +181,53 @@ def test_timeout_drains_and_shutdown_cancels_all_requests() -> None:
     asyncio.run(scenario())
 
 
-def test_unconfirmed_termination_quarantines_capacity_and_retains_scratch(
+def test_scratch_cleanup_failure_warns_but_keeps_serving(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    real_rmtree = shutil.rmtree
+    removed: list[Path] = []
+
+    def raiser(path: Path, *args: object, **kwargs: object) -> None:
+        removed.append(Path(path))
+        if len(removed) == 1:
+            # The child has exited; only the rmdir itself fails for this request.
+            raise OSError("busy")
+        real_rmtree(Path(path), ignore_errors=True)
+
+    monkeypatch.setattr("shutil.rmtree", raiser)
+
+    async def scenario() -> None:
+        runtime = GatewayRuntime(GatewayLimits(concurrency=1), {"fake": 1})
+        backend = Backend()
+        handle = runtime.start(backend, CompletionRequest("hello"))
+        assert (await handle.result).content == "ok"
+        await handle.drain()
+        # A failed scratch cleanup must not disable admission.
+        assert runtime.healthy is True
+        assert runtime.active == 0
+        assert backend.paths[0].exists()
+        follow = runtime.start(backend, CompletionRequest("hello"))
+        assert (await follow.result).content == "ok"
+        await follow.drain()
+        assert runtime.active == 0
+        # This fake has no live process; manually remove its deliberately retained residue.
+        (backend.paths[0] / "scratch").unlink()
+        backend.paths[0].rmdir()
+
+    asyncio.run(scenario())
+
+
+def test_unconfirmed_termination_quarantines_capacity_and_retains_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     monkeypatch.setattr(module, "DRAIN_GRACE_S", 0.03)
+    caplog.set_level(logging.ERROR, logger="uvicorn.error")
 
     async def scenario() -> None:
         backend = Backend([CompletionTerminationError()])
         runtime = GatewayRuntime(GatewayLimits(), {})
-        handle = runtime.start(backend, CompletionRequest("x"))
+        handle = runtime.start(backend, CompletionRequest("private prompt body"))
         with pytest.raises(CompletionTerminationError):
             await handle.result
         await handle.drain()
@@ -196,6 +236,12 @@ def test_unconfirmed_termination_quarantines_capacity_and_retains_scratch(
         with pytest.raises(CompletionError) as caught:
             runtime.start(backend, CompletionRequest("y"))
         assert caught.value.status == 503
+        # The lockout is attributable from the log, without leaking request content.
+        assert any(
+            f"quarantining gateway backend={backend.id}" in record.getMessage()
+            for record in caplog.records
+        )
+        assert "private prompt body" not in caplog.text
         # This fake has no live process; manually remove its deliberately retained residue.
         (backend.paths[0] / "scratch").unlink()
         backend.paths[0].rmdir()
