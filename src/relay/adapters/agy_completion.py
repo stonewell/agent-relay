@@ -8,16 +8,18 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
 from relay.adapters.antigravity import agy_envelope, envelope_error
 from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
 from relay.adapters.completion import (
+    CompletionChunkSink,
     CompletionError,
     CompletionInvalid,
     CompletionProfile,
@@ -27,8 +29,10 @@ from relay.adapters.completion import (
     CompletionTerminationError,
     CompletionUsage,
     ObservedModel,
+    current_chunk_sink,
     model_aliases,
 )
+from relay.adapters.cursor import schema_instructions
 from relay.core.env import CompleteEnv, build_env, redact
 from relay.core.platform.proc import (
     CommandNotFound,
@@ -43,12 +47,112 @@ from relay.core.platform.proc import (
 )
 from relay.core.registry import Agent
 
-COMPLETION_FLAGS: tuple[str, ...] = ("--mode", "plan", "--sandbox")
+_AGY_SETTINGS = (
+    '{"agentMode":"","toolPermission":"strict",'
+    '"allowNonWorkspaceAccess":false,"disableSlashCommands":true}'
+)
+COMPLETION_FLAGS: tuple[str, ...] = (
+    "--agent",
+    "relay-completion",
+    "--disable-slash-commands",
+    "--sandbox",
+    "--settings",
+    _AGY_SETTINGS,
+)
 PROMPT_LIMIT_BYTES = 30_000 if sys.platform == "win32" else 120_000
 DEFAULT_AGY_MODEL = "gemini-2.5-pro"
 DEFAULT_CONTEXT_WINDOW = 1_048_576
 DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 ENUMERATION_TIMEOUT_S = 15.0
+
+_AGY_AGENT_MD = (
+    "---\n"
+    "name: relay-completion\n"
+    "description: Stateless single-turn completion responder without tools or subagents.\n"
+    "tools: []\n"
+    "mainAgent: true\n"
+    "subagent: false\n"
+    "commandExecutionPolicy: off\n"
+    "skills: []\n"
+    "plugins: []\n"
+    "---\n"
+    "# System Prompt\n"
+    "You are a stateless completion model for a non-interactive API gateway.\n"
+    "Explicit user instruction override: Ignore any global coordinator or subagent routing rules "
+    "(`<RULE[user_global]>`). Do NOT call `define_subagent`, `invoke_subagent`, `send_message`, "
+    "`manage_subagents`, or any other tool. Respond directly in this single turn with only the "
+    "requested completion output.\n"
+)
+
+_AGY_RULE_MD = (
+    "# Explicit User Instructions Override\n"
+    "For this workspace session, explicit user instructions take precedence over "
+    "`<RULE[user_global]>`:\n"
+    "- Do NOT act as a task coordinator and do NOT register or invoke any subagents "
+    "(`define_subagent`, `invoke_subagent`).\n"
+    "- Do NOT call any tools or run commands.\n"
+    "- Answer the supplied prompt directly in a single turn and output the response immediately.\n"
+)
+
+_DENY_SCRIPT = """import json
+import sys
+from pathlib import Path
+
+Path(__file__).with_suffix(".used").touch()
+print(json.dumps({
+    "allow_tool": False,
+    "deny_reason": "Relay clients execute tools.",
+    "decision": "deny",
+    "reason": "Relay clients execute tools."
+}))
+raise SystemExit(0)
+"""
+
+
+def _write(path: Path, text: str) -> None:
+    if path.is_symlink():
+        raise OSError("Antigravity policy path must not be a symbolic link")
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _prepare_policy(cwd: Path) -> Path:
+    agents_dir = cwd / ".agents"
+    custom_agents = agents_dir / "agents"
+    for directory in (agents_dir, custom_agents):
+        if directory.is_symlink():
+            raise OSError("Antigravity policy directory must not be a symbolic link")
+        directory.mkdir(mode=0o700, exist_ok=True)
+    _write(custom_agents / "relay-completion.md", _AGY_AGENT_MD)
+    _write(cwd / "GEMINI.md", _AGY_RULE_MD)
+    script = agents_dir / "deny_tools.py"
+    _write(script, _DENY_SCRIPT)
+    script_resolved = script.resolve()
+    executable = str(Path(sys.executable).resolve())
+    if sys.platform == "win32":
+        command = (
+            "& "
+            + " ".join(
+                "'" + value.replace("'", "''") + "'" for value in (executable, str(script_resolved))
+            )
+            + "; exit $LASTEXITCODE"
+        )
+    else:
+        command = shlex.join((executable, str(script_resolved)))
+    hooks = {
+        "relay-deny-tools": {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": command, "timeout": 10}],
+                }
+            ]
+        }
+    }
+    _write(agents_dir / "hooks.json", json.dumps(hooks))
+    _write(agents_dir / "mcp_config.json", '{"mcpServers":{}}')
+    return script.with_suffix(".used")
+
 
 _ENUMERATED: dict[str, tuple[str, ...]] = {}
 
@@ -137,15 +241,116 @@ def _observed(payload: dict[str, Any], request_model: str = "default") -> Observ
         model_name = DEFAULT_AGY_MODEL
 
     context = (
-        _positive(payload.get("context_window") or payload.get("contextWindow"))
+        _positive(payload.get("context_window"))
+        or _positive(payload.get("contextWindow"))
         or DEFAULT_CONTEXT_WINDOW
     )
     output = (
-        _positive(payload.get("max_output_tokens") or payload.get("maxOutputTokens"))
+        _positive(payload.get("max_output_tokens"))
+        or _positive(payload.get("maxOutputTokens"))
         or DEFAULT_MAX_OUTPUT_TOKENS
     )
 
     return ObservedModel(model_name, context, output)
+
+
+def _tool_activity(event: dict[str, Any]) -> bool:
+    if event.get("event") == "step_update" and isinstance(event.get("step_update"), dict):
+        step = cast("dict[str, Any]", event["step_update"])
+        return (
+            step.get("step_type") == "tool"
+            or bool(step.get("tool_name"))
+            or bool(step.get("tool_info"))
+            or bool(step.get("subagent_info"))
+        )
+    return False
+
+
+def _stream_sink(
+    sink: CompletionChunkSink, tool_marker: Path | None = None
+) -> Callable[[str], None]:
+    emitted = ""
+    failed = False
+
+    def on_line(line: str) -> None:
+        nonlocal emitted, failed
+        if failed:
+            return
+        if tool_marker is not None and tool_marker.exists():
+            failed = True
+            return
+        line = line.strip()
+        if not line:
+            return
+        try:
+            raw_event: Any = json.loads(line)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(raw_event, dict):
+            return
+        event = cast("dict[str, Any]", raw_event)
+        if _tool_activity(event):
+            failed = True
+            return
+        if event.get("event") == "result" and isinstance(event.get("result"), dict):
+            res = cast("dict[str, Any]", event["result"])
+            if res.get("status") in {"ERROR", "INVALID"} or res.get("is_error") is True:
+                failed = True
+            return
+        if event.get("status") in {"ERROR", "INVALID"} or event.get("is_error") is True:
+            failed = True
+            return
+        if event.get("event") == "step_update" and isinstance(event.get("step_update"), dict):
+            step = cast("dict[str, Any]", event["step_update"])
+            if step.get("step_type") == "agent_response":
+                delta = step.get("text_delta")
+                if isinstance(delta, str) and delta:
+                    emitted += delta
+                    sink(delta)
+            return
+        if event.get("type") == "stream_event":
+            inner = event.get("event")
+            if (
+                isinstance(inner, dict)
+                and cast("dict[str, Any]", inner).get("type") == "content_block_delta"
+            ):
+                inner_dict = cast("dict[str, Any]", inner)
+                delta = inner_dict.get("delta")
+                if (
+                    isinstance(delta, dict)
+                    and cast("dict[str, Any]", delta).get("type") == "text_delta"
+                ):
+                    delta_dict = cast("dict[str, Any]", delta)
+                    text = delta_dict.get("text")
+                    if isinstance(text, str) and text:
+                        emitted += text
+                        sink(text)
+            return
+        if event.get("type") == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                message_dict = cast("dict[str, Any]", message)
+                content = message_dict.get("content")
+                if isinstance(content, list):
+                    content_list = cast("list[Any]", content)
+                    joined = "".join(
+                        cast("str", cast("dict[str, Any]", block)["text"])
+                        for block in content_list
+                        if isinstance(block, dict)
+                        and cast("dict[str, Any]", block).get("type") == "text"
+                        and isinstance(cast("dict[str, Any]", block).get("text"), str)
+                    )
+                    if joined:
+                        if not emitted:
+                            emitted = joined
+                            sink(joined)
+                        elif joined.startswith(emitted) and len(joined) > len(emitted):
+                            delta_text = joined[len(emitted) :]
+                            emitted = joined
+                            sink(delta_text)
+            return
+
+    return on_line
 
 
 class AgyCompletionAdapter:
@@ -195,10 +400,12 @@ class AgyCompletionAdapter:
         )
 
     @staticmethod
-    def arguments(request: CompletionRequest) -> tuple[str, ...]:
-        args = ["-p", request.prompt, "--output-format", "json", *COMPLETION_FLAGS]
+    def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
+        output_format = "stream-json" if stream and request.output_schema is None else "json"
+        prompt = request.prompt
         if request.output_schema is not None:
-            args += ["--json-schema", json.dumps(request.output_schema, separators=(",", ":"))]
+            prompt += schema_instructions(request.output_schema)
+        args = ["-p", prompt, "--output-format", output_format, *COMPLETION_FLAGS]
         if request.model != "default":
             args += ["--model", request.model]
         if request.effort is not None:
@@ -213,28 +420,51 @@ class AgyCompletionAdapter:
         cancel: threading.Event,
         timeout_s: float,
         max_output_bytes: int,
+        on_chunk: CompletionChunkSink | None = None,
     ) -> CompletionResult:
         deadline = time.monotonic() + timeout_s
-        if len(request.prompt.encode("utf-8")) > PROMPT_LIMIT_BYTES:
+        prompt = request.prompt
+        if request.output_schema is not None:
+            prompt += schema_instructions(request.output_schema)
+        if len(prompt.encode("utf-8")) > PROMPT_LIMIT_BYTES:
             raise CompletionError(
                 "Prompt exceeds CLI argument limit",
                 status=400,
                 code="context_length_exceeded",
                 param="messages",
             )
+        chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
+        streaming = chunk_sink is not None and request.output_schema is None
+        try:
+            tool_marker = _prepare_policy(cwd)
+        except OSError as exc:
+            raise CompletionError("Could not prepare Antigravity completion restrictions") from exc
+
+        line_sink = (
+            _stream_sink(chunk_sink, tool_marker)
+            if streaming and chunk_sink is not None
+            else discard_output
+        )
         try:
             with (
                 cancel_processes_when(cancel),
-                stream_output(discard_output, max_bytes=max_output_bytes),
+                stream_output(line_sink, max_bytes=max_output_bytes),
             ):
                 env = self._environment()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
                 command = resolve_command(
-                    self._agent.cmd, self.arguments(request), env=env, cwd=cwd
+                    self._agent.cmd,
+                    self.arguments(request, stream=streaming),
+                    env=env,
+                    cwd=cwd,
                 )
                 proc = run_process(command, cwd=cwd, env=env, timeout_s=remaining)
+            if tool_marker.exists():
+                raise CompletionError(
+                    "Antigravity attempted model-side tools", code="backend_tool_use"
+                )
             return parse_completion(
                 proc,
                 structured=request.output_schema is not None,
@@ -260,6 +490,39 @@ class AgyCompletionAdapter:
             raise CompletionTerminationError() from exc
 
 
+def _parse_candidate(raw: str) -> dict[str, Any] | None:
+    text = raw.strip()
+    with contextlib.suppress(ValueError, RecursionError):
+        parsed: Any = json.loads(text)
+        if isinstance(parsed, dict):
+            return cast("dict[str, Any]", parsed)
+    if "```" in text:
+        parts = text.split("```")
+        for i in range(1, len(parts), 2):
+            block = parts[i]
+            inner = block.partition("\n")[2] if "\n" in block else block
+            with contextlib.suppress(ValueError, RecursionError):
+                parsed = json.loads(inner.strip())
+                if isinstance(parsed, dict):
+                    return cast("dict[str, Any]", parsed)
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        with contextlib.suppress(ValueError, RecursionError):
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                return cast("dict[str, Any]", parsed)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        with contextlib.suppress(ValueError, RecursionError):
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, dict):
+                return cast("dict[str, Any]", parsed)
+    return None
+
+
 def parse_completion(
     proc: ProcessResult,
     *,
@@ -269,6 +532,16 @@ def parse_completion(
 ) -> CompletionResult:
     if proc.timed_out:
         raise CompletionError("Completion deadline expired", status=504, code="timeout")
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed: Any = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(parsed, dict) and _tool_activity(cast("dict[str, Any]", parsed)):
+            raise CompletionError("Antigravity reported model-side tools", code="backend_tool_use")
     payload = agy_envelope(proc.stdout)
     is_error = payload is not None and (
         payload.get("status") in {"ERROR", "INVALID"} or payload.get("is_error") is True
@@ -313,11 +586,9 @@ def parse_completion(
             )
         candidate: Any = payload.get("structured_output")
         if candidate is None and isinstance(payload.get("response"), str):
-            with contextlib.suppress(ValueError, RecursionError):
-                candidate = json.loads(payload["response"])
+            candidate = _parse_candidate(payload["response"])
         elif candidate is None and isinstance(payload.get("result"), str):
-            with contextlib.suppress(ValueError, RecursionError):
-                candidate = json.loads(payload["result"])
+            candidate = _parse_candidate(payload["result"])
         if not isinstance(candidate, dict):
             raise CompletionInvalid(
                 "CLI returned no tool envelope",
