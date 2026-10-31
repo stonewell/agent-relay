@@ -39,13 +39,19 @@ def pid_alive(pid: int) -> bool:
         return True
     try:
         return "Z" not in Path(f"/proc/{pid}/stat").read_text().split(") ")[-1][:2]
+    except FileNotFoundError:
+        # The entry vanished between the signal check and the stat read: the process is gone.
+        return False
     except OSError:
+        # Unreadable for another reason (e.g. hidepid): fall back to the signal probe.
         return True
 
 
 def wait_dead(pid: int, seconds: float = 3.0) -> bool:
     deadline = time.monotonic() + seconds
-    while pid_alive(pid) and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
         time.sleep(0.02)
     return not pid_alive(pid)
 
