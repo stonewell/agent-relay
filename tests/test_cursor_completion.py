@@ -22,10 +22,12 @@ from relay.adapters.completion import (
     CompletionTerminationError,
     CompletionUsage,
     ObservedModel,
+    stream_completion_chunks,
 )
 from relay.adapters.cursor_completion import CursorCompletionAdapter, parse_completion
 from relay.core.env import CompleteEnv
 from relay.core.platform.proc import (
+    _OUTPUT_SINK,  # pyright: ignore[reportPrivateUsage]
     CommandNotFound,
     OutputLimitExceeded,
     ProcessCancelled,
@@ -675,3 +677,211 @@ def test_cursor_policy_setup_failure_does_not_launch(tmp_path: Path) -> None:
             timeout_s=5,
             max_output_bytes=1000,
         )
+
+
+def test_cursor_arguments_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", no_models)
+    adapter = CursorCompletionAdapter(Agent(cmd="cursor"))
+
+    # Plain stream
+    req_plain = CompletionRequest("prompt", "default")
+    args_plain = adapter.arguments(req_plain, stream=True)
+    assert "--stream-partial-output" in args_plain
+    assert args_plain == (
+        "-p",
+        "--mode",
+        "ask",
+        "--trust",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+    )
+
+    # Stream with model: verify --stream-partial-output is before --model
+    req_model = CompletionRequest("prompt", "custom-model")
+    args_model = adapter.arguments(req_model, stream=True)
+    assert "--stream-partial-output" in args_model
+    assert "--model" in args_model
+    assert args_model.index("--stream-partial-output") < args_model.index("--model")
+    assert args_model == (
+        "-p",
+        "--mode",
+        "ask",
+        "--trust",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+        "--model",
+        "custom-model",
+    )
+
+    # Stream with schema: --stream-partial-output omitted
+    req_schema = CompletionRequest("prompt", "default", output_schema={"type": "object"})
+    args_schema = adapter.arguments(req_schema, stream=True)
+    assert "--stream-partial-output" not in args_schema
+    assert args_schema == ("-p", "--mode", "ask", "--trust", "--output-format", "stream-json")
+
+
+def test_cursor_stream_sink(tmp_path: Path) -> None:
+    chunks: list[str] = []
+    tool_marker = tmp_path / "deny_tools.used"
+    sink = cursor_completion._stream_sink(chunks.append, tool_marker)  # pyright: ignore[reportPrivateUsage]
+
+    # 1. timestamp_ms partial chunks
+    sink(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp_ms": 100,
+                "message": {"content": "part1"},
+            }
+        )
+    )
+    sink(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp_ms": 200,
+                "message": {"content": "part2"},
+            }
+        )
+    )
+    assert chunks == ["part1", "part2"]
+
+    # 2. Cumulative snapshot suffix deduplication (when timestamp_ms not in event)
+    chunks.clear()
+    sink2 = cursor_completion._stream_sink(chunks.append, tool_marker)  # pyright: ignore[reportPrivateUsage]
+    sink2(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": "Hello"},
+            }
+        )
+    )
+    sink2(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": "Hello world"},
+            }
+        )
+    )
+    assert chunks == ["Hello", " world"]
+
+    # 3. Ignoring model_call_id pre-tool flushes
+    chunks.clear()
+    sink3 = cursor_completion._stream_sink(chunks.append, tool_marker)  # pyright: ignore[reportPrivateUsage]
+    sink3(
+        json.dumps(
+            {
+                "type": "assistant",
+                "model_call_id": "call_flush_1",
+                "message": {"content": "pre-tool text"},
+            }
+        )
+    )
+    assert chunks == []
+    # Regular message works after
+    sink3(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": "regular"},
+            }
+        )
+    )
+    assert chunks == ["regular"]
+
+    # 4. Halting on _tool_activity
+    chunks.clear()
+    sink4 = cursor_completion._stream_sink(chunks.append, tool_marker)  # pyright: ignore[reportPrivateUsage]
+    sink4(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp_ms": 100,
+                "message": {"content": "valid"},
+            }
+        )
+    )
+    assert chunks == ["valid"]
+    # Tool activity event
+    sink4(json.dumps({"type": "tool_call", "name": "bash"}))
+    # Subsequent events ignored
+    sink4(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp_ms": 200,
+                "message": {"content": "ignored"},
+            }
+        )
+    )
+    assert chunks == ["valid"]
+
+    # 5. Halting on tool_marker.exists()
+    chunks.clear()
+    tool_marker.touch()
+    sink5 = cursor_completion._stream_sink(chunks.append, tool_marker)  # pyright: ignore[reportPrivateUsage]
+    sink5(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp_ms": 100,
+                "message": {"content": "ignored"},
+            }
+        )
+    )
+    assert chunks == []
+    tool_marker.unlink()
+
+
+def test_cursor_complete_streaming(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", no_models)
+    agent = Agent(cmd="cursor")
+    adapter = CursorCompletionAdapter(agent, parent_env={})
+
+    events = [
+        {"type": "assistant", "timestamp_ms": 1, "message": {"content": "hello "}},
+        {"type": "assistant", "timestamp_ms": 2, "message": {"content": "world"}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "hello world"},
+    ]
+    raw_lines = [json.dumps(e) for e in events]
+
+    def mock_run_process(cmd: Any, **kwargs: Any) -> ProcessResult:
+        entry = _OUTPUT_SINK.get()
+        if entry is not None:
+            sink, _ = entry
+            for line in raw_lines:
+                sink(line)
+        return ProcessResult(0, "\n".join(raw_lines))
+
+    monkeypatch.setattr(cursor_completion, "run_process", mock_run_process)
+    monkeypatch.setattr(cursor_completion, "resolve_cursor_command", legacy_command)
+    monkeypatch.setattr(cursor_completion, "resolve_command", fake_command)
+
+    chunks: list[str] = []
+    res = adapter.complete(
+        CompletionRequest("test", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=5,
+        max_output_bytes=10000,
+        on_chunk=chunks.append,
+    )
+    assert res.content == "hello world"
+    assert chunks == ["hello ", "world"]
+
+    # Also test stream_completion_chunks context manager
+    chunks_ctx: list[str] = []
+    with stream_completion_chunks(chunks_ctx.append):
+        res2 = adapter.complete(
+            CompletionRequest("test", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert res2.content == "hello world"
+    assert chunks_ctx == ["hello ", "world"]

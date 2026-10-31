@@ -16,12 +16,13 @@ import shlex
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
 from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
 from relay.adapters.completion import (
+    CompletionChunkSink,
     CompletionError,
     CompletionInvalid,
     CompletionProfile,
@@ -30,6 +31,7 @@ from relay.adapters.completion import (
     CompletionSupport,
     CompletionTerminationError,
     CompletionUsage,
+    current_chunk_sink,
     model_aliases,
 )
 from relay.adapters.parsing import strict_schema
@@ -173,6 +175,83 @@ def _deny_hook(cwd: Path) -> str:
     )
 
 
+def _stream_sink(sink: CompletionChunkSink, cwd: Path) -> Callable[[str], None]:
+    emitted = ""
+    started = False
+    terminal = False
+    failed = False
+    denied = cwd / _DENIED
+
+    def on_line(line: str) -> None:
+        nonlocal emitted, started, terminal, failed
+        if failed or terminal or not line.strip():
+            return
+        if denied.exists():
+            failed = True
+            return
+        try:
+            raw_event: Any = json.loads(line)
+        except (ValueError, RecursionError):
+            failed = True
+            return
+        if not isinstance(raw_event, dict):
+            failed = True
+            return
+        event = cast("dict[str, Any]", raw_event)
+        kind = event.get("type")
+        if kind in {"turn.failed", "turn.cancelled", "turn.interrupted", "error"}:
+            failed = True
+            return
+        if kind == "turn.started":
+            if started:
+                failed = True
+                return
+            started = True
+            return
+        if kind == "turn.completed":
+            terminal = True
+            return
+        if kind in {"item.started", "item.updated", "item.completed"}:
+            raw_item = event.get("item")
+            if not isinstance(raw_item, dict):
+                failed = True
+                return
+            item = cast("dict[str, Any]", raw_item)
+            item_type = item.get("type")
+            if item_type == "error":
+                if (
+                    kind == "item.completed"
+                    and not started
+                    and item.get("message") == _HOOK_TRUST_ADVISORY
+                ):
+                    return
+                failed = True
+                return
+            if item_type not in {"agent_message", "reasoning"}:
+                failed = True
+                return
+            if item_type == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    if not emitted:
+                        emitted = text
+                        sink(text)
+                    elif text.startswith(emitted) and len(text) > len(emitted):
+                        delta = text[len(emitted) :]
+                        emitted = text
+                        sink(delta)
+                elif (
+                    kind == "item.updated"
+                    and isinstance(event.get("delta"), str)
+                    and event["delta"]
+                ):
+                    delta = cast("str", event["delta"])
+                    emitted += delta
+                    sink(delta)
+
+    return on_line
+
+
 class CodexCompletionAdapter:
     id = "codex"
 
@@ -260,12 +339,19 @@ class CodexCompletionAdapter:
         cancel: threading.Event,
         timeout_s: float,
         max_output_bytes: int,
+        on_chunk: CompletionChunkSink | None = None,
     ) -> CompletionResult:
         deadline = time.monotonic() + timeout_s
+        chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
+        line_sink = (
+            _stream_sink(chunk_sink, cwd)
+            if chunk_sink is not None and request.output_schema is None
+            else discard_output
+        )
         try:
             with (
                 cancel_processes_when(cancel),
-                stream_output(discard_output, max_bytes=max_output_bytes),
+                stream_output(line_sink, max_bytes=max_output_bytes),
             ):
                 env = self._environment()
                 args = self.arguments(request, cwd)

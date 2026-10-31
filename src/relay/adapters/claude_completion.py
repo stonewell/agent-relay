@@ -11,12 +11,13 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
 from relay.adapters.completion import (
     DEFAULT_MODEL_ALIASES,
+    CompletionChunkSink,
     CompletionError,
     CompletionInvalid,
     CompletionProfile,
@@ -26,6 +27,7 @@ from relay.adapters.completion import (
     CompletionTerminationError,
     CompletionUsage,
     ObservedModel,
+    current_chunk_sink,
 )
 from relay.core.env import CompleteEnv, build_env, redact
 from relay.core.platform.proc import (
@@ -59,6 +61,74 @@ def _capture(_: str) -> None:
 
 
 discard_output = _capture
+
+
+def _stream_sink(sink: CompletionChunkSink) -> Callable[[str], None]:
+    emitted = ""
+    failed = False
+
+    def on_line(line: str) -> None:
+        nonlocal emitted, failed
+        if failed:
+            return
+        line = line.strip()
+        if not line:
+            return
+        try:
+            raw_event: Any = json.loads(line)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(raw_event, dict):
+            return
+        event = cast("dict[str, Any]", raw_event)
+        if event.get("type") == "result":
+            if event.get("is_error"):
+                failed = True
+            return
+        if event.get("type") == "stream_event":
+            inner = event.get("event")
+            if (
+                isinstance(inner, dict)
+                and cast("dict[str, Any]", inner).get("type") == "content_block_delta"
+            ):
+                inner_dict = cast("dict[str, Any]", inner)
+                delta = inner_dict.get("delta")
+                if (
+                    isinstance(delta, dict)
+                    and cast("dict[str, Any]", delta).get("type") == "text_delta"
+                ):
+                    delta_dict = cast("dict[str, Any]", delta)
+                    text = delta_dict.get("text")
+                    if isinstance(text, str) and text:
+                        emitted += text
+                        sink(text)
+            return
+        if event.get("type") == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                message_dict = cast("dict[str, Any]", message)
+                content = message_dict.get("content")
+                if isinstance(content, list):
+                    content_list = cast("list[Any]", content)
+                    joined = "".join(
+                        cast("str", cast("dict[str, Any]", block)["text"])
+                        for block in content_list
+                        if isinstance(block, dict)
+                        and cast("dict[str, Any]", block).get("type") == "text"
+                        and isinstance(cast("dict[str, Any]", block).get("text"), str)
+                    )
+                    if joined:
+                        if not emitted:
+                            emitted = joined
+                            sink(joined)
+                        elif joined.startswith(emitted) and len(joined) > len(emitted):
+                            delta_text = joined[len(emitted) :]
+                            emitted = joined
+                            sink(delta_text)
+            return
+
+    return on_line
+
 
 # CLI diagnostics that indicate provider rate limiting; matched case-insensitively.
 RATE_LIMIT_MARKERS: tuple[str, ...] = (
@@ -105,8 +175,18 @@ class ClaudeCompletionAdapter:
         )
 
     @staticmethod
-    def arguments(request: CompletionRequest) -> tuple[str, ...]:
-        args = ["-p", "--output-format", "json", *COMPLETION_FLAGS]
+    def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
+        if stream and request.output_schema is None:
+            args = [
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                *COMPLETION_FLAGS,
+            ]
+        else:
+            args = ["-p", "--output-format", "json", *COMPLETION_FLAGS]
         if request.output_schema is not None:
             args += ["--json-schema", json.dumps(request.output_schema, separators=(",", ":"))]
         if request.model != "default":
@@ -123,16 +203,23 @@ class ClaudeCompletionAdapter:
         cancel: threading.Event,
         timeout_s: float,
         max_output_bytes: int,
+        on_chunk: CompletionChunkSink | None = None,
     ) -> CompletionResult:
         deadline = time.monotonic() + timeout_s
+        chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
+        streaming = chunk_sink is not None and request.output_schema is None
+        line_sink = _stream_sink(chunk_sink) if streaming and chunk_sink is not None else _capture
         try:
-            with cancel_processes_when(cancel), stream_output(_capture, max_bytes=max_output_bytes):
+            with (
+                cancel_processes_when(cancel),
+                stream_output(line_sink, max_bytes=max_output_bytes),
+            ):
                 env = self._environment()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
                 command = resolve_command(
-                    self._agent.cmd, self.arguments(request), env=env, cwd=cwd
+                    self._agent.cmd, self.arguments(request, stream=streaming), env=env, cwd=cwd
                 )
                 proc = run_process(
                     command, cwd=cwd, env=env, stdin=request.prompt, timeout_s=remaining

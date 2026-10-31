@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import relay.adapters.claude_completion as claude_completion
 from relay.adapters.claude_completion import ClaudeCompletionAdapter, parse_completion
 from relay.adapters.completion import (
     CompletionError,
@@ -17,8 +19,10 @@ from relay.adapters.completion import (
     CompletionRequest,
     CompletionUsage,
     aggregate_usage,
+    stream_completion_chunks,
 )
-from relay.core.platform.proc import ProcessResult
+from relay.core.platform.proc import _OUTPUT_SINK, ProcessResult  # pyright: ignore[reportPrivateUsage]
+from relay.core.registry import Agent
 
 
 def response(**values: Any) -> ProcessResult:
@@ -106,3 +110,170 @@ def test_plain_schema_arguments_are_separate_and_native_token_limit_is_never_inv
     assert args[args.index("--json-schema") + 1] == '{"type":"object"}'
     assert "--model" not in args
     assert sys.platform
+
+
+def test_claude_arguments_streaming() -> None:
+    req_plain = CompletionRequest("hello", "default")
+    args_plain = ClaudeCompletionAdapter.arguments(req_plain, stream=True)
+    assert args_plain[1:5] == (
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+    )
+
+    args_non_stream = ClaudeCompletionAdapter.arguments(req_plain, stream=False)
+    assert args_non_stream[1:3] == ("--output-format", "json")
+    assert "--verbose" not in args_non_stream
+    assert "--include-partial-messages" not in args_non_stream
+
+    req_schema = CompletionRequest("hello", "default", output_schema={"type": "object"})
+    args_schema = ClaudeCompletionAdapter.arguments(req_schema, stream=True)
+    assert args_schema[1:3] == ("--output-format", "json")
+    assert "--verbose" not in args_schema
+    assert "--include-partial-messages" not in args_schema
+
+
+def test_claude_stream_sink() -> None:
+    chunks: list[str] = []
+    sink = claude_completion._stream_sink(chunks.append)  # pyright: ignore[reportPrivateUsage]
+
+    # 1. stream_event: content_block_delta -> text_delta
+    sink(
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "Hel"},
+                },
+            }
+        )
+    )
+    sink(
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "lo"},
+                },
+            }
+        )
+    )
+    assert chunks == ["Hel", "lo"]
+
+    # 2. assistant snapshot deduplication
+    chunks.clear()
+    sink2 = claude_completion._stream_sink(chunks.append)  # pyright: ignore[reportPrivateUsage]
+    sink2(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Hello"}]},
+            }
+        )
+    )
+    sink2(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Hello world"}]},
+            }
+        )
+    )
+    assert chunks == ["Hello", " world"]
+
+    # 3. stopping on is_error: true
+    chunks.clear()
+    sink3 = claude_completion._stream_sink(chunks.append)  # pyright: ignore[reportPrivateUsage]
+    sink3(
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "Hel"},
+                },
+            }
+        )
+    )
+    sink3(json.dumps({"type": "result", "is_error": True}))
+    sink3(
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "lo"},
+                },
+            }
+        )
+    )
+    assert chunks == ["Hel"]
+
+
+def test_claude_complete_streaming(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = Agent(cmd="claude")
+    adapter = ClaudeCompletionAdapter(agent)
+
+    recorded_lines = [
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "chunk1"},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "chunk2"},
+                },
+            }
+        ),
+        json.dumps({"type": "result", "result": "chunk1chunk2"}),
+    ]
+
+    def mock_run_process(cmd: Any, **kwargs: Any) -> ProcessResult:
+        entry = _OUTPUT_SINK.get()
+        if entry is not None:
+            sink, _ = entry
+            for line in recorded_lines:
+                sink(line)
+        return ProcessResult(0, "\n".join(recorded_lines))
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return ("claude",)
+
+    monkeypatch.setattr(claude_completion, "run_process", mock_run_process)
+    monkeypatch.setattr(claude_completion, "resolve_command", fake_resolve)
+
+    chunks: list[str] = []
+    res = adapter.complete(
+        CompletionRequest("test", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=5,
+        max_output_bytes=10000,
+        on_chunk=chunks.append,
+    )
+    assert res.content == "chunk1chunk2"
+    assert chunks == ["chunk1", "chunk2"]
+
+    # Also with stream_completion_chunks context manager
+    chunks_ctx: list[str] = []
+    with stream_completion_chunks(chunks_ctx.append):
+        res2 = adapter.complete(
+            CompletionRequest("test", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert res2.content == "chunk1chunk2"
+    assert chunks_ctx == ["chunk1", "chunk2"]

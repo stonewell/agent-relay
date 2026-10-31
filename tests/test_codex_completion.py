@@ -14,9 +14,15 @@ import pytest
 
 from relay.adapters import codex_completion as module
 from relay.adapters.codex_completion import CodexCompletionAdapter, parse_completion
-from relay.adapters.completion import CompletionError, CompletionInvalid, CompletionRequest
+from relay.adapters.completion import (
+    CompletionError,
+    CompletionInvalid,
+    CompletionRequest,
+    stream_completion_chunks,
+)
 from relay.core.env import CompleteEnv
 from relay.core.platform.proc import (
+    _OUTPUT_SINK,  # pyright: ignore[reportPrivateUsage]
     CommandNotFound,
     OutputLimitExceeded,
     ProcessCancelled,
@@ -449,3 +455,166 @@ def test_enumeration_preserves_shutdown_and_process_ownership_failures(
     with pytest.raises(type(error)):
         _ = CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).default_aliases
     assert not module._ENUMERATED  # pyright: ignore[reportPrivateUsage]
+
+
+def test_codex_stream_sink(tmp_path: Path) -> None:
+    chunks: list[str] = []
+    sink = module._stream_sink(chunks.append, tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    # 1. turn.started
+    sink(json.dumps({"type": "turn.started"}))
+
+    # 2. item.started with agent_message text
+    sink(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {"type": "agent_message", "text": "start "},
+            }
+        )
+    )
+    assert chunks == ["start "]
+
+    # 3. item.updated with delta
+    sink(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "update ",
+            }
+        )
+    )
+    assert chunks == ["start ", "update "]
+
+    # 4. item.completed with cumulative text
+    sink(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "start update completed"},
+            }
+        )
+    )
+    assert chunks == ["start ", "update ", "completed"]
+
+    # 5. reasoning item is allowed without emitting or failing
+    sink(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "reasoning", "text": "thinking"},
+            }
+        )
+    )
+    assert chunks == ["start ", "update ", "completed"]
+
+    # 6. immediate halt if non-agent_message/reasoning item occurs
+    chunks.clear()
+    sink2 = module._stream_sink(chunks.append, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    sink2(json.dumps({"type": "turn.started"}))
+    sink2(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "ok",
+            }
+        )
+    )
+    assert chunks == ["ok"]
+    # Send a tool/other item
+    sink2(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {"type": "command_execution"},
+            }
+        )
+    )
+    # Subsequent message is ignored
+    sink2(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "ignored",
+            }
+        )
+    )
+    assert chunks == ["ok"]
+
+    # 7. immediate halt if denied marker exists
+    chunks.clear()
+    denied_marker = tmp_path / module._DENIED  # pyright: ignore[reportPrivateUsage]
+    denied_marker.touch()
+    sink3 = module._stream_sink(chunks.append, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    sink3(json.dumps({"type": "turn.started"}))
+    sink3(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "ignored",
+            }
+        )
+    )
+    assert chunks == []
+    denied_marker.unlink()
+
+
+def test_codex_complete_streaming(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_no_models(*_a: object, **_k: object) -> tuple[str, ...]:
+        return ()
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return ("codex",)
+
+    monkeypatch.setattr(module, "_enumerated_models", fake_no_models)
+    agent = Agent(cmd="codex")
+    adapter = CodexCompletionAdapter(agent, parent_env={})
+
+    events = [
+        {"type": "turn.started"},
+        {"type": "item.started", "item": {"type": "agent_message", "text": "first "}},
+        {"type": "item.updated", "item": {"type": "agent_message"}, "delta": "second"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "first second"}},
+        {"type": "turn.completed"},
+    ]
+    raw_lines = [json.dumps(e) for e in events]
+
+    def mock_run_process(cmd: Any, **kwargs: Any) -> ProcessResult:
+        entry = _OUTPUT_SINK.get()
+        if entry is not None:
+            sink, _ = entry
+            for line in raw_lines:
+                sink(line)
+        return ProcessResult(0, "\n".join(raw_lines))
+
+    monkeypatch.setattr(module, "run_process", mock_run_process)
+    monkeypatch.setattr(module, "resolve_command", fake_resolve)
+
+    chunks: list[str] = []
+    res = adapter.complete(
+        CompletionRequest("test", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=5,
+        max_output_bytes=10000,
+        on_chunk=chunks.append,
+    )
+    assert res.content == "first second"
+    assert chunks == ["first ", "second"]
+
+    # Also test with stream_completion_chunks
+    chunks_ctx: list[str] = []
+    with stream_completion_chunks(chunks_ctx.append):
+        res2 = adapter.complete(
+            CompletionRequest("test", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert res2.content == "first second"
+    assert chunks_ctx == ["first ", "second"]

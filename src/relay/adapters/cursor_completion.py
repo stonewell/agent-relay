@@ -16,12 +16,13 @@ import shlex
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
 from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
 from relay.adapters.completion import (
+    CompletionChunkSink,
     CompletionError,
     CompletionInvalid,
     CompletionModelOptions,
@@ -32,6 +33,7 @@ from relay.adapters.completion import (
     CompletionTerminationError,
     CompletionUsage,
     ObservedModel,
+    current_chunk_sink,
     model_aliases,
 )
 from relay.adapters.cursor import resolve_cursor_command, schema_instructions
@@ -246,7 +248,7 @@ class CursorCompletionAdapter:
         # Keep HOME/APPDATA/XDG_CONFIG_HOME unchanged; no credentials need copying.
         return build_env(self._agent, extra, parent_env=parent)
 
-    def arguments(self, request: CompletionRequest) -> tuple[str, ...]:
+    def arguments(self, request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
         try:
             model_aliases((request.model,))
         except ValueError as exc:
@@ -267,6 +269,8 @@ class CursorCompletionAdapter:
             # requested alias: bare base uses Cursor's default, legacy -low stays low.
             model = variants[request.effort]
         args = ["-p", "--mode", "ask", "--trust", "--output-format", "stream-json"]
+        if stream and request.output_schema is None:
+            args.append("--stream-partial-output")
         if model != "default":
             args += ["--model", model]
         return tuple(args)
@@ -279,9 +283,12 @@ class CursorCompletionAdapter:
         cancel: threading.Event,
         timeout_s: float,
         max_output_bytes: int,
+        on_chunk: CompletionChunkSink | None = None,
     ) -> CompletionResult:
         deadline = time.monotonic() + timeout_s
-        args = self.arguments(request)
+        chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
+        streaming = chunk_sink is not None and request.output_schema is None
+        args = self.arguments(request, stream=streaming)
         prompt = request.prompt
         if request.output_schema is not None:
             prompt += schema_instructions(request.output_schema)
@@ -295,10 +302,15 @@ class CursorCompletionAdapter:
             raise CompletionError("Could not prepare Cursor completion restrictions") from exc
         env = self._environment(config, data)
         command_name = resolve_cursor_command(self._agent.cmd, env)
+        line_sink = (
+            _stream_sink(chunk_sink, tool_marker)
+            if streaming and chunk_sink is not None
+            else discard_output
+        )
         try:
             with (
                 cancel_processes_when(cancel),
-                stream_output(discard_output, max_bytes=max_output_bytes),
+                stream_output(line_sink, max_bytes=max_output_bytes),
             ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -374,6 +386,72 @@ def _tool_activity(event: dict[str, Any]) -> bool:
         in {"tool_use", "tool_call", "tool_result", "function_call"}
         for block in cast("list[Any]", blocks)
     )
+
+
+def _assistant_text(event: dict[str, Any]) -> str | None:
+    message = event.get("message")
+    if isinstance(message, dict):
+        message_dict = cast("dict[str, Any]", message)
+        content = message_dict.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            content_list = cast("list[Any]", content)
+            blocks: list[str] = [
+                cast("str", cast("dict[str, Any]", block)["text"])
+                for block in content_list
+                if isinstance(block, dict)
+                and cast("dict[str, Any]", block).get("type") == "text"
+                and isinstance(cast("dict[str, Any]", block).get("text"), str)
+            ]
+            if blocks:
+                return "".join(blocks)
+    if isinstance(event.get("text"), str):
+        return cast("str", event["text"])
+    return None
+
+
+def _stream_sink(sink: CompletionChunkSink, tool_marker: Path) -> Callable[[str], None]:
+    emitted = ""
+    failed = False
+
+    def on_line(line: str) -> None:
+        nonlocal emitted, failed
+        if failed or not line.strip():
+            return
+        if tool_marker.exists():
+            failed = True
+            return
+        try:
+            raw_event: Any = json.loads(line)
+        except (ValueError, RecursionError):
+            failed = True
+            return
+        if not isinstance(raw_event, dict):
+            failed = True
+            return
+        event = cast("dict[str, Any]", raw_event)
+        if _tool_activity(event) or event.get("type") == "error":
+            failed = True
+            return
+        if event.get("type") == "assistant":
+            if "model_call_id" in event:
+                return
+            text = _assistant_text(event)
+            if not text:
+                return
+            if "timestamp_ms" in event:
+                emitted += text
+                sink(text)
+            elif not emitted:
+                emitted = text
+                sink(text)
+            elif text.startswith(emitted) and len(text) > len(emitted):
+                delta = text[len(emitted) :]
+                emitted = text
+                sink(delta)
+
+    return on_line
 
 
 def parse_completion(
