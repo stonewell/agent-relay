@@ -26,6 +26,8 @@ from relay.adapters.completion import (
     CompletionResult,
     CompletionUsage,
     ObservedModel,
+    current_chunk_sink,
+    stream_completion_chunks,
 )
 from relay.gateway import app as gateway_app
 from relay.gateway.app import GatewayLimits, RequestSummaryMiddleware, create_app
@@ -536,12 +538,133 @@ def test_real_http_post_keepalive_error(monkeypatch: pytest.MonkeyPatch) -> None
         )
         response = connection.getresponse()
         assert response.status == 200
-        assert response.readline() == b": keepalive\n"
+        heartbeat = response.readline()
+        assert heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
         backend.release.set()
         remainder = response.read()
         assert b'"error"' in remainder and b"[DONE]" not in remainder
         assert b'"finish_reason"' not in remainder
         connection.close()
+
+
+def test_real_http_heartbeat_prevents_client_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    backend = WaitingBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "x"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        heartbeat = response.readline()
+        assert heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+        backend.release.set()
+        remainder = response.read()
+        assert b"data: [DONE]\n\n" in remainder
+        connection.close()
+
+
+def test_real_http_stream_unexpected_backend_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+
+    class ExplodingBackend(WaitingBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            self.started.set()
+            self.scratch = cwd
+            try:
+                while not self.release.wait(0.01):
+                    if cancel.is_set():
+                        raise CompletionError("cancelled", status=503)
+                raise RuntimeError("private-backend-detail")
+            finally:
+                self.finished.set()
+
+    backend = ExplodingBackend()
+    with local_server(backend) as (port, _runtime):
+        # uvicorn's logging config sets the parent "uvicorn" logger to propagate=False;
+        # re-enable it so caplog sees the record emitted by the "uvicorn.error" child.
+        monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+        with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "model": "fake",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "x"}],
+                    }
+                ),
+                headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            heartbeat = response.readline()
+            assert (
+                heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+            )
+            backend.release.set()
+            remainder = response.read()
+            connection.close()
+    assert b'"internal_error"' in remainder
+    assert b'"server_error"' in remainder
+    assert b"[DONE]" not in remainder
+    assert b"private-backend-detail" not in remainder
+    assert b'"finish_reason"' not in remainder
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert "completion stream failed: RuntimeError" in messages
+
+
+def test_real_http_client_abort_is_attributed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    backend = WaitingBackend()
+    with local_server(backend) as (port, _runtime):
+        # uvicorn's logging config sets the parent "uvicorn" logger to propagate=False;
+        # re-enable it so caplog sees the record emitted by the "uvicorn.error" child.
+        monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+        with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "model": "fake",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "x"}],
+                    }
+                ),
+                headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            heartbeat = response.readline()
+            assert (
+                heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+            )
+            connection.close()
+            assert backend.finished.wait(2)
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert "completion stream cancelled by client heartbeats=1" in messages
 
 
 def test_real_http_chunked_body_limit() -> None:
@@ -667,3 +790,159 @@ def test_pinned_openai_sdk_real_http_tools_roundtrip_and_stream() -> None:
         )
         assert chunks[-1].choices == [] and chunks[-1].usage is not None
         assert chunks[-1].usage.total_tokens == 7
+
+
+def test_real_http_live_streaming_chunks() -> None:
+    first_chunk_received = threading.Event()
+
+    class LiveStreamingBackend(FakeBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            self.calls.append(request)
+            sink = current_chunk_sink()
+            assert sink is not None
+            sink("Hel")
+            assert first_chunk_received.wait(3)
+            sink("lo")
+            return CompletionResult(content="Hello")
+
+    backend = LiveStreamingBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert "text/event-stream" in response.getheader("Content-Type", "")
+
+        # Read line by line:
+        line1 = response.readline()
+        _ = response.readline()
+        chunk1 = json.loads(line1.removeprefix(b"data: "))
+        assert chunk1["choices"][0]["delta"] == {"role": "assistant"}
+
+        line2 = response.readline()
+        _ = response.readline()
+        chunk2 = json.loads(line2.removeprefix(b"data: "))
+        assert chunk2["choices"][0]["delta"] == {"content": "Hel"}
+
+        # Signal that the client has received the first chunk before backend finishes
+        first_chunk_received.set()
+
+        remainder = response.read()
+        connection.close()
+
+        assert b'"content":"lo"' in remainder or b'"content": "lo"' in remainder
+        assert b"data: [DONE]\n\n" in remainder
+
+
+def test_real_http_stream_invalid_unicode_before_headers() -> None:
+    class InvalidUnicodeEarlyBackend(FakeBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            sink = current_chunk_sink()
+            assert sink is not None
+            sink("\ud800")
+            return CompletionResult(content="Hello")
+
+    backend = InvalidUnicodeEarlyBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 502
+        body = json.loads(response.read())
+        assert body["error"]["code"] in ("invalid_completion", "completion_failed")
+        assert "invalid Unicode" in body["error"]["message"]
+        connection.close()
+
+
+def test_real_http_stream_invalid_unicode_after_first_chunk() -> None:
+    first_chunk_received = threading.Event()
+
+    class InvalidUnicodeLateBackend(FakeBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            sink = current_chunk_sink()
+            assert sink is not None
+            sink("valid")
+            assert first_chunk_received.wait(3)
+            sink("\ud800")
+            return CompletionResult(content="valid")
+
+    backend = InvalidUnicodeLateBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        line1 = response.readline()
+        _ = response.readline()
+        chunk1 = json.loads(line1.removeprefix(b"data: "))
+        assert chunk1["choices"][0]["delta"] == {"role": "assistant"}
+
+        line2 = response.readline()
+        _ = response.readline()
+        chunk2 = json.loads(line2.removeprefix(b"data: "))
+        assert chunk2["choices"][0]["delta"] == {"content": "valid"}
+
+        first_chunk_received.set()
+
+        remainder = response.read()
+        connection.close()
+
+        assert b'"error"' in remainder
+        assert b"invalid Unicode" in remainder
+        assert b"[DONE]" not in remainder
+
+
+def test_stream_completion_chunks_context() -> None:
+    chunks: list[str] = []
+    assert current_chunk_sink() is None
+    with stream_completion_chunks(chunks.append):
+        sink = current_chunk_sink()
+        assert sink is not None
+        sink("test")
+    assert current_chunk_sink() is None
+    assert chunks == ["test"]

@@ -18,7 +18,7 @@ from relay.gateway.render import (
     render_repair,
     render_transcript,
 )
-from relay.gateway.sse import completion_response, response_events
+from relay.gateway.sse import completion_response, heartbeat_event, response_events
 
 
 @pytest.mark.parametrize("bad", ["\ud800", "\udfff"])
@@ -344,6 +344,19 @@ def test_sse_reassembly_and_unique_call_ids() -> None:
         None,
     )
     assert call["id"] != other["choices"][0]["message"]["tool_calls"][0]["id"]
+
+
+def test_heartbeat_event_is_protocol_visible_chunk() -> None:
+    frame = heartbeat_event("chatcmpl-x", 7, "fake/opus")
+    assert frame.startswith(b"data: ") and frame.endswith(b"\n\n")
+    assert json.loads(frame[6:]) == {
+        "id": "chatcmpl-x",
+        "object": "chat.completion.chunk",
+        "created": 7,
+        "model": "fake/opus",
+        "choices": [{"index": 0, "delta": {}}],
+    }
+    assert b"finish_reason" not in frame
 
 
 def test_nonfinite_exponent_rejected_in_envelope_and_schema() -> None:

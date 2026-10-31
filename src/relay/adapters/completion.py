@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -17,6 +19,23 @@ class CompletionProfile:
     platform: str
     auth_mode: str
     config_digest: str
+
+
+CompletionChunkSink = Callable[[str], None]
+_CHUNK_SINK: ContextVar[CompletionChunkSink | None] = ContextVar("_CHUNK_SINK", default=None)
+
+
+def current_chunk_sink() -> CompletionChunkSink | None:
+    return _CHUNK_SINK.get()
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def stream_completion_chunks(sink: CompletionChunkSink | None) -> Iterator[None]:
+    token = _CHUNK_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _CHUNK_SINK.reset(token)
 
 
 DEFAULT_MODEL_ALIASES: tuple[str, ...] = ("default", "sonnet", "opus", "fable")

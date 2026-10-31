@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from http import HTTPStatus
@@ -38,10 +38,18 @@ from .models import ModelCatalog
 from .protocol import GatewayError, parse_request
 from .render import render_transcript
 from .runtime import CompletionHandle, GatewayLimits, GatewayRuntime
-from .sse import completion_response, event, response_events
+from .sse import (
+    chunk_event,
+    completion_response,
+    event,
+    heartbeat_event,
+    response_events,
+    usage_event,
+)
 
 __all__ = ["GatewayLimits", "create_app"]
-KEEPALIVE_INTERVAL = 15.0
+# Client stall timers are finite: a 15 s cadence raced the observed ~15 s client tolerance.
+KEEPALIVE_INTERVAL = 5.0
 TRANSPORT_CHUNK_BYTES = 16384
 HTTP_MESSAGES = {404: "route not found", 405: "method not allowed"}
 logger = logging.getLogger("uvicorn.error")
@@ -460,15 +468,40 @@ def create_app(
             except BaseException:
                 await cleanup()
                 raise
-        # Keep failures before the first keepalive as ordinary HTTP errors.
+        # Keep failures before the first keepalive or live chunk as ordinary HTTP errors.
+        buffered: dict[str, Any] | None = None
+        first_chunk: str | None = None
+        chunk_task: asyncio.Task[str | None] | None = (
+            asyncio.create_task(handle.chunks.get()) if schema is None else None
+        )
         try:
-            done, _pending = await asyncio.wait({handle.result}, timeout=KEEPALIVE_INTERVAL)
-            if done:
+            wait_set: set[asyncio.Task[Any]] = {handle.result}
+            if chunk_task is not None:
+                wait_set.add(chunk_task)
+            done, _pending = await asyncio.wait(
+                wait_set,
+                timeout=KEEPALIVE_INTERVAL,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if handle.result in done:
+                if chunk_task is not None and not chunk_task.done():
+                    chunk_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await chunk_task
+                chunk_task = None
                 result = handle.result.result()
                 buffered = final(result)
-            else:
-                buffered = None
+            elif chunk_task is not None and chunk_task in done:
+                first_chunk = chunk_task.result()
+                chunk_task = None
+                if first_chunk is None:
+                    result = await handle.result
+                    buffered = final(result)
         except BaseException:
+            if chunk_task is not None and not chunk_task.done():
+                chunk_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await chunk_task
             await cleanup()
             raise
 
@@ -479,20 +512,123 @@ def create_app(
             await watcher
 
         async def stream() -> AsyncIterator[bytes]:
+            nonlocal chunk_task
+            heartbeats = 0
+            include_usage = bool(parsed.stream_options and parsed.stream_options.include_usage)
+
+            def Slice(data: bytes) -> Iterator[bytes]:
+                for offset in range(0, len(data), TRANSPORT_CHUNK_BYTES):
+                    yield data[offset : offset + TRANSPORT_CHUNK_BYTES]
+
             try:
-                response = buffered
-                if response is None:
+                if buffered is not None:
+                    for data in response_events(buffered, include_usage):
+                        for piece in Slice(data):
+                            yield piece
+                    return
+
+                if schema is not None:
                     while not handle.result.done():
-                        yield b": keepalive\n\n"
+                        yield heartbeat_event(completion_id, created, parsed.model)
+                        heartbeats += 1
                         await asyncio.wait({handle.result}, timeout=KEEPALIVE_INTERVAL)
                     response = final(handle.result.result())
-                include_usage = bool(parsed.stream_options and parsed.stream_options.include_usage)
-                for data in response_events(response, include_usage):
-                    for offset in range(0, len(data), TRANSPORT_CHUNK_BYTES):
-                        yield data[offset : offset + TRANSPORT_CHUNK_BYTES]
+                    for data in response_events(response, include_usage):
+                        for piece in Slice(data):
+                            yield piece
+                    return
+
+                role_sent = False
+                if first_chunk is not None:
+                    for piece in Slice(
+                        chunk_event(completion_id, created, parsed.model, {"role": "assistant"})
+                    ):
+                        yield piece
+                    role_sent = True
+                    for piece in Slice(
+                        chunk_event(completion_id, created, parsed.model, {"content": first_chunk})
+                    ):
+                        yield piece
+
+                while True:
+                    if chunk_task is None:
+                        chunk_task = asyncio.create_task(handle.chunks.get())
+                    done, _pending = await asyncio.wait({chunk_task}, timeout=KEEPALIVE_INTERVAL)
+                    if not done:
+                        yield heartbeat_event(completion_id, created, parsed.model)
+                        heartbeats += 1
+                        continue
+                    item = chunk_task.result()
+                    chunk_task = None
+                    if item is None:
+                        break
+                    if not role_sent:
+                        for piece in Slice(
+                            chunk_event(completion_id, created, parsed.model, {"role": "assistant"})
+                        ):
+                            yield piece
+                        role_sent = True
+                    for piece in Slice(
+                        chunk_event(completion_id, created, parsed.model, {"content": item})
+                    ):
+                        yield piece
+
+                result = await handle.result
+                if not role_sent:
+                    response = final(result)
+                    for data in response_events(response, include_usage):
+                        for piece in Slice(data):
+                            yield piece
+                    return
+
+                content = result.content or ""
+                streamed = handle.streamed_content
+                if content.startswith(streamed):
+                    remainder = content[len(streamed) :]
+                elif not streamed:
+                    remainder = content
+                else:
+                    remainder = ""
+                if remainder:
+                    for piece in Slice(
+                        chunk_event(completion_id, created, parsed.model, {"content": remainder})
+                    ):
+                        yield piece
+                for piece in Slice(
+                    chunk_event(completion_id, created, parsed.model, {}, result.finish_reason)
+                ):
+                    yield piece
+                if include_usage and result.usage is not None:
+                    for piece in Slice(
+                        usage_event(completion_id, created, parsed.model, result.usage.as_openai())
+                    ):
+                        yield piece
+                yield b"data: [DONE]\n\n"
             except CompletionError as exc:
                 yield event(GatewayError(exc.status, str(exc), exc.param, exc.code).body())
+            except asyncio.CancelledError:
+                # Client went away (or the server is shutting down): attribute it, then let the
+                # cancellation propagate so `finally` still drains the handle and releases the slot.
+                logger.debug("completion stream cancelled by client heartbeats=%d", heartbeats)
+                raise
+            except Exception as exc:
+                # Unexpected backend failure: terminate the stream with a protocol-visible error
+                # frame instead of truncating it. Only the exception type is logged; messages can
+                # carry private prompt/completion content.
+                logger.error("completion stream failed: %s", type(exc).__name__)
+                yield event(
+                    GatewayError(
+                        500,
+                        "internal gateway error",
+                        code="internal_error",
+                        error_type="server_error",
+                    ).body()
+                )
             finally:
+                if chunk_task is not None and not chunk_task.done():
+                    chunk_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await chunk_task
                 await cleanup()
 
         return StreamingResponse(
