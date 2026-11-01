@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ from relay.adapters.completion import (
     ObservedModel,
     stream_completion_chunks,
 )
-from relay.core.platform.proc import ProcessResult
+from relay.core.platform.proc import ProcessCancelled, ProcessResult
 from relay.core.registry import Agent, Config
 from relay.gateway.discovery import default_adapters
 from relay.gateway.models import ModelCatalog
@@ -733,6 +734,337 @@ def test_agy_complete_streaming_and_tool_detection(
     with pytest.raises(CompletionError) as exc_info3:
         parse_completion(proc_subagent, structured=False)
     assert exc_info3.value.code == "backend_tool_use"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_agy_watcher_cancels_process_when_deny_tools_used_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    agent = Agent(cmd=sys.executable)
+    adapter = AgyCompletionAdapter(agent)
+    marker = tmp_path / ".agents" / "deny_tools.used"
+
+    # Child process touches deny_tools.used and then sleeps
+    code = (
+        "import pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "time.sleep(10)\n"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code, str(marker))
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+
+    chunks: list[str] = []
+    on_chunk = chunks.append if streaming else None
+
+    start = time.monotonic()
+    with pytest.raises(CompletionError) as exc_info:
+        adapter.complete(
+            CompletionRequest("hello", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=10.0,
+            max_output_bytes=10000,
+            on_chunk=on_chunk,
+        )
+    duration = time.monotonic() - start
+
+    assert duration < 3.0, f"Process took {duration}s, did not cancel promptly"
+    assert exc_info.value.code == "backend_tool_use"
+    assert exc_info.value.status == 502
+    assert isinstance(exc_info.value.__cause__, ProcessCancelled)
+    assert marker.exists()
+
+
+def test_agy_stream_sink_triggers_cancellation_on_tool_activity(tmp_path: Path) -> None:
+    chunks: list[str] = []
+    cancel_event = threading.Event()
+    tool_detected = threading.Event()
+    marker = tmp_path / "deny_tools.used"
+
+    sink = agy_completion._stream_sink(  # pyright: ignore[reportPrivateUsage]
+        chunks.append,
+        tool_marker=marker,
+        cancel_event=cancel_event,
+        tool_detected=tool_detected,
+    )
+
+    # Regular agent text chunk passes through
+    sink(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "agent_response", "text_delta": "Hello"},
+            }
+        )
+    )
+    assert chunks == ["Hello"]
+    assert not cancel_event.is_set()
+    assert not tool_detected.is_set()
+
+    # Tool activity triggers cancel_event and tool_detected
+    sink(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "tool", "tool_name": "run_command"},
+            }
+        )
+    )
+    assert cancel_event.is_set()
+    assert tool_detected.is_set()
+
+    # Further text is ignored
+    sink(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "agent_response", "text_delta": " world"},
+            }
+        )
+    )
+    assert chunks == ["Hello"]
+
+    # Also test tool_marker exists triggers cancel_event and tool_detected
+    chunks.clear()
+    cancel_event2 = threading.Event()
+    tool_detected2 = threading.Event()
+    marker.touch()
+    sink2 = agy_completion._stream_sink(  # pyright: ignore[reportPrivateUsage]
+        chunks.append,
+        tool_marker=marker,
+        cancel_event=cancel_event2,
+        tool_detected=tool_detected2,
+    )
+    sink2(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "agent_response", "text_delta": "ignored"},
+            }
+        )
+    )
+    assert chunks == []
+    assert cancel_event2.is_set()
+    assert tool_detected2.is_set()
+    marker.unlink()
+
+
+def test_agy_streaming_tool_activity_stdout_cancels_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = Agent(cmd=sys.executable)
+    adapter = AgyCompletionAdapter(agent)
+
+    # Child process prints a tool activity event and sleeps
+    code = (
+        "import json, sys, time\n"
+        "print(json.dumps({'event': 'step_update', 'step_update': {'step_type': 'tool', 'tool_name': 'bash'}}), flush=True)\n"
+        "time.sleep(10)\n"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+
+    chunks: list[str] = []
+    start = time.monotonic()
+    with pytest.raises(CompletionError) as exc_info:
+        adapter.complete(
+            CompletionRequest("hello", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=10.0,
+            max_output_bytes=10000,
+            on_chunk=chunks.append,
+        )
+    duration = time.monotonic() - start
+
+    assert duration < 3.0, f"Process took {duration}s, did not cancel promptly"
+    assert exc_info.value.code == "backend_tool_use"
+    assert exc_info.value.status == 502
+    assert isinstance(exc_info.value.__cause__, ProcessCancelled)
+
+
+def test_agy_caller_cancel_raises_request_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = Agent(cmd=sys.executable)
+    adapter = AgyCompletionAdapter(agent)
+
+    # 1. Caller cancel event is pre-set before calling complete
+    cancel_preset = threading.Event()
+    cancel_preset.set()
+    with pytest.raises(CompletionError) as exc_info_preset:
+        adapter.complete(
+            CompletionRequest("hello", "default"),
+            cwd=tmp_path,
+            cancel=cancel_preset,
+            timeout_s=10.0,
+            max_output_bytes=10000,
+        )
+    assert exc_info_preset.value.code == "request_cancelled"
+    assert exc_info_preset.value.status == 503
+
+    # 2. Caller cancel event is set during process execution (mid-flight disconnect)
+    code = "import time; time.sleep(10)\n"
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+
+    cancel_mid = threading.Event()
+    timer = threading.Timer(0.05, cancel_mid.set)
+    timer.start()
+
+    start = time.monotonic()
+    try:
+        with pytest.raises(CompletionError) as exc_info_mid:
+            adapter.complete(
+                CompletionRequest("hello", "default"),
+                cwd=tmp_path,
+                cancel=cancel_mid,
+                timeout_s=10.0,
+                max_output_bytes=10000,
+            )
+    finally:
+        timer.cancel()
+    duration = time.monotonic() - start
+
+    assert duration < 3.0, f"Process took {duration}s, did not cancel promptly"
+    assert exc_info_mid.value.code == "request_cancelled"
+    assert exc_info_mid.value.status == 503
+    assert isinstance(exc_info_mid.value.__cause__, ProcessCancelled)
+
+
+def test_agy_watcher_thread_cleanly_terminates_without_leaking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_threads: list[TrackingThread] = []
+    orig_thread = threading.Thread
+
+    class TrackingThread(orig_thread):
+        target_func: Any
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.target_func = kwargs.get("target") or (args[0] if args else None)
+            captured_threads.append(self)
+
+    monkeypatch.setattr(agy_completion.threading, "Thread", TrackingThread)
+
+    agent = Agent(cmd=sys.executable)
+    adapter = AgyCompletionAdapter(agent)
+
+    # 1. Normal completion scenario
+    success_json = json.dumps({"status": "SUCCESS", "response": "ok"})
+    code_success = f"import sys; print({success_json!r})\n"
+
+    def fake_resolve_success(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code_success)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve_success)
+    adapter.complete(
+        CompletionRequest("hello", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=5.0,
+        max_output_bytes=10000,
+    )
+
+    watcher_normal = [
+        t for t in captured_threads if getattr(t.target_func, "__name__", "") == "_watch_marker"
+    ]
+    assert len(watcher_normal) == 1
+    assert not watcher_normal[0].is_alive()
+
+    # 2. Cancelled via tool marker
+    captured_threads.clear()
+    marker = tmp_path / ".agents" / "deny_tools.used"
+    code_marker = (
+        "import pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "time.sleep(10)\n"
+    )
+
+    def fake_resolve_marker(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code_marker, str(marker))
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve_marker)
+    with pytest.raises(CompletionError):
+        adapter.complete(
+            CompletionRequest("hello", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5.0,
+            max_output_bytes=10000,
+        )
+
+    watcher_marker = [
+        t for t in captured_threads if getattr(t.target_func, "__name__", "") == "_watch_marker"
+    ]
+    assert len(watcher_marker) == 1
+    assert not watcher_marker[0].is_alive()
+
+    # 3. Cancelled via client disconnect
+    captured_threads.clear()
+    code_sleep = "import time; time.sleep(10)\n"
+
+    def fake_resolve_sleep(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code_sleep)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve_sleep)
+    cancel_evt = threading.Event()
+    timer = orig_thread(target=lambda: (time.sleep(0.05), cancel_evt.set()))
+    timer.start()
+    try:
+        with pytest.raises(CompletionError):
+            adapter.complete(
+                CompletionRequest("hello", "default"),
+                cwd=tmp_path,
+                cancel=cancel_evt,
+                timeout_s=5.0,
+                max_output_bytes=10000,
+            )
+    finally:
+        timer.join()
+
+    watcher_cancel = [
+        t for t in captured_threads if getattr(t.target_func, "__name__", "") == "_watch_marker"
+    ]
+    assert len(watcher_cancel) == 1
+    assert not watcher_cancel[0].is_alive()
+
+    # 4. Cancelled via tool event in stdout stream
+    captured_threads.clear()
+    tool_json = json.dumps(
+        {"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "bash"}}
+    )
+    code_tool = f"import sys, time; print({tool_json!r}, flush=True); time.sleep(10)\n"
+
+    def fake_resolve_tool(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code_tool)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve_tool)
+    chunks: list[str] = []
+    with pytest.raises(CompletionError):
+        adapter.complete(
+            CompletionRequest("hello", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5.0,
+            max_output_bytes=10000,
+            on_chunk=chunks.append,
+        )
+    watcher_stream = [
+        t for t in captured_threads if getattr(t.target_func, "__name__", "") == "_watch_marker"
+    ]
+    assert len(watcher_stream) == 1
+    assert not watcher_stream[0].is_alive()
 
 
 def test_agy_completion_prompt_limit(tmp_path: Path) -> None:

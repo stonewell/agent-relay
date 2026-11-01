@@ -367,7 +367,10 @@ def _tool_activity(event: dict[str, Any]) -> bool:
 
 
 def _stream_sink(
-    sink: CompletionChunkSink, tool_marker: Path | None = None
+    sink: CompletionChunkSink,
+    tool_marker: Path | None = None,
+    cancel_event: threading.Event | None = None,
+    tool_detected: threading.Event | None = None,
 ) -> Callable[[str], None]:
     emitted = ""
     failed = False
@@ -378,6 +381,10 @@ def _stream_sink(
             return
         if tool_marker is not None and tool_marker.exists():
             failed = True
+            if tool_detected is not None:
+                tool_detected.set()
+            if cancel_event is not None:
+                cancel_event.set()
             return
         line = line.strip()
         if not line:
@@ -391,6 +398,10 @@ def _stream_sink(
         event = cast("dict[str, Any]", raw_event)
         if _tool_activity(event):
             failed = True
+            if tool_detected is not None:
+                tool_detected.set()
+            if cancel_event is not None:
+                cancel_event.set()
             return
         if event.get("event") == "result" and isinstance(event.get("result"), dict):
             res = cast("dict[str, Any]", event["result"])
@@ -550,14 +561,46 @@ class AgyCompletionAdapter:
         except OSError as exc:
             raise CompletionError("Could not prepare Antigravity completion restrictions") from exc
 
+        if cancel.is_set():
+            raise CompletionError(
+                "Completion cancelled", status=503, code="request_cancelled"
+            )
+        if tool_marker.exists():
+            raise CompletionError(
+                "Antigravity attempted model-side tools", code="backend_tool_use"
+            )
+
+        process_cancel = threading.Event()
+        tool_detected = threading.Event()
+        stop_watcher = threading.Event()
+
+        def _watch_marker() -> None:
+            while not stop_watcher.is_set() and not process_cancel.is_set():
+                if cancel.is_set():
+                    process_cancel.set()
+                    return
+                if tool_marker.exists():
+                    tool_detected.set()
+                    process_cancel.set()
+                    return
+                stop_watcher.wait(0.05)
+
         line_sink = (
-            _stream_sink(chunk_sink, tool_marker)
+            _stream_sink(
+                chunk_sink,
+                tool_marker,
+                cancel_event=process_cancel,
+                tool_detected=tool_detected,
+            )
             if streaming and chunk_sink is not None
             else discard_output
         )
+
+        watcher_thread = threading.Thread(target=_watch_marker, daemon=True)
+        watcher_thread.start()
         try:
             with (
-                cancel_processes_when(cancel),
+                cancel_processes_when(process_cancel),
                 stream_output(line_sink, max_bytes=max_output_bytes),
             ):
                 env = self._environment()
@@ -571,9 +614,13 @@ class AgyCompletionAdapter:
                     cwd=cwd,
                 )
                 proc = run_process(command, cwd=cwd, env=env, timeout_s=remaining)
-            if tool_marker.exists():
+            if tool_marker.exists() or tool_detected.is_set():
                 raise CompletionError(
                     "Antigravity attempted model-side tools", code="backend_tool_use"
+                )
+            if cancel.is_set():
+                raise CompletionError(
+                    "Completion cancelled", status=503, code="request_cancelled"
                 )
             return parse_completion(
                 proc,
@@ -589,6 +636,10 @@ class AgyCompletionAdapter:
             print(message, file=sys.stderr)
             raise CompletionError(message, status=503, code="unavailable") from exc
         except ProcessCancelled as exc:
+            if tool_marker.exists() or tool_detected.is_set():
+                raise CompletionError(
+                    "Antigravity attempted model-side tools", code="backend_tool_use"
+                ) from exc
             raise CompletionError(
                 "Completion cancelled", status=503, code="request_cancelled"
             ) from exc
@@ -598,6 +649,9 @@ class AgyCompletionAdapter:
             ) from exc
         except ProcessDrainError as exc:
             raise CompletionTerminationError() from exc
+        finally:
+            stop_watcher.set()
+            watcher_thread.join()
 
 
 def _parse_candidate(raw: str) -> dict[str, Any] | None:
