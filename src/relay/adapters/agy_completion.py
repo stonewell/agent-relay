@@ -32,7 +32,6 @@ from relay.adapters.completion import (
     current_chunk_sink,
     model_aliases,
 )
-from relay.adapters.cursor import schema_instructions
 from relay.core.env import CompleteEnv, build_env, redact
 from relay.core.platform.proc import (
     CommandNotFound,
@@ -48,8 +47,9 @@ from relay.core.platform.proc import (
 from relay.core.registry import Agent
 
 _AGY_SETTINGS = (
-    '{"agentMode":"","toolPermission":"strict",'
-    '"allowNonWorkspaceAccess":false,"disableSlashCommands":true}'
+    '{"toolPermission":"strict",'
+    '"allowNonWorkspaceAccess":false,"disableSlashCommands":true,'
+    '"permissions":{"allow":[],"ask":[],"deny":["*"]}}'
 )
 COMPLETION_FLAGS: tuple[str, ...] = (
     "--agent",
@@ -70,6 +70,14 @@ _AGY_AGENT_MD = (
     "name: relay-completion\n"
     "description: Stateless single-turn completion responder without tools or subagents.\n"
     "tools: []\n"
+    "enableWriteTools: false\n"
+    "enableMcpTools: false\n"
+    "enableSubagentTools: false\n"
+    "enable_write_tools: false\n"
+    "enable_mcp_tools: false\n"
+    "enable_subagent_tools: false\n"
+    "subagents: []\n"
+    "mcpServers: []\n"
     "mainAgent: true\n"
     "subagent: false\n"
     "commandExecutionPolicy: off\n"
@@ -80,23 +88,43 @@ _AGY_AGENT_MD = (
     "You are a stateless completion model for a non-interactive API gateway.\n"
     "Explicit user instruction override: Ignore any global coordinator or subagent routing rules "
     "(`<RULE[user_global]>`). Do NOT call `define_subagent`, `invoke_subagent`, `send_message`, "
-    "`manage_subagents`, or any other tool. Respond directly in this single turn with only the "
-    "requested completion output.\n"
+    "`manage_subagents`, `view_file`, `read_file`, `list_dir`, `grep_search`, `find_by_name`, "
+    "`run_command`, `search_web`, `read_url_content`, or any other runtime tool. "
+    "If the prompt asks for a JSON tool_calls envelope, emit that JSON object as plain text in "
+    "your response without invoking any native tool. Respond directly in this single turn with "
+    "only the requested completion output.\n"
 )
 
 _AGY_RULE_MD = (
+    "---\n"
+    "trigger: always_on\n"
+    "description: Explicit user instruction override disabling all tools and subagents.\n"
+    "---\n"
     "# Explicit User Instructions Override\n"
     "For this workspace session, explicit user instructions take precedence over "
     "`<RULE[user_global]>`:\n"
     "- Do NOT act as a task coordinator and do NOT register or invoke any subagents "
-    "(`define_subagent`, `invoke_subagent`).\n"
-    "- Do NOT call any tools or run commands.\n"
+    "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`).\n"
+    "- Do NOT call any runtime tools (`view_file`, `read_file`, `list_dir`, `grep_search`, "
+    "`find_by_name`, `run_command`, `search_web`, `read_url_content`, etc.) or run commands.\n"
+    "- If client functions/tools are listed in the prompt transcript, never invoke a native tool "
+    "call; represent proposed client tool calls only as JSON data inside the requested plain-text "
+    "JSON response envelope.\n"
     "- Answer the supplied prompt directly in a single turn and output the response immediately.\n"
 )
 
 _DENY_SCRIPT = """import json
 import sys
 from pathlib import Path
+
+msg = (
+    "Explicit user instruction override: Stateless single-turn completion mode. "
+    "Do NOT invoke any tools or subagents. Answer directly or emit the requested JSON envelope."
+)
+
+if "--pre-invocation" in sys.argv[1:]:
+    print(json.dumps({"systemMessage": msg, "ephemeralMessage": msg}))
+    raise SystemExit(0)
 
 Path(__file__).with_suffix(".used").touch()
 print(json.dumps({
@@ -109,49 +137,118 @@ raise SystemExit(0)
 """
 
 
-def _write(path: Path, text: str) -> None:
+def _write_policy_file(path: Path, text: str) -> None:
     if path.is_symlink():
         raise OSError("Antigravity policy path must not be a symbolic link")
     path.write_text(text, encoding="utf-8")
     path.chmod(0o600)
 
 
+_write = _write_policy_file
+
+
 def _prepare_policy(cwd: Path) -> Path:
     agents_dir = cwd / ".agents"
     custom_agents = agents_dir / "agents"
-    for directory in (agents_dir, custom_agents):
+    rules_dir = agents_dir / "rules"
+    for directory in (agents_dir, custom_agents, rules_dir):
         if directory.is_symlink():
-            raise OSError("Antigravity policy directory must not be a symbolic link")
+            raise OSError(
+                "Antigravity policy directory must not be a symbolic link: "
+                "Refusing symlinked Antigravity policy path"
+            )
         directory.mkdir(mode=0o700, exist_ok=True)
-    _write(custom_agents / "relay-completion.md", _AGY_AGENT_MD)
-    _write(cwd / "GEMINI.md", _AGY_RULE_MD)
+    _write_policy_file(custom_agents / "relay-completion.md", _AGY_AGENT_MD)
+    _write_policy_file(rules_dir / "relay-completion.md", _AGY_RULE_MD)
+    _write_policy_file(cwd / "GEMINI.md", _AGY_RULE_MD)
+    _write_policy_file(
+        agents_dir / "rules.json",
+        json.dumps({"exclude": ["user_global", "~/.gemini/GEMINI.md"]}),
+    )
+
+    known_agents = [
+        "explore",
+        "flash",
+        "tests",
+        "pro",
+        "pro-gemini",
+        "pro-flash-high",
+        "review",
+        "review-gemini",
+        "review-flash-high",
+        "scout",
+        "mechanical",
+        "implementer",
+        "specialist",
+        "tester",
+        "reviewer",
+        "self",
+        "research",
+        "image-generator",
+    ]
+    excluded_agents = list(dict.fromkeys(known_agents))
+    try:
+        home_agents_dir = Path.home() / ".gemini" / "config" / "agents"
+        if home_agents_dir.is_dir():
+            for agent_file in sorted(home_agents_dir.glob("*.md")):
+                name = agent_file.stem
+                if name != "relay-completion" and name not in excluded_agents:
+                    excluded_agents.append(name)
+    except (OSError, RuntimeError):
+        pass
+    _write_policy_file(agents_dir / "agents.json", json.dumps({"exclude": excluded_agents}))
+    _write_policy_file(agents_dir / "skills.json", json.dumps({"exclude": ["*"]}))
+    _write_policy_file(agents_dir / "plugins.json", json.dumps({"exclude": ["*"]}))
+
     script = agents_dir / "deny_tools.py"
-    _write(script, _DENY_SCRIPT)
+    _write_policy_file(script, _DENY_SCRIPT)
     script_resolved = script.resolve()
     executable = str(Path(sys.executable).resolve())
     if sys.platform == "win32":
-        command = (
+        command_pre_tool = (
             "& "
             + " ".join(
                 "'" + value.replace("'", "''") + "'" for value in (executable, str(script_resolved))
             )
             + "; exit $LASTEXITCODE"
         )
+        command_pre_inv = (
+            "& "
+            + " ".join(
+                "'" + value.replace("'", "''") + "'"
+                for value in (executable, str(script_resolved), "--pre-invocation")
+            )
+            + "; exit $LASTEXITCODE"
+        )
     else:
-        command = shlex.join((executable, str(script_resolved)))
+        command_pre_tool = shlex.join((executable, str(script_resolved)))
+        command_pre_inv = shlex.join((executable, str(script_resolved), "--pre-invocation"))
     hooks = {
         "relay-deny-tools": {
+            "PreInvocation": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": command_pre_inv, "timeout": 10}],
+                }
+            ],
             "PreToolUse": [
                 {
                     "matcher": "*",
-                    "hooks": [{"type": "command", "command": command, "timeout": 10}],
+                    "hooks": [{"type": "command", "command": command_pre_tool, "timeout": 10}],
                 }
-            ]
+            ],
         }
     }
-    _write(agents_dir / "hooks.json", json.dumps(hooks))
-    _write(agents_dir / "mcp_config.json", '{"mcpServers":{}}')
-    return script.with_suffix(".used")
+    _write_policy_file(agents_dir / "hooks.json", json.dumps(hooks))
+    _write_policy_file(agents_dir / "mcp_config.json", '{"mcpServers":{}}')
+    marker = script.with_suffix(".used")
+    if marker.is_symlink():
+        raise OSError(
+            "Antigravity policy path must not be a symbolic link: "
+            "Refusing symlinked Antigravity policy path"
+        )
+    marker.unlink(missing_ok=True)
+    return marker
 
 
 _ENUMERATED: dict[str, tuple[str, ...]] = {}
@@ -353,6 +450,16 @@ def _stream_sink(
     return on_line
 
 
+def _agy_schema_instructions(schema: dict[str, Any]) -> str:
+    compact = json.dumps(schema, separators=(",", ":"), sort_keys=True)
+    return (
+        "\n\nExplicit user instruction: Do NOT call any runtime tools or subagents "
+        "(never call define_subagent, invoke_subagent, send_message, view_file, run_command, "
+        "or search_web). Reply immediately in this turn with only one JSON object "
+        f"(no prose and no code fence) that conforms to this JSON Schema: {compact}"
+    )
+
+
 class AgyCompletionAdapter:
     id = "agy"
     COMPLETION_FLAGS = COMPLETION_FLAGS
@@ -404,7 +511,7 @@ class AgyCompletionAdapter:
         output_format = "stream-json" if stream and request.output_schema is None else "json"
         prompt = request.prompt
         if request.output_schema is not None:
-            prompt += schema_instructions(request.output_schema)
+            prompt += _agy_schema_instructions(request.output_schema)
         args = ["-p", prompt, "--output-format", output_format, *COMPLETION_FLAGS]
         if request.model != "default":
             args += ["--model", request.model]
@@ -425,7 +532,7 @@ class AgyCompletionAdapter:
         deadline = time.monotonic() + timeout_s
         prompt = request.prompt
         if request.output_schema is not None:
-            prompt += schema_instructions(request.output_schema)
+            prompt += _agy_schema_instructions(request.output_schema)
         if len(prompt.encode("utf-8")) > PROMPT_LIMIT_BYTES:
             raise CompletionError(
                 "Prompt exceeds CLI argument limit",

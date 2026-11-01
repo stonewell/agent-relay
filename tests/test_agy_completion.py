@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,8 @@ from relay.core.platform.proc import ProcessResult
 from relay.core.registry import Agent, Config
 from relay.gateway.discovery import default_adapters
 from relay.gateway.models import ModelCatalog
+from relay.gateway.protocol import ChatRequest, FunctionDefinition, Message, Tool
+from relay.gateway.render import render_transcript
 
 
 def agy_response(**values: Any) -> ProcessResult:
@@ -94,60 +98,333 @@ def test_agy_completion_adapter_arguments() -> None:
     assert "--json-schema" not in args_schema_stream
 
 
+def test_agy_settings_and_completion_flags() -> None:
+    settings_raw: str = agy_completion._AGY_SETTINGS  # pyright: ignore[reportPrivateUsage]
+    assert '"agentMode":""' not in settings_raw
+    assert "agentMode" not in settings_raw
+    assert '"permissions":{"allow":[],"ask":[],"deny":["*"]}' in settings_raw
+
+    settings: dict[str, Any] = json.loads(settings_raw)
+    assert "agentMode" not in settings
+    assert settings["permissions"] == {"allow": [], "ask": [], "deny": ["*"]}
+    assert settings["toolPermission"] == "strict"
+    assert settings["allowNonWorkspaceAccess"] is False
+    assert settings["disableSlashCommands"] is True
+
+    expected_flags = (
+        "--agent",
+        "relay-completion",
+        "--disable-slash-commands",
+        "--sandbox",
+        "--settings",
+        settings_raw,
+    )
+    assert expected_flags == COMPLETION_FLAGS
+    for flag in COMPLETION_FLAGS:
+        assert "agentMode" not in flag
+        assert "plan" not in flag
+        assert "--mode" not in flag
+
+
 def test_agy_prepare_policy(tmp_path: Path) -> None:
+    stale_marker = tmp_path / ".agents" / "deny_tools.used"
+    stale_marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stale_marker.touch()
+    assert stale_marker.exists()
+
     marker = agy_completion._prepare_policy(tmp_path)  # pyright: ignore[reportPrivateUsage]
-    assert marker == tmp_path / ".agents" / "deny_tools.used"
+    assert marker == stale_marker
     assert not marker.exists()
 
     agents_dir = tmp_path / ".agents"
     custom_agents = agents_dir / "agents"
-    assert agents_dir.is_dir()
-    assert custom_agents.is_dir()
-    assert (agents_dir.stat().st_mode & 0o777) == 0o700
-    assert (custom_agents.stat().st_mode & 0o777) == 0o700
+    rules_dir = agents_dir / "rules"
+    for directory in (agents_dir, custom_agents, rules_dir):
+        assert directory.is_dir()
+        if sys.platform != "win32":
+            assert (directory.stat().st_mode & 0o777) == 0o700
 
     policy_files = [
         custom_agents / "relay-completion.md",
+        rules_dir / "relay-completion.md",
         tmp_path / "GEMINI.md",
+        agents_dir / "rules.json",
+        agents_dir / "agents.json",
+        agents_dir / "skills.json",
+        agents_dir / "plugins.json",
         agents_dir / "hooks.json",
         agents_dir / "deny_tools.py",
         agents_dir / "mcp_config.json",
     ]
     for file_path in policy_files:
         assert file_path.is_file()
-        assert (file_path.stat().st_mode & 0o777) == 0o600
+        if sys.platform != "win32":
+            assert (file_path.stat().st_mode & 0o777) == 0o600
 
-    assert "relay-completion" in (custom_agents / "relay-completion.md").read_text(encoding="utf-8")
-    assert "Explicit User Instructions Override" in (tmp_path / "GEMINI.md").read_text(
-        encoding="utf-8"
+    # 1. relay-completion.md contains tools: [] and enableSubagentTools: false
+    agent_text = (custom_agents / "relay-completion.md").read_text(encoding="utf-8")
+    assert "name: relay-completion" in agent_text
+    assert "tools: []" in agent_text
+    assert "enableSubagentTools: false" in agent_text
+    assert "enable_subagent_tools: false" in agent_text
+    assert "commandExecutionPolicy: off" in agent_text
+    assert "<RULE[user_global]>" in agent_text
+    assert "define_subagent" in agent_text
+    assert "invoke_subagent" in agent_text
+    assert "send_message" in agent_text
+
+    # 2. GEMINI.md and rules/relay-completion.md with trigger: always_on
+    rule_text = (rules_dir / "relay-completion.md").read_text(encoding="utf-8")
+    gemini_text = (tmp_path / "GEMINI.md").read_text(encoding="utf-8")
+    assert "trigger: always_on" in rule_text
+    assert "trigger: always_on" in gemini_text
+    assert "Explicit User Instructions Override" in rule_text
+    assert "Explicit User Instructions Override" in gemini_text
+    assert "<RULE[user_global]>" in rule_text
+    assert "<RULE[user_global]>" in gemini_text
+    assert "define_subagent" in rule_text
+    assert "invoke_subagent" in rule_text
+
+    # 3. rules.json, agents.json, skills.json, plugins.json with 0o600 and valid JSON {"exclude": [...]}
+    rules_data: dict[str, Any] = json.loads((agents_dir / "rules.json").read_text(encoding="utf-8"))
+    assert rules_data == {"exclude": ["user_global", "~/.gemini/GEMINI.md"]}
+
+    skills_data: dict[str, Any] = json.loads(
+        (agents_dir / "skills.json").read_text(encoding="utf-8")
     )
-    assert "PreToolUse" in (agents_dir / "hooks.json").read_text(encoding="utf-8")
-    assert "deny" in (agents_dir / "deny_tools.py").read_text(encoding="utf-8")
-    assert (agents_dir / "mcp_config.json").read_text(encoding="utf-8") == '{"mcpServers":{}}'
+    assert skills_data == {"exclude": ["*"]}
 
-    # Symlinks rejected with OSError
-    symlink_dir = tmp_path / "symlink_dir"
-    symlink_dir.mkdir(mode=0o700)
-    fake_target = tmp_path / "fake_target"
-    fake_target.mkdir(mode=0o700)
-    (symlink_dir / ".agents").symlink_to(fake_target)
-    with pytest.raises(OSError, match="symbolic link"):
-        agy_completion._prepare_policy(symlink_dir)  # pyright: ignore[reportPrivateUsage]
+    plugins_data: dict[str, Any] = json.loads(
+        (agents_dir / "plugins.json").read_text(encoding="utf-8")
+    )
+    assert plugins_data == {"exclude": ["*"]}
 
-    symlink_dir2 = tmp_path / "symlink_dir2"
-    symlink_dir2.mkdir(mode=0o700)
-    (symlink_dir2 / ".agents").mkdir(mode=0o700)
-    (symlink_dir2 / ".agents" / "agents").symlink_to(fake_target)
-    with pytest.raises(OSError, match="symbolic link"):
-        agy_completion._prepare_policy(symlink_dir2)  # pyright: ignore[reportPrivateUsage]
+    agents_data: dict[str, Any] = json.loads(
+        (agents_dir / "agents.json").read_text(encoding="utf-8")
+    )
+    assert "exclude" in agents_data
+    assert isinstance(agents_data["exclude"], list)
+    assert "relay-completion" not in agents_data["exclude"]
+    for expected_agent in (
+        "explore",
+        "flash",
+        "tests",
+        "pro",
+        "pro-gemini",
+        "pro-flash-high",
+        "review",
+    ):
+        assert expected_agent in agents_data["exclude"]
 
-    symlink_dir3 = tmp_path / "symlink_dir3"
-    symlink_dir3.mkdir(mode=0o700)
-    target_file = tmp_path / "target_file.txt"
-    target_file.touch()
-    (symlink_dir3 / "GEMINI.md").symlink_to(target_file)
+    # 4. hooks.json with both PreInvocation and PreToolUse hooks
+    hooks_data: dict[str, Any] = json.loads((agents_dir / "hooks.json").read_text(encoding="utf-8"))
+    assert "relay-deny-tools" in hooks_data
+    relay_hooks: dict[str, Any] = hooks_data["relay-deny-tools"]
+    assert "PreInvocation" in relay_hooks
+    assert "PreToolUse" in relay_hooks
+
+    pre_inv: list[dict[str, Any]] = relay_hooks["PreInvocation"]
+    assert len(pre_inv) == 1
+    assert pre_inv[0]["matcher"] == "*"
+    assert pre_inv[0]["hooks"][0]["type"] == "command"
+    assert "--pre-invocation" in pre_inv[0]["hooks"][0]["command"]
+    assert pre_inv[0]["hooks"][0]["timeout"] == 10
+
+    pre_tool: list[dict[str, Any]] = relay_hooks["PreToolUse"]
+    assert len(pre_tool) == 1
+    assert pre_tool[0]["matcher"] == "*"
+    assert pre_tool[0]["hooks"][0]["type"] == "command"
+    assert "--pre-invocation" not in pre_tool[0]["hooks"][0]["command"]
+    assert pre_tool[0]["hooks"][0]["timeout"] == 10
+
+    # mcp_config.json
+    assert json.loads((agents_dir / "mcp_config.json").read_text(encoding="utf-8")) == {
+        "mcpServers": {}
+    }
+
+
+def test_agy_prepare_policy_agent_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_home = tmp_path / "fake_home"
+    home_agents_dir = fake_home / ".gemini" / "config" / "agents"
+    home_agents_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (home_agents_dir / "custom-agent.md").write_text("name: custom-agent", encoding="utf-8")
+    (home_agents_dir / "relay-completion.md").write_text("name: relay-completion", encoding="utf-8")
+    (home_agents_dir / "another-agent.md").write_text("name: another-agent", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    agy_completion._prepare_policy(work_dir)  # pyright: ignore[reportPrivateUsage]
+
+    agents_data: dict[str, Any] = json.loads(
+        (work_dir / ".agents" / "agents.json").read_text(encoding="utf-8")
+    )
+    assert "custom-agent" in agents_data["exclude"]
+    assert "another-agent" in agents_data["exclude"]
+    assert "relay-completion" not in agents_data["exclude"]
+
+
+def test_agy_deny_tools_execution(tmp_path: Path) -> None:
+    agy_completion._prepare_policy(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    script = tmp_path / ".agents" / "deny_tools.py"
+    marker = tmp_path / ".agents" / "deny_tools.used"
+    assert not marker.exists()
+
+    # Running deny_tools.py --pre-invocation outputs valid JSON with systemMessage and ephemeralMessage
+    # and does NOT create deny_tools.used
+    res_pre = subprocess.run(
+        [sys.executable, str(script), "--pre-invocation"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert res_pre.returncode == 0
+    assert not marker.exists()
+    pre_data: dict[str, Any] = json.loads(res_pre.stdout)
+    assert "systemMessage" in pre_data
+    assert "ephemeralMessage" in pre_data
+    assert pre_data["systemMessage"] == pre_data["ephemeralMessage"]
+    assert "Stateless single-turn completion mode" in pre_data["systemMessage"]
+
+    # Running deny_tools.py without --pre-invocation creates deny_tools.used and outputs decision: deny
+    res_deny = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert res_deny.returncode == 0
+    assert marker.exists()
+    deny_data: dict[str, Any] = json.loads(res_deny.stdout)
+    assert deny_data.get("decision") == "deny"
+    assert deny_data.get("allow_tool") is False
+    assert deny_data.get("reason") == "Relay clients execute tools."
+    assert deny_data.get("deny_reason") == "Relay clients execute tools."
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "is_dir"),
+    [
+        (Path(".agents"), True),
+        (Path(".agents") / "agents", True),
+        (Path(".agents") / "rules", True),
+        (Path("GEMINI.md"), False),
+        (Path(".agents") / "rules.json", False),
+        (Path(".agents") / "agents.json", False),
+        (Path(".agents") / "skills.json", False),
+        (Path(".agents") / "plugins.json", False),
+        (Path(".agents") / "hooks.json", False),
+        (Path(".agents") / "mcp_config.json", False),
+        (Path(".agents") / "deny_tools.py", False),
+        (Path(".agents") / "agents" / "relay-completion.md", False),
+        (Path(".agents") / "rules" / "relay-completion.md", False),
+        (Path(".agents") / "deny_tools.used", False),
+    ],
+)
+def test_agy_prepare_policy_symlink_rejection(tmp_path: Path, rel_path: Path, is_dir: bool) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    if is_dir:
+        target.mkdir(mode=0o700)
+    else:
+        target.touch()
+
+    symlink_path = work_dir / rel_path
+    symlink_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    symlink_path.symlink_to(target)
+
     with pytest.raises(OSError, match="symbolic link"):
-        agy_completion._prepare_policy(symlink_dir3)  # pyright: ignore[reportPrivateUsage]
+        agy_completion._prepare_policy(work_dir)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_agy_prepare_policy_windows_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    agy_completion._prepare_policy(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    hooks_data: dict[str, Any] = json.loads(
+        (tmp_path / ".agents" / "hooks.json").read_text(encoding="utf-8")
+    )
+    relay_hooks: dict[str, Any] = hooks_data["relay-deny-tools"]
+    inv_cmd: str = relay_hooks["PreInvocation"][0]["hooks"][0]["command"]
+    tool_cmd: str = relay_hooks["PreToolUse"][0]["hooks"][0]["command"]
+    assert inv_cmd.startswith("& ")
+    assert inv_cmd.endswith("; exit $LASTEXITCODE")
+    assert "--pre-invocation" in inv_cmd
+    assert tool_cmd.startswith("& ")
+    assert tool_cmd.endswith("; exit $LASTEXITCODE")
+    assert "--pre-invocation" not in tool_cmd
+
+
+def test_agy_prompt_framing_and_schema_overrides() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "count": {"type": "integer"}},
+        "required": ["name"],
+    }
+    schema_inst = agy_completion._agy_schema_instructions(schema)  # pyright: ignore[reportPrivateUsage]
+    assert "Explicit user instruction:" in schema_inst
+    assert "define_subagent" in schema_inst
+    assert "invoke_subagent" in schema_inst
+    assert "send_message" in schema_inst
+    assert "view_file" in schema_inst
+    assert "run_command" in schema_inst
+    assert "search_web" in schema_inst
+    assert json.dumps(schema, separators=(",", ":"), sort_keys=True) in schema_inst
+
+    # ChatRequest without tools
+    req_no_tools = ChatRequest(
+        model="gemini-2.5-pro",
+        messages=[Message(role="user", content="Tell me a joke.")],
+    )
+    transcript_no_tools = render_transcript(req_no_tools, model="gemini-2.5-pro")
+    assert "<RULE[user_global]>" in transcript_no_tools
+    assert "define_subagent" in transcript_no_tools
+    assert "invoke_subagent" in transcript_no_tools
+    assert "send_message" in transcript_no_tools
+    assert "view_file" in transcript_no_tools
+    assert "read_file" in transcript_no_tools
+    assert "list_dir" in transcript_no_tools
+    assert "grep_search" in transcript_no_tools
+    assert "find_by_name" in transcript_no_tools
+    assert "run_command" in transcript_no_tools
+    assert "search_web" in transcript_no_tools
+    assert "read_url_content" in transcript_no_tools
+    assert "Return only the assistant's text." in transcript_no_tools
+
+    # ChatRequest with tools
+    tool = Tool(
+        type="function",
+        function=FunctionDefinition(
+            name="get_weather",
+            description="Fetch weather",
+            parameters={"type": "object", "properties": {"loc": {"type": "string"}}},
+        ),
+    )
+    req_with_tools = ChatRequest(
+        model="gemini-2.5-pro",
+        messages=[Message(role="user", content="What is the weather in Seattle?")],
+        tools=[tool],
+    )
+    transcript_with_tools = render_transcript(req_with_tools, model="gemini-2.5-pro")
+    assert "<RULE[user_global]>" in transcript_with_tools
+    assert "define_subagent" in transcript_with_tools
+    assert "invoke_subagent" in transcript_with_tools
+    assert "send_message" in transcript_with_tools
+    assert "view_file" in transcript_with_tools
+    assert "read_file" in transcript_with_tools
+    assert "run_command" in transcript_with_tools
+    assert "search_web" in transcript_with_tools
+    assert "read_url_content" in transcript_with_tools
+    assert (
+        'Return exactly one JSON envelope {"content":string|null,"tool_calls":'
+        in transcript_with_tools
+    )
+    assert "Propose only supplied functions; the client executes them." in transcript_with_tools
 
 
 def test_agy_stream_json_ndjson_envelope_and_parse() -> None:
