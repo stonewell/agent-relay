@@ -65,11 +65,40 @@ def _agy_payload(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _extract_dict_error(err_dict: dict[str, Any]) -> str | None:
+    for key in ("message", "detail", "error"):
+        val = err_dict.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            nested = _extract_dict_error(val)
+            if nested is not None:
+                return nested
+    return None
+
+
 def _error_text(payload: dict[str, Any]) -> str | None:
-    """The envelope's `error` text, when it is a non-empty string."""
+    """The envelope's `error` text, when present."""
     error = payload.get("error")
     if isinstance(error, str) and error.strip():
         return error.strip()
+    if isinstance(error, dict):
+        text = _extract_dict_error(error)
+        if text is not None:
+            return text
+        if error:
+            try:
+                return json.dumps(error)
+            except (TypeError, ValueError):
+                return str(error)
+    elif error is not None:
+        text = str(error).strip()
+        if text:
+            return text
+    for key in ("message", "detail", "reason"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
     return None
 
 

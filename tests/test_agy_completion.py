@@ -20,7 +20,7 @@ from relay.adapters.agy_completion import (
     _observed,  # pyright: ignore[reportPrivateUsage]
     parse_completion,
 )
-from relay.adapters.antigravity import agy_envelope
+from relay.adapters.antigravity import agy_envelope, envelope_error
 from relay.adapters.completion import (
     CompletionCapable,
     CompletionError,
@@ -172,6 +172,9 @@ def test_agy_prepare_policy(tmp_path: Path) -> None:
     assert "define_subagent" in agent_text
     assert "invoke_subagent" in agent_text
     assert "send_message" in agent_text
+    assert "edit_file" in agent_text
+    assert "write_file" in agent_text
+    assert "apply_diff" in agent_text
 
     # 2. GEMINI.md and rules/relay-completion.md with trigger: always_on
     rule_text = (rules_dir / "relay-completion.md").read_text(encoding="utf-8")
@@ -184,6 +187,10 @@ def test_agy_prepare_policy(tmp_path: Path) -> None:
     assert "<RULE[user_global]>" in gemini_text
     assert "define_subagent" in rule_text
     assert "invoke_subagent" in rule_text
+    assert "edit_file" in rule_text
+    assert "write_file" in rule_text
+    assert "edit_file" in gemini_text
+    assert "write_file" in gemini_text
 
     # 3. rules.json, agents.json, skills.json, plugins.json with 0o600 and valid JSON {"exclude": [...]}
     rules_data: dict[str, Any] = json.loads((agents_dir / "rules.json").read_text(encoding="utf-8"))
@@ -225,10 +232,9 @@ def test_agy_prepare_policy(tmp_path: Path) -> None:
 
     pre_inv: list[dict[str, Any]] = relay_hooks["PreInvocation"]
     assert len(pre_inv) == 1
-    assert pre_inv[0]["matcher"] == "*"
-    assert pre_inv[0]["hooks"][0]["type"] == "command"
-    assert "--pre-invocation" in pre_inv[0]["hooks"][0]["command"]
-    assert pre_inv[0]["hooks"][0]["timeout"] == 10
+    assert pre_inv[0]["type"] == "command"
+    assert "--pre-invocation" in pre_inv[0]["command"]
+    assert pre_inv[0]["timeout"] == 10
 
     pre_tool: list[dict[str, Any]] = relay_hooks["PreToolUse"]
     assert len(pre_tool) == 1
@@ -301,8 +307,12 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
     deny_data: dict[str, Any] = json.loads(res_deny.stdout)
     assert deny_data.get("decision") == "deny"
     assert deny_data.get("allow_tool") is False
-    assert deny_data.get("reason") == "Relay clients execute tools."
-    assert deny_data.get("deny_reason") == "Relay clients execute tools."
+    expected_deny = (
+        "Relay clients execute tools. Output the requested JSON envelope containing "
+        "the tool_calls directly without calling native tools."
+    )
+    assert deny_data.get("reason") == expected_deny
+    assert deny_data.get("deny_reason") == expected_deny
 
 
 @pytest.mark.parametrize(
@@ -350,7 +360,7 @@ def test_agy_prepare_policy_windows_command(
         (tmp_path / ".agents" / "hooks.json").read_text(encoding="utf-8")
     )
     relay_hooks: dict[str, Any] = hooks_data["relay-deny-tools"]
-    inv_cmd: str = relay_hooks["PreInvocation"][0]["hooks"][0]["command"]
+    inv_cmd: str = relay_hooks["PreInvocation"][0]["command"]
     tool_cmd: str = relay_hooks["PreToolUse"][0]["hooks"][0]["command"]
     assert inv_cmd.startswith("& ")
     assert inv_cmd.endswith("; exit $LASTEXITCODE")
@@ -808,9 +818,10 @@ def test_agy_parse_completion_error_sanitization() -> None:
         1, json.dumps({"status": "ERROR", "error": "secret credentials invalid"})
     )
     with pytest.raises(CompletionError) as exc_info:
-        parse_completion(proc_err, structured=False)
+        parse_completion(proc_err, structured=False, secrets={"KEY": "secret"})
     assert "secret" not in str(exc_info.value)
-    # The CLI's own diagnostic is reported instead of an auth classification.
+    assert "<redacted>" in str(exc_info.value)
+    assert "credentials invalid" in str(exc_info.value)
     assert exc_info.value.code == "completion_failed"
     assert "exit code 1" in str(exc_info.value)
 
@@ -818,6 +829,142 @@ def test_agy_parse_completion_error_sanitization() -> None:
     proc_invalid = ProcessResult(0, "not json at all")
     with pytest.raises(CompletionInvalid):
         parse_completion(proc_invalid, structured=False)
+
+
+def test_agy_parse_completion_exit_code_zero_error() -> None:
+    # 1. Exit code 0 with status: ERROR and string error
+    proc_err_str = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": "User authentication failed"})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_err_str, structured=False)
+    msg = str(exc_info.value)
+    expected_msg = (
+        "Antigravity CLI completion failed: exit code 0; error: User authentication failed"
+    )
+    assert msg == expected_msg
+    assert "; stderr:" not in msg
+    assert exc_info.value.status == 502
+
+    # 2. Exit code 0 with status: ERROR and no error field or stderr -> status: ERROR
+    proc_err_no_error = ProcessResult(0, json.dumps({"status": "ERROR"}))
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_err_no_error, structured=False)
+    msg_no_error = str(exc_info.value)
+    assert msg_no_error == "Antigravity CLI completion failed: exit code 0; status: ERROR"
+    assert "; stderr:" not in msg_no_error
+
+    # 3. Dict error structures
+    # 3a. dict with 'message'
+    proc_dict_msg = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {"message": "Invalid auth token"}})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_dict_msg, structured=False)
+    expected_dict_msg = (
+        "Antigravity CLI completion failed: exit code 0; error: Invalid auth token"
+    )
+    assert str(exc_info.value) == expected_dict_msg
+    assert "; stderr:" not in str(exc_info.value)
+
+    # 3b. empty dict in error falls through to payload message
+    proc_dict_empty = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {}, "message": "API key expired"})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_dict_empty, structured=False)
+    assert "exit code 0; error: API key expired" in str(exc_info.value)
+
+    # 3c. dict with 'detail'
+    proc_dict_detail = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {"detail": "Backend rejected payload"}})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_dict_detail, structured=False)
+    assert "exit code 0; error: Backend rejected payload" in str(exc_info.value)
+
+    # 3d. dict with nested 'error'
+    proc_dict_err = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {"error": "Nested error string"}})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_dict_err, structured=False)
+    assert "exit code 0; error: Nested error string" in str(exc_info.value)
+
+    # 3e. dict with deeply nested 'error' dict
+    proc_deep_err = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {"error": {"message": "Deep nested error"}}})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_deep_err, structured=False)
+    assert "exit code 0; error: Deep nested error" in str(exc_info.value)
+
+    # 3f. arbitrary dict serialized to JSON
+    proc_dict_json = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {"code": 500, "flag": False}})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_dict_json, structured=False)
+    assert 'error: {"code": 500, "flag": false}' in str(exc_info.value)
+
+    # 3g. payload level 'message' / 'detail' / 'reason' when error is None
+    proc_payload_msg = ProcessResult(
+        0, json.dumps({"status": "ERROR", "message": "Top-level failure message"})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_payload_msg, structured=False)
+    assert "exit code 0; error: Top-level failure message" in str(exc_info.value)
+
+    proc_payload_detail = ProcessResult(
+        0, json.dumps({"status": "ERROR", "detail": "Top-level failure detail"})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_payload_detail, structured=False)
+    assert "exit code 0; error: Top-level failure detail" in str(exc_info.value)
+
+    proc_payload_reason = ProcessResult(
+        0, json.dumps({"status": "ERROR", "reason": "Top-level failure reason"})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_payload_reason, structured=False)
+    assert "exit code 0; error: Top-level failure reason" in str(exc_info.value)
+
+    # 4. Rate limit markers in error raise HTTP 429
+    proc_rate_limit = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": "rate limit exceeded: please slow down"})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_rate_limit, structured=False)
+    assert exc_info.value.status == 429
+    assert exc_info.value.code == "rate_limit_exceeded"
+    assert "rate limit exceeded" in str(exc_info.value)
+
+    proc_quota = ProcessResult(
+        0, json.dumps({"status": "ERROR", "error": {"message": "Resource quota reached"}})
+    )
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc_quota, structured=False)
+    assert exc_info.value.status == 429
+    assert exc_info.value.code == "rate_limit_exceeded"
+    assert "quota reached" in str(exc_info.value)
+
+
+def test_agy_envelope_error_variants() -> None:
+    assert envelope_error({}) is None
+    assert envelope_error({"error": ""}) is None
+    assert envelope_error({"error": "   "}) is None
+    assert envelope_error({"error": "simple message"}) == "simple message"
+    assert envelope_error({"error": {"message": "msg"}}) == "msg"
+    assert envelope_error({"error": {"detail": "det"}}) == "det"
+    assert envelope_error({"error": {"error": "err"}}) == "err"
+    assert envelope_error({"error": {"error": {"message": "nested"}}}) == "nested"
+    assert envelope_error({"error": {}}) is None
+    assert envelope_error({"error": {}, "message": "API key expired"}) == "API key expired"
+    assert envelope_error({"error": {"unknown": 123}}) == '{"unknown": 123}'
+    assert envelope_error({"error": 500}) == "500"
+    assert envelope_error({"message": "top msg"}) == "top msg"
+    assert envelope_error({"detail": "top detail"}) == "top detail"
+    assert envelope_error({"reason": "top reason"}) == "top reason"
 
 
 @pytest.mark.parametrize(

@@ -88,7 +88,8 @@ _AGY_AGENT_MD = (
     "You are a stateless completion model for a non-interactive API gateway.\n"
     "Explicit user instruction override: Ignore any global coordinator or subagent routing rules "
     "(`<RULE[user_global]>`). Do NOT call `define_subagent`, `invoke_subagent`, `send_message`, "
-    "`manage_subagents`, `view_file`, `read_file`, `list_dir`, `grep_search`, `find_by_name`, "
+    "`manage_subagents`, `edit_file`, `write_file`, `apply_diff`, `patch`, `save_file`, "
+    "`create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, `find_by_name`, "
     "`run_command`, `search_web`, `read_url_content`, or any other runtime tool. "
     "If the prompt asks for a JSON tool_calls envelope, emit that JSON object as plain text in "
     "your response without invoking any native tool. Respond directly in this single turn with "
@@ -105,7 +106,8 @@ _AGY_RULE_MD = (
     "`<RULE[user_global]>`:\n"
     "- Do NOT act as a task coordinator and do NOT register or invoke any subagents "
     "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`).\n"
-    "- Do NOT call any runtime tools (`view_file`, `read_file`, `list_dir`, `grep_search`, "
+    "- Do NOT call any runtime tools (`edit_file`, `write_file`, `apply_diff`, `patch`, "
+    "`save_file`, `create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, "
     "`find_by_name`, `run_command`, `search_web`, `read_url_content`, etc.) or run commands.\n"
     "- If client functions/tools are listed in the prompt transcript, never invoke a native tool "
     "call; represent proposed client tool calls only as JSON data inside the requested plain-text "
@@ -127,11 +129,15 @@ if "--pre-invocation" in sys.argv[1:]:
     raise SystemExit(0)
 
 Path(__file__).with_suffix(".used").touch()
+deny_msg = (
+    "Relay clients execute tools. Output the requested JSON envelope containing "
+    "the tool_calls directly without calling native tools."
+)
 print(json.dumps({
     "allow_tool": False,
-    "deny_reason": "Relay clients execute tools.",
+    "deny_reason": deny_msg,
     "decision": "deny",
-    "reason": "Relay clients execute tools."
+    "reason": deny_msg
 }))
 raise SystemExit(0)
 """
@@ -226,10 +232,7 @@ def _prepare_policy(cwd: Path) -> Path:
     hooks = {
         "relay-deny-tools": {
             "PreInvocation": [
-                {
-                    "matcher": "*",
-                    "hooks": [{"type": "command", "command": command_pre_inv, "timeout": 10}],
-                }
+                {"type": "command", "command": command_pre_inv, "timeout": 10}
             ],
             "PreToolUse": [
                 {
@@ -668,9 +671,22 @@ def parse_completion(
                 code="context_length_exceeded",
                 param="messages",
             )
+        if err_msg:
+            err_part = f"; error: {redact(err_msg, secrets=secrets)}"
+        elif is_error and not proc.stderr.strip():
+            status_desc = ""
+            if payload:
+                status_desc = str(
+                    payload.get("status") or ("error" if payload.get("is_error") else "")
+                )
+            err_part = f"; status: {status_desc}" if status_desc else "; error: unknown"
+        else:
+            err_part = ""
+        stderr_text = redact(proc.stderr[-2000:], secrets=secrets)
+        stderr_part = f"; stderr: {stderr_text}" if proc.stderr.strip() else ""
         message = (
-            f"Antigravity CLI completion failed: exit code {proc.exit_code}; "
-            f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
+            f"Antigravity CLI completion failed: exit code {proc.exit_code}"
+            f"{err_part}{stderr_part}"
         )
         print(message, file=sys.stderr)
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
