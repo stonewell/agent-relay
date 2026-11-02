@@ -49,7 +49,9 @@ from relay.core.registry import Agent
 _AGY_SETTINGS = (
     '{"toolPermission":"strict",'
     '"allowNonWorkspaceAccess":false,"disableSlashCommands":true,'
-    '"permissions":{"allow":[],"ask":[],"deny":["*"]}}'
+    '"permissions":{"allow":[],"ask":[],"deny":['
+    '"command(*)","read_file(*)","write_file(*)","read_url(*)","execute_url(*)","mcp(*)"'
+    ']}}'
 )
 COMPLETION_FLAGS: tuple[str, ...] = (
     "--agent",
@@ -125,7 +127,7 @@ msg = (
 )
 
 if "--pre-invocation" in sys.argv[1:]:
-    print(json.dumps({"systemMessage": msg, "ephemeralMessage": msg}))
+    print(json.dumps({"injectSteps": [{"ephemeralMessage": msg}]}))
     raise SystemExit(0)
 
 Path(__file__).with_suffix(".used").touch()

@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -103,11 +103,19 @@ def test_agy_settings_and_completion_flags() -> None:
     settings_raw: str = agy_completion._AGY_SETTINGS  # pyright: ignore[reportPrivateUsage]
     assert '"agentMode":""' not in settings_raw
     assert "agentMode" not in settings_raw
-    assert '"permissions":{"allow":[],"ask":[],"deny":["*"]}' in settings_raw
+    expected_deny = [
+        "command(*)",
+        "read_file(*)",
+        "write_file(*)",
+        "read_url(*)",
+        "execute_url(*)",
+        "mcp(*)",
+    ]
+    assert f'"deny":{json.dumps(expected_deny, separators=(",", ":"))}' in settings_raw
 
     settings: dict[str, Any] = json.loads(settings_raw)
     assert "agentMode" not in settings
-    assert settings["permissions"] == {"allow": [], "ask": [], "deny": ["*"]}
+    assert settings["permissions"] == {"allow": [], "ask": [], "deny": expected_deny}
     assert settings["toolPermission"] == "strict"
     assert settings["allowNonWorkspaceAccess"] is False
     assert settings["disableSlashCommands"] is True
@@ -280,7 +288,7 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
     marker = tmp_path / ".agents" / "deny_tools.used"
     assert not marker.exists()
 
-    # Running deny_tools.py --pre-invocation outputs valid JSON with systemMessage and ephemeralMessage
+    # Running deny_tools.py --pre-invocation outputs valid JSON with injectSteps and ephemeralMessage
     # and does NOT create deny_tools.used
     res_pre = subprocess.run(
         [sys.executable, str(script), "--pre-invocation"],
@@ -291,10 +299,12 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
     assert res_pre.returncode == 0
     assert not marker.exists()
     pre_data: dict[str, Any] = json.loads(res_pre.stdout)
-    assert "systemMessage" in pre_data
-    assert "ephemeralMessage" in pre_data
-    assert pre_data["systemMessage"] == pre_data["ephemeralMessage"]
-    assert "Stateless single-turn completion mode" in pre_data["systemMessage"]
+    assert "injectSteps" in pre_data
+    inject_steps = cast("list[dict[str, Any]]", pre_data["injectSteps"])
+    assert isinstance(inject_steps, list)
+    assert len(inject_steps) == 1
+    assert "ephemeralMessage" in inject_steps[0]
+    assert "Stateless single-turn completion mode" in inject_steps[0]["ephemeralMessage"]
 
     # Running deny_tools.py without --pre-invocation creates deny_tools.used and outputs decision: deny
     res_deny = subprocess.run(
