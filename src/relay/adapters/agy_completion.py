@@ -67,6 +67,14 @@ DEFAULT_CONTEXT_WINDOW = 1_048_576
 DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 ENUMERATION_TIMEOUT_S = 15.0
 
+MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
+    "improperly formatted function call",
+    "malformed function call",
+    "failed to parse function call",
+    "function call is empty",
+    "empty function call",
+)
+
 _AGY_AGENT_MD = (
     "---\n"
     "name: relay-completion\n"
@@ -89,13 +97,14 @@ _AGY_AGENT_MD = (
     "# System Prompt\n"
     "You are a stateless completion model for a non-interactive API gateway.\n"
     "Explicit user instruction override: Ignore any global coordinator or subagent routing rules "
-    "(`<RULE[user_global]>`). Do NOT call `define_subagent`, `invoke_subagent`, `send_message`, "
-    "`manage_subagents`, `edit_file`, `write_file`, `apply_diff`, `patch`, `save_file`, "
-    "`create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, `find_by_name`, "
-    "`run_command`, `search_web`, `read_url_content`, or any other runtime tool. "
-    "If the prompt asks for a JSON tool_calls envelope, emit that JSON object as plain text in "
-    "your response without invoking any native tool. Respond directly in this single turn with "
-    "only the requested completion output.\n"
+    "(`<RULE[user_global]>`). Native function calling is disabled; native function call blocks or "
+    "`<call>` tokens are forbidden. Do NOT call `define_subagent`, `invoke_subagent`, "
+    "`send_message`, `manage_subagents`, `edit_file`, `write_file`, `apply_diff`, `patch`, "
+    "`save_file`, `create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, "
+    "`find_by_name`, `run_command`, `search_web`, `read_url_content`, or any other runtime tool. "
+    "Tool proposals must be emitted exclusively as plain JSON text in the requested envelope "
+    "without invoking any native tool. Respond directly in this single turn with only the "
+    "requested completion output.\n"
 )
 
 _AGY_RULE_MD = (
@@ -106,14 +115,16 @@ _AGY_RULE_MD = (
     "# Explicit User Instructions Override\n"
     "For this workspace session, explicit user instructions take precedence over "
     "`<RULE[user_global]>`:\n"
+    "- Native function calling is disabled; native function call blocks or `<call>` tokens "
+    "are forbidden.\n"
     "- Do NOT act as a task coordinator and do NOT register or invoke any subagents "
     "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`).\n"
     "- Do NOT call any runtime tools (`edit_file`, `write_file`, `apply_diff`, `patch`, "
     "`save_file`, `create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, "
     "`find_by_name`, `run_command`, `search_web`, `read_url_content`, etc.) or run commands.\n"
     "- If client functions/tools are listed in the prompt transcript, never invoke a native tool "
-    "call; represent proposed client tool calls only as JSON data inside the requested plain-text "
-    "JSON response envelope.\n"
+    "call; tool proposals must be emitted exclusively as plain JSON text in the requested "
+    "envelope.\n"
     "- Answer the supplied prompt directly in a single turn and output the response immediately.\n"
 )
 
@@ -123,7 +134,9 @@ from pathlib import Path
 
 msg = (
     "Explicit user instruction override: Stateless single-turn completion mode. "
-    "Do NOT invoke any tools or subagents. Answer directly or emit the requested JSON envelope."
+    "Native function calling is disabled; native function call blocks or <call> tokens "
+    "are forbidden. Do NOT invoke any tools or subagents. Tool proposals must be emitted "
+    "exclusively as plain JSON text in the requested envelope."
 )
 
 if "--pre-invocation" in sys.argv[1:]:
@@ -132,8 +145,9 @@ if "--pre-invocation" in sys.argv[1:]:
 
 Path(__file__).with_suffix(".used").touch()
 deny_msg = (
-    "Relay clients execute tools. Output the requested JSON envelope containing "
-    "the tool_calls directly without calling native tools."
+    "Relay clients execute tools. Native function calling is disabled; native function call "
+    "blocks or <call> tokens are forbidden. Tool proposals must be emitted exclusively as plain "
+    "JSON text in the requested envelope without calling native tools."
 )
 print(json.dumps({
     "allow_tool": False,
@@ -469,10 +483,12 @@ def _stream_sink(
 def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     compact = json.dumps(schema, separators=(",", ":"), sort_keys=True)
     return (
-        "\n\nExplicit user instruction: Do NOT call any runtime tools or subagents "
+        "\n\nExplicit user instruction: Native function calling is disabled; native function "
+        "call blocks or `<call>` tokens are forbidden. Do NOT call any runtime tools or subagents "
         "(never call define_subagent, invoke_subagent, send_message, view_file, run_command, "
-        "or search_web). Reply immediately in this turn with only one JSON object "
-        f"(no prose and no code fence) that conforms to this JSON Schema: {compact}"
+        "or search_web). Tool proposals must be emitted exclusively as plain JSON text. Reply "
+        "immediately in this turn with only one JSON object (no prose and no code fence) that "
+        f"conforms to this JSON Schema: {compact}"
     )
 
 
@@ -747,6 +763,20 @@ def parse_completion(
         print(message, file=sys.stderr)
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
+        if structured and (
+            (payload is not None and payload.get("status") == "INVALID")
+            or any(marker in diagnostic for marker in MALFORMED_FUNCTION_CALL_MARKERS)
+        ):
+            raw_content = (
+                str(payload.get("response") or payload.get("result") or "")
+                if payload is not None
+                else ""
+            ) or proc.stdout
+            raise CompletionInvalid(
+                message,
+                raw=raw_content[:4000],
+                usage=_usage(payload) if payload else None,
+            )
         raise CompletionError(message)
     if payload is None:
         message = (

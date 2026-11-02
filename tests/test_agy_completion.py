@@ -16,6 +16,7 @@ from relay.adapters.agy_completion import (
     DEFAULT_AGY_MODEL,
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_MAX_OUTPUT_TOKENS,
+    MALFORMED_FUNCTION_CALL_MARKERS,
     PROMPT_LIMIT_BYTES,
     AgyCompletionAdapter,
     _observed,  # pyright: ignore[reportPrivateUsage]
@@ -319,8 +320,9 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
     assert deny_data.get("decision") == "deny"
     assert deny_data.get("allow_tool") is False
     expected_deny = (
-        "Relay clients execute tools. Output the requested JSON envelope containing "
-        "the tool_calls directly without calling native tools."
+        "Relay clients execute tools. Native function calling is disabled; native function call "
+        "blocks or <call> tokens are forbidden. Tool proposals must be emitted exclusively as plain "
+        "JSON text in the requested envelope without calling native tools."
     )
     assert deny_data.get("reason") == expected_deny
     assert deny_data.get("deny_reason") == expected_deny
@@ -1445,3 +1447,81 @@ def test_agy_observed_fallback_and_model_usage() -> None:
     assert result.observed == ObservedModel(
         "gemini-2.5-flash", DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS
     )
+
+
+def test_agy_malformed_function_call_markers() -> None:
+    assert MALFORMED_FUNCTION_CALL_MARKERS == (
+        "improperly formatted function call",
+        "malformed function call",
+        "failed to parse function call",
+        "function call is empty",
+        "empty function call",
+    )
+
+
+def test_agy_parse_completion_malformed_function_call_invalid() -> None:
+    # 1. Exit code != 0 with malformed function call in stderr and structured=True -> CompletionInvalid
+    proc_malformed = ProcessResult(
+        1,
+        "",
+        stderr="google.api_core.exceptions.InvalidArgument: 400 Malformed function call: Function call is empty",
+    )
+    with pytest.raises(CompletionInvalid) as exc_info:
+        parse_completion(proc_malformed, structured=True)
+    assert exc_info.value.code == "invalid_completion"
+    assert "exit code 1" in str(exc_info.value)
+    assert "Malformed function call: Function call is empty" in str(exc_info.value)
+
+    # 2. structured=False does not convert malformed function call to CompletionInvalid -> CompletionError
+    with pytest.raises(CompletionError) as exc_err:
+        parse_completion(proc_malformed, structured=False)
+    assert not isinstance(exc_err.value, CompletionInvalid)
+    assert exc_err.value.code == "completion_failed"
+
+    # 3. Payload with status: INVALID and structured=True -> CompletionInvalid with raw and usage
+    usage_data = {"input_tokens": 100, "output_tokens": 20}
+    proc_invalid_payload = ProcessResult(
+        0,
+        json.dumps({
+            "status": "INVALID",
+            "error": "Failed to parse function call",
+            "usage": usage_data,
+            "response": '{"broken": json',
+        }),
+    )
+    with pytest.raises(CompletionInvalid) as exc_info2:
+        parse_completion(proc_invalid_payload, structured=True)
+    assert exc_info2.value.code == "invalid_completion"
+    assert exc_info2.value.raw == '{"broken": json'
+    assert exc_info2.value.usage == CompletionUsage(prompt_tokens=100, completion_tokens=20)
+
+    # 4. Each marker in MALFORMED_FUNCTION_CALL_MARKERS triggers CompletionInvalid when structured=True
+    for marker in MALFORMED_FUNCTION_CALL_MARKERS:
+        proc_marker = ProcessResult(1, "", stderr=f"Backend error: {marker}")
+        with pytest.raises(CompletionInvalid):
+            parse_completion(proc_marker, structured=True)
+
+    # 5. Rate limit still takes precedence over malformed function call
+    proc_rate_limit = ProcessResult(
+        1,
+        "",
+        stderr="Rate limit exceeded: please slow down; malformed function call",
+    )
+    with pytest.raises(CompletionError) as exc_rl:
+        parse_completion(proc_rate_limit, structured=True)
+    assert not isinstance(exc_rl.value, CompletionInvalid)
+    assert exc_rl.value.status == 429
+    assert exc_rl.value.code == "rate_limit_exceeded"
+
+    # 6. Context length exceeded still takes precedence over malformed function call
+    proc_ctx = ProcessResult(
+        1,
+        "",
+        stderr="context_length_exceeded: prompt is too long; malformed function call",
+    )
+    with pytest.raises(CompletionError) as exc_ctx:
+        parse_completion(proc_ctx, structured=True)
+    assert not isinstance(exc_ctx.value, CompletionInvalid)
+    assert exc_ctx.value.status == 400
+    assert exc_ctx.value.code == "context_length_exceeded"
+
