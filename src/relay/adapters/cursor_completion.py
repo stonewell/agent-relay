@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
+from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output, launch_failed
 from relay.adapters.completion import (
     CompletionChunkSink,
     CompletionError,
@@ -315,7 +315,10 @@ class CursorCompletionAdapter:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
-                command = resolve_command(command_name, args, env=env, cwd=cwd)
+                try:
+                    command = resolve_command(command_name, args, env=env, cwd=cwd)
+                except ValueError as exc:
+                    raise launch_failed("Cursor", exc) from exc
                 proc = run_process(command, cwd=cwd, env=env, stdin=prompt, timeout_s=remaining)
             if tool_marker.exists():
                 raise CompletionError("Cursor attempted model-side tools", code="backend_tool_use")
@@ -336,6 +339,8 @@ class CursorCompletionAdapter:
             ) from exc
         except ProcessDrainError as exc:
             raise CompletionTerminationError() from exc
+        except OSError as exc:
+            raise launch_failed("Cursor", exc) from exc
 
 
 def _counter(value: object) -> int | None:
@@ -471,10 +476,8 @@ def parse_completion(
                 code="context_length_exceeded",
                 param="messages",
             )
-        message = (
-            f"Cursor CLI completion failed: exit code {proc.exit_code}; "
-            f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
-        )
+        message = f"Cursor CLI completion failed: exit code {proc.exit_code}"
+        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)

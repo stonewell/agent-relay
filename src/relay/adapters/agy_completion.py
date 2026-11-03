@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
@@ -17,7 +18,12 @@ from pathlib import Path
 from typing import Any, cast
 
 from relay.adapters.antigravity import agy_envelope, envelope_error
-from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
+from relay.adapters.claude_completion import (
+    RATE_LIMIT_MARKERS,
+    command_line_too_long,
+    discard_output,
+    launch_failed,
+)
 from relay.adapters.completion import (
     CompletionChunkSink,
     CompletionError,
@@ -62,10 +68,8 @@ COMPLETION_FLAGS: tuple[str, ...] = (
     _AGY_SETTINGS,
 )
 PROMPT_LIMIT_BYTES = 30_000 if sys.platform == "win32" else 120_000
-DEFAULT_AGY_MODEL = "gemini-2.5-pro"
-DEFAULT_CONTEXT_WINDOW = 1_048_576
-DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 ENUMERATION_TIMEOUT_S = 15.0
+logger = logging.getLogger("uvicorn.error")
 
 MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
     "improperly formatted function call",
@@ -345,8 +349,13 @@ def _observed(payload: dict[str, Any], request_model: str = "default") -> Observ
                 return ObservedModel(model.strip(), context, output)
 
     # agy CLI outputs standard usage tokens rather than Claude-specific modelUsage.
-    # Fall back to payload model/limits or Gemini defaults.
-    model_name: str
+    # Limits are observed, never guessed: without both reported limits the model is unknown.
+    context = _positive(payload.get("context_window")) or _positive(payload.get("contextWindow"))
+    output = _positive(payload.get("max_output_tokens")) or _positive(
+        payload.get("maxOutputTokens")
+    )
+    if context is None or output is None:
+        return None
     if isinstance(payload.get("model"), str) and payload["model"].strip():
         model_name = payload["model"].strip()
     elif isinstance(payload.get("model_id"), str) and payload["model_id"].strip():
@@ -354,19 +363,7 @@ def _observed(payload: dict[str, Any], request_model: str = "default") -> Observ
     elif request_model and request_model != "default":
         model_name = request_model
     else:
-        model_name = DEFAULT_AGY_MODEL
-
-    context = (
-        _positive(payload.get("context_window"))
-        or _positive(payload.get("contextWindow"))
-        or DEFAULT_CONTEXT_WINDOW
-    )
-    output = (
-        _positive(payload.get("max_output_tokens"))
-        or _positive(payload.get("maxOutputTokens"))
-        or DEFAULT_MAX_OUTPUT_TOKENS
-    )
-
+        return None
     return ObservedModel(model_name, context, output)
 
 
@@ -625,12 +622,29 @@ class AgyCompletionAdapter:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
-                command = resolve_command(
-                    self._agent.cmd,
-                    self.arguments(request, stream=streaming),
-                    env=env,
-                    cwd=cwd,
-                )
+                try:
+                    command = resolve_command(
+                        self._agent.cmd,
+                        self.arguments(request, stream=streaming),
+                        env=env,
+                        cwd=cwd,
+                    )
+                except ValueError as exc:
+                    # A Windows .cmd shim cannot forward a prompt containing newlines or NUL.
+                    logger.warning("Antigravity prompt rejected by .cmd shim: %s", exc)
+                    raise CompletionError(
+                        "Antigravity CLI .cmd shim cannot receive a multi-line prompt; "
+                        "configure agents.agy.cmd as the native executable",
+                        status=503,
+                        code="unavailable",
+                    ) from exc
+                if command_line_too_long(command):
+                    raise CompletionError(
+                        "Prompt exceeds CLI argument limit",
+                        status=400,
+                        code="context_length_exceeded",
+                        param="messages",
+                    )
                 proc = run_process(command, cwd=cwd, env=env, timeout_s=remaining)
             if tool_marker.exists() or tool_detected.is_set():
                 raise CompletionError(
@@ -667,6 +681,8 @@ class AgyCompletionAdapter:
             ) from exc
         except ProcessDrainError as exc:
             raise CompletionTerminationError() from exc
+        except OSError as exc:
+            raise launch_failed("Antigravity", exc) from exc
         finally:
             stop_watcher.set()
             watcher_thread.join()
@@ -725,8 +741,9 @@ def parse_completion(
         if isinstance(parsed, dict) and _tool_activity(cast("dict[str, Any]", parsed)):
             raise CompletionError("Antigravity reported model-side tools", code="backend_tool_use")
     payload = agy_envelope(proc.stdout)
+    # Only SUCCESS (or no status) is success; CANCELED/INTERRUPTED/WAITING/RUNNING also fail.
     is_error = payload is not None and (
-        payload.get("status") in {"ERROR", "INVALID"} or payload.get("is_error") is True
+        payload.get("status") not in (None, "SUCCESS") or payload.get("is_error") is True
     )
     if proc.exit_code != 0 or is_error:
         err_msg = envelope_error(payload) if payload else None
@@ -745,7 +762,7 @@ def parse_completion(
             )
         if err_msg:
             err_part = f"; error: {redact(err_msg, secrets=secrets)}"
-        elif is_error and not proc.stderr.strip():
+        elif is_error:
             status_desc = ""
             if payload:
                 status_desc = str(
@@ -754,19 +771,16 @@ def parse_completion(
             err_part = f"; status: {status_desc}" if status_desc else "; error: unknown"
         else:
             err_part = ""
-        stderr_text = redact(proc.stderr[-2000:], secrets=secrets)
-        stderr_part = f"; stderr: {stderr_text}" if proc.stderr.strip() else ""
-        message = (
-            f"Antigravity CLI completion failed: exit code {proc.exit_code}"
-            f"{err_part}{stderr_part}"
-        )
-        print(message, file=sys.stderr)
+        malformed = any(marker in diagnostic for marker in MALFORMED_FUNCTION_CALL_MARKERS)
+        if malformed and not err_msg:
+            # Fixed text so a repair prompt still names the failure without raw stderr.
+            err_part += "; malformed function call"
+        message = f"Antigravity CLI completion failed: exit code {proc.exit_code}{err_part}"
+        # Raw stderr is a private diagnostic: log it redacted, never return it to the client.
+        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
-        if structured and (
-            (payload is not None and payload.get("status") == "INVALID")
-            or any(marker in diagnostic for marker in MALFORMED_FUNCTION_CALL_MARKERS)
-        ):
+        if structured and ((payload is not None and payload.get("status") == "INVALID") or malformed):
             raw_content = (
                 str(payload.get("response") or payload.get("result") or "")
                 if payload is not None
@@ -779,11 +793,8 @@ def parse_completion(
             )
         raise CompletionError(message)
     if payload is None:
-        message = (
-            f"Antigravity CLI returned no completion object: exit code {proc.exit_code}; "
-            f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
-        )
-        print(message, file=sys.stderr)
+        message = f"Antigravity CLI returned no completion object: exit code {proc.exit_code}"
+        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         raise CompletionInvalid(message, raw=proc.stdout[:4000])
     usage = _usage(payload)
     observed = _observed(payload, request_model=request_model)

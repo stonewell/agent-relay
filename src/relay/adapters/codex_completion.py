@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output
+from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output, launch_failed
 from relay.adapters.completion import (
     CompletionChunkSink,
     CompletionError,
@@ -147,8 +147,10 @@ def _transport_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 def _hook_command(executable: Path, script: Path) -> tuple[str, str]:
     command = shlex.join((str(executable), str(script)))
-    windows = "& " + " ".join(
-        "'" + str(path).replace("'", "''") + "'" for path in (executable, script)
+    windows = (
+        "& "
+        + " ".join("'" + str(path).replace("'", "''") + "'" for path in (executable, script))
+        + "; exit $LASTEXITCODE"
     )
     return command, windows
 
@@ -358,7 +360,10 @@ class CodexCompletionAdapter:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
-                command = resolve_command(self._agent.cmd, args, env=env, cwd=cwd)
+                try:
+                    command = resolve_command(self._agent.cmd, args, env=env, cwd=cwd)
+                except ValueError as exc:
+                    raise launch_failed("Codex", exc) from exc
                 prompt = request.prompt
                 if request.output_schema is not None:
                     prompt += (
@@ -366,7 +371,15 @@ class CodexCompletionAdapter:
                         "JSON-encoded string containing the complete arguments object. "
                         "Relay decodes that string before the client receives the proposal.\n"
                     )
-                proc = run_process(command, cwd=cwd, env=env, stdin=prompt, timeout_s=remaining)
+                try:
+                    proc = run_process(
+                        command, cwd=cwd, env=env, stdin=prompt, timeout_s=remaining
+                    )
+                except CommandNotFound:
+                    raise
+                except OSError as exc:
+                    # Spawn failures are not policy setup failures (those come from arguments()).
+                    raise launch_failed("Codex", exc) from exc
             if (cwd / _DENIED).exists():
                 raise CompletionError(
                     "Codex attempted a model-side tool", code="backend_tool_activity"
@@ -443,10 +456,8 @@ def parse_completion(
                 code="context_length_exceeded",
                 param="messages",
             )
-        message = (
-            f"Codex CLI completion failed: exit code {proc.exit_code}; "
-            f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
-        )
+        message = f"Codex CLI completion failed: exit code {proc.exit_code}"
+        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -13,9 +14,6 @@ import pytest
 import relay.adapters.agy_completion as agy_completion
 from relay.adapters.agy_completion import (
     COMPLETION_FLAGS,
-    DEFAULT_AGY_MODEL,
-    DEFAULT_CONTEXT_WINDOW,
-    DEFAULT_MAX_OUTPUT_TOKENS,
     MALFORMED_FUNCTION_CALL_MARKERS,
     PROMPT_LIMIT_BYTES,
     AgyCompletionAdapter,
@@ -32,7 +30,7 @@ from relay.adapters.completion import (
     ObservedModel,
     stream_completion_chunks,
 )
-from relay.core.platform.proc import ProcessCancelled, ProcessResult
+from relay.core.platform.proc import ProcessCancelled, ProcessResult, ResolvedCommand
 from relay.core.registry import Agent, Config
 from relay.gateway.discovery import default_adapters
 from relay.gateway.models import ModelCatalog
@@ -1329,18 +1327,98 @@ def test_agy_envelope_error_variants() -> None:
     ],
 )
 def test_agy_process_error_categories_do_not_expose_stderr(
-    proc: ProcessResult, status: int, code: str
+    proc: ProcessResult, status: int, code: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    with pytest.raises(CompletionError) as caught:
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        pytest.raises(CompletionError) as caught,
+    ):
         parse_completion(proc, structured=False)
     assert caught.value.status == status
     assert caught.value.code == code
+    # Raw stderr is logged for operators, never returned as the public message.
+    assert "secret" not in str(caught.value)
     if status in (429, 502):
-        # Bad exits name the exit code and a redacted stderr tail.
-        assert f"exit code {proc.exit_code}" in str(caught.value)
-        assert "secret" in str(caught.value)
-    else:
-        assert "secret" not in str(caught.value)
+        assert str(caught.value) == (
+            f"Antigravity CLI completion failed: exit code {proc.exit_code}"
+        )
+        assert "secret" in caplog.text
+
+
+@pytest.mark.parametrize("status", ["CANCELED", "INTERRUPTED", "WAITING", "RUNNING", "UNKNOWN"])
+def test_agy_non_success_status_fails(status: str) -> None:
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(agy_response(status=status), structured=False)
+    assert not isinstance(caught.value, CompletionInvalid)
+    assert str(caught.value) == f"Antigravity CLI completion failed: exit code 0; status: {status}"
+
+
+def test_agy_success_or_missing_status_succeeds() -> None:
+    assert parse_completion(agy_response(), structured=False).content == "hello from agy"
+    no_status = ProcessResult(0, json.dumps({"conversation_id": "c", "response": "ok"}))
+    assert parse_completion(no_status, structured=False).content == "ok"
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "code"),
+    [
+        (OSError("[WinError 206] The filename or extension is too long"), 502, "completion_failed"),
+        (ValueError("batch arguments cannot contain newlines"), 503, "unavailable"),
+    ],
+)
+def test_agy_launch_failures_become_completion_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    status: int,
+    code: str,
+) -> None:
+    def resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        if isinstance(failure, ValueError):
+            raise failure
+        return ("agy",)
+
+    def run(*_a: object, **_k: object) -> ProcessResult:
+        raise failure
+
+    monkeypatch.setattr(agy_completion, "resolve_command", resolve)
+    monkeypatch.setattr(agy_completion, "run_process", run)
+    with pytest.raises(CompletionError) as caught:
+        AgyCompletionAdapter(Agent(cmd="agy")).complete(
+            CompletionRequest("line one\n\nline two"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=1000,
+        )
+    assert (caught.value.status, caught.value.code) == (status, code)
+    assert "WinError" not in str(caught.value)
+
+
+def test_agy_final_command_line_length_is_context_length_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def resolve(_cmd: str, args: tuple[str, ...], **_k: object) -> ResolvedCommand:
+        # Quoting can push a prompt under PROMPT_LIMIT_BYTES past the CreateProcess limit.
+        return ResolvedCommand(argv=("agy.exe", *args))
+
+    def run(*_a: object, **_k: object) -> ProcessResult:
+        raise AssertionError("must not spawn")
+
+    monkeypatch.setattr(agy_completion, "resolve_command", resolve)
+    monkeypatch.setattr(agy_completion, "run_process", run)
+    monkeypatch.setattr(sys, "platform", "win32")
+    prompt = '"' * (PROMPT_LIMIT_BYTES - 100)
+    assert len(subprocess.list2cmdline(["agy.exe", "-p", prompt])) >= 32_767
+    with pytest.raises(CompletionError) as caught:
+        AgyCompletionAdapter(Agent(cmd="agy")).complete(
+            CompletionRequest(prompt),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=1000,
+        )
+    assert (caught.value.status, caught.value.code) == (400, "context_length_exceeded")
 
 
 SLUGS = ("gemini-4-argon-medium", "claude-sonnet-5-5-high")
@@ -1416,24 +1494,25 @@ def test_agy_catalog_lists_enumerated_models(monkeypatch: pytest.MonkeyPatch) ->
         assert relay["max_output_tokens"] is None
 
 
-def test_agy_observed_fallback_and_model_usage() -> None:
-    # 1. Fallback when modelUsage is absent
-    obs_default = _observed({})
-    assert obs_default == ObservedModel(
-        DEFAULT_AGY_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS
-    )
+def test_agy_observed_limits_are_never_invented() -> None:
+    # 1. No reported limits -> unknown, never default Gemini limits
+    assert _observed({}) is None
+    assert _observed({}, request_model="gemini-2.5-flash") is None
+    assert _observed({"model": "m", "context_window": 500_000}) is None
+    assert _observed({"model": "m", "max_output_tokens": 16_384}) is None
 
-    # 2. Fallback with custom request_model
-    obs_custom = _observed({}, request_model="gemini-2.5-flash")
-    assert obs_custom == ObservedModel(
-        "gemini-2.5-flash", DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS
-    )
+    # 2. Limits reported without any model name -> unknown model
+    assert _observed({"context_window": 500_000, "max_output_tokens": 16_384}) is None
 
-    # 3. Fallback with payload model / limits
+    # 3. Payload model / limits
     obs_payload = _observed(
         {"model": "custom-agy-model", "context_window": 500_000, "max_output_tokens": 16_384}
     )
     assert obs_payload == ObservedModel("custom-agy-model", 500_000, 16_384)
+    obs_request = _observed(
+        {"contextWindow": 500_000, "maxOutputTokens": 16_384}, request_model="gemini-2.5-flash"
+    )
+    assert obs_request == ObservedModel("gemini-2.5-flash", 500_000, 16_384)
 
     # 4. When modelUsage is present
     obs_usage = _observed(
@@ -1441,12 +1520,12 @@ def test_agy_observed_fallback_and_model_usage() -> None:
     )
     assert obs_usage == ObservedModel("custom-entry", 100_000, 4_096)
 
-    # 5. parse_completion forwards request_model
-    proc = agy_response()
-    result = parse_completion(proc, structured=False, request_model="gemini-2.5-flash")
-    assert result.observed == ObservedModel(
-        "gemini-2.5-flash", DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS
-    )
+    # 5. parse_completion forwards request_model and reports unknown limits as None
+    result = parse_completion(agy_response(), structured=False, request_model="gemini-2.5-flash")
+    assert result.observed is None
+    reported = agy_response(context_window=200_000, max_output_tokens=8_192)
+    result = parse_completion(reported, structured=False, request_model="gemini-2.5-flash")
+    assert result.observed == ObservedModel("gemini-2.5-flash", 200_000, 8_192)
 
 
 def test_agy_malformed_function_call_markers() -> None:
@@ -1469,8 +1548,11 @@ def test_agy_parse_completion_malformed_function_call_invalid() -> None:
     with pytest.raises(CompletionInvalid) as exc_info:
         parse_completion(proc_malformed, structured=True)
     assert exc_info.value.code == "invalid_completion"
-    assert "exit code 1" in str(exc_info.value)
-    assert "Malformed function call: Function call is empty" in str(exc_info.value)
+    # Fixed text for the repair prompt; the raw provider stderr is not the message.
+    assert str(exc_info.value) == (
+        "Antigravity CLI completion failed: exit code 1; malformed function call"
+    )
+    assert "InvalidArgument" not in str(exc_info.value)
 
     # 2. structured=False does not convert malformed function call to CompletionInvalid -> CompletionError
     with pytest.raises(CompletionError) as exc_err:

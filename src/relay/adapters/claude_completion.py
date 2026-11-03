@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -36,12 +38,38 @@ from relay.core.platform.proc import (
     ProcessCancelled,
     ProcessDrainError,
     ProcessResult,
+    ResolvedCommand,
     cancel_processes_when,
     resolve_command,
     run_process,
     stream_output,
 )
 from relay.core.registry import Agent
+
+logger = logging.getLogger("uvicorn.error")
+
+# cmd.exe rejects longer command lines; CreateProcess allows 32,767 chars including the NUL.
+CMD_SHIM_COMMAND_LIMIT = 8191
+WINDOWS_COMMAND_LIMIT = 32_767
+
+
+def command_line_too_long(command: object) -> bool:
+    """Whether Windows would reject the final command line of a resolved command."""
+    if not isinstance(command, ResolvedCommand):
+        return False
+    if command.windows_command_line is not None:
+        return len(command.windows_command_line) > CMD_SHIM_COMMAND_LIMIT
+    return (
+        sys.platform == "win32"
+        and len(subprocess.list2cmdline(command.argv)) >= WINDOWS_COMMAND_LIMIT
+    )
+
+
+def launch_failed(agent: str, exc: BaseException) -> CompletionError:
+    """Fixed public error for a CLI that could not be started; the cause is only logged."""
+    logger.warning("%s CLI could not be started: %s: %s", agent, type(exc).__name__, exc)
+    return CompletionError(f"{agent} CLI could not be started")
+
 
 COMPLETION_FLAGS: tuple[str, ...] = (
     "--tools",
@@ -218,9 +246,23 @@ class ClaudeCompletionAdapter:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
-                command = resolve_command(
-                    self._agent.cmd, self.arguments(request, stream=streaming), env=env, cwd=cwd
-                )
+                try:
+                    command = resolve_command(
+                        self._agent.cmd,
+                        self.arguments(request, stream=streaming),
+                        env=env,
+                        cwd=cwd,
+                    )
+                except ValueError as exc:
+                    raise launch_failed("Claude", exc) from exc
+                if command_line_too_long(command):
+                    # The prompt is on stdin; only the --json-schema argument can grow this large.
+                    raise CompletionError(
+                        "Tool definitions exceed the Windows command-line limit",
+                        status=400,
+                        code="context_length_exceeded",
+                        param="tools",
+                    )
                 proc = run_process(
                     command, cwd=cwd, env=env, stdin=request.prompt, timeout_s=remaining
                 )
@@ -242,6 +284,8 @@ class ClaudeCompletionAdapter:
             ) from exc
         except ProcessDrainError as exc:
             raise CompletionTerminationError() from exc
+        except OSError as exc:
+            raise launch_failed("Claude", exc) from exc
 
 
 def _usage(payload: dict[str, Any]) -> CompletionUsage | None:
@@ -315,20 +359,14 @@ def parse_completion(
                 code="context_length_exceeded",
                 param="messages",
             )
-        message = (
-            f"Claude CLI completion failed: exit code {proc.exit_code}; "
-            f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
-        )
-        print(message, file=sys.stderr)
+        message = f"Claude CLI completion failed: exit code {proc.exit_code}"
+        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)
     if payload is None:
-        message = (
-            f"Claude CLI returned no completion object: exit code {proc.exit_code}; "
-            f"stderr: {redact(proc.stderr[-2000:], secrets=secrets)}"
-        )
-        print(message, file=sys.stderr)
+        message = f"Claude CLI returned no completion object: exit code {proc.exit_code}"
+        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         raise CompletionInvalid(message, raw=proc.stdout[:4000])
     usage = _usage(payload)
     observed = _observed(payload)

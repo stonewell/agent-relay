@@ -618,3 +618,70 @@ def test_codex_complete_streaming(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         )
     assert res2.content == "first second"
     assert chunks_ctx == ["first ", "second"]
+
+
+def test_windows_hook_command_propagates_powershell_exit_code(tmp_path: Path) -> None:
+    command, windows = module._hook_command(  # pyright: ignore[reportPrivateUsage]
+        Path("C:/Py's/python.exe"), tmp_path / "relay-deny-tools.py"
+    )
+    assert windows.startswith("& 'C:")
+    assert "'C:\\Py''s\\python.exe'" in windows or "'C:/Py''s/python.exe'" in windows
+    assert windows.endswith("; exit $LASTEXITCODE")
+    assert "LASTEXITCODE" not in command
+
+
+def test_process_failure_logs_stderr_but_returns_fixed_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = ProcessResult(1, stderr="private provider diagnostic key-secret")
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        pytest.raises(CompletionError) as caught,
+    ):
+        parse_completion(proc, structured=False, secrets={"OPENAI_API_KEY": "key-secret"})
+    assert str(caught.value) == "Codex CLI completion failed: exit code 1"
+    assert caught.value.code == "completion_failed"
+    assert "private provider diagnostic" in caplog.text
+    assert "key-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("failure", [OSError("[WinError 206] too long"), ValueError("newline")])
+def test_launch_failures_are_not_reported_as_policy_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: Exception
+) -> None:
+    def no_models(*_: object) -> tuple[str, ...]:
+        return ()
+
+    def resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        if isinstance(failure, ValueError):
+            raise failure
+        return ("codex",)
+
+    def run(*_a: object, **_k: object) -> ProcessResult:
+        raise failure
+
+    monkeypatch.setattr(module, "_enumerated_models", no_models)
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    with pytest.raises(CompletionError) as caught:
+        CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).complete(
+            CompletionRequest("x"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert str(caught.value) == "Codex CLI could not be started"
+    assert caught.value.code == "completion_failed"
+
+
+def test_policy_write_failure_remains_policy_setup_failed(tmp_path: Path) -> None:
+    with pytest.raises(CompletionError) as caught:
+        CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).complete(
+            CompletionRequest("x"),
+            cwd=tmp_path / "missing",
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert caught.value.code == "policy_setup_failed"

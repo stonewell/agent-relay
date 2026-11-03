@@ -667,6 +667,49 @@ def test_cursor_process_ownership_errors(
         assert isinstance(caught.value, CompletionTerminationError)
 
 
+@pytest.mark.parametrize("failure", [OSError("[WinError 5] denied"), ValueError("newline")])
+def test_cursor_launch_failures_become_fixed_completion_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    def resolve(*_a: Any, **_k: Any) -> tuple[str, ...]:
+        if isinstance(failure, ValueError):
+            raise failure
+        return ("cursor",)
+
+    def fail(*_: Any, **__: Any) -> ProcessResult:
+        raise failure
+
+    monkeypatch.setattr(cursor_completion, "resolve_command", resolve)
+    monkeypatch.setattr(cursor_completion, "run_process", fail)
+    with pytest.raises(CompletionError) as caught:
+        CursorCompletionAdapter(Agent(cmd="cursor")).complete(
+            CompletionRequest("hi"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=1000,
+        )
+    assert str(caught.value) == "Cursor CLI could not be started"
+    assert caught.value.code == "completion_failed"
+
+
+def test_cursor_process_failure_logs_stderr_but_returns_fixed_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        pytest.raises(CompletionError) as caught,
+    ):
+        parse_completion(
+            ProcessResult(1, stderr="private failure key-secret"),
+            structured=False,
+            secrets={"CURSOR_API_KEY": "key-secret"},
+        )
+    assert str(caught.value) == "Cursor CLI completion failed: exit code 1"
+    assert "private failure" in caplog.text
+    assert "key-secret" not in caplog.text
+
+
 def test_cursor_policy_setup_failure_does_not_launch(tmp_path: Path) -> None:
     (tmp_path / ".cursor").write_text("not a directory")
     with pytest.raises(CompletionError, match="restrictions"):
