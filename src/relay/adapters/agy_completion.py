@@ -379,14 +379,30 @@ def _tool_activity(event: dict[str, Any]) -> bool:
     return False
 
 
+def _activity_label(event: dict[str, Any]) -> str:
+    label = str(event.get("event") or event.get("type") or "unknown")
+    step = event.get("step_update")
+    if isinstance(step, dict):
+        label += f":{cast('dict[str, Any]', step).get('step_type')}"
+    return label
+
+
 def _stream_sink(
-    sink: CompletionChunkSink,
+    sink: CompletionChunkSink | None,
     tool_marker: Path | None = None,
     cancel_event: threading.Event | None = None,
     tool_detected: threading.Event | None = None,
+    on_activity: Callable[[str], None] | None = None,
 ) -> Callable[[str], None]:
+    """Consume stream-json lines. `sink` is None for buffered (tool) turns: events are
+    then only liveness signals (`on_activity`) and tool-use detection, never content."""
     emitted = ""
     failed = False
+    if sink is None:
+        def emit(_text: str) -> None:
+            return
+    else:
+        emit = sink
 
     def on_line(line: str) -> None:
         nonlocal emitted, failed
@@ -409,6 +425,8 @@ def _stream_sink(
         if not isinstance(raw_event, dict):
             return
         event = cast("dict[str, Any]", raw_event)
+        if on_activity is not None:
+            on_activity(_activity_label(event))
         if _tool_activity(event):
             failed = True
             if tool_detected is not None:
@@ -430,7 +448,7 @@ def _stream_sink(
                 delta = step.get("text_delta")
                 if isinstance(delta, str) and delta:
                     emitted += delta
-                    sink(delta)
+                    emit(delta)
             return
         if event.get("type") == "stream_event":
             inner = event.get("event")
@@ -448,7 +466,7 @@ def _stream_sink(
                     text = delta_dict.get("text")
                     if isinstance(text, str) and text:
                         emitted += text
-                        sink(text)
+                        emit(text)
             return
         if event.get("type") == "assistant":
             message = event.get("message")
@@ -467,11 +485,11 @@ def _stream_sink(
                     if joined:
                         if not emitted:
                             emitted = joined
-                            sink(joined)
+                            emit(joined)
                         elif joined.startswith(emitted) and len(joined) > len(emitted):
                             delta_text = joined[len(emitted) :]
                             emitted = joined
-                            sink(delta_text)
+                            emit(delta_text)
             return
 
     return on_line
@@ -537,7 +555,7 @@ class AgyCompletionAdapter:
 
     @staticmethod
     def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
-        output_format = "stream-json" if stream and request.output_schema is None else "json"
+        output_format = "stream-json" if stream else "json"
         prompt = request.prompt
         if request.output_schema is not None:
             prompt += _agy_schema_instructions(request.output_schema)
@@ -600,14 +618,26 @@ class AgyCompletionAdapter:
                     return
                 stop_watcher.wait(0.05)
 
+        # Tool (schema) turns also run stream-json so step events show the CLI is working;
+        # their content stays buffered for envelope validation (sink None).
+        live = streaming or request.output_schema is not None
+        started = time.monotonic()
+        activity: dict[str, Any] = {"events": 0, "at": started, "label": "none"}
+
+        def note_activity(label: str) -> None:
+            activity["events"] += 1
+            activity["at"] = time.monotonic()
+            activity["label"] = label
+
         line_sink = (
             _stream_sink(
-                chunk_sink,
+                chunk_sink if streaming else None,
                 tool_marker,
                 cancel_event=process_cancel,
                 tool_detected=tool_detected,
+                on_activity=note_activity,
             )
-            if streaming and chunk_sink is not None
+            if live
             else discard_output
         )
 
@@ -625,7 +655,7 @@ class AgyCompletionAdapter:
                 try:
                     command = resolve_command(
                         self._agent.cmd,
-                        self.arguments(request, stream=streaming),
+                        self.arguments(request, stream=live),
                         env=env,
                         cwd=cwd,
                     )
@@ -686,6 +716,16 @@ class AgyCompletionAdapter:
         finally:
             stop_watcher.set()
             watcher_thread.join()
+            if live:
+                # Separates "working" (steps seen recently) from "hung" (none) after the fact.
+                now = time.monotonic()
+                logger.info(
+                    "agy turn ended after %.1fs: events=%d last=%s %.1fs before end",
+                    now - started,
+                    activity["events"],
+                    activity["label"],
+                    now - activity["at"],
+                )
 
 
 def _parse_candidate(raw: str) -> dict[str, Any] | None:

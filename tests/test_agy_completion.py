@@ -94,8 +94,25 @@ def test_agy_completion_adapter_arguments() -> None:
     assert args_schema_stream[0] == "-p"
     assert "test prompt" in args_schema_stream[1]
     assert '{"type":"object"}' in args_schema_stream[1]
-    assert args_schema_stream[2:4] == ("--output-format", "json")
+    # Tool turns stream events for liveness; content stays buffered by the caller.
+    assert args_schema_stream[2:4] == ("--output-format", "stream-json")
     assert "--json-schema" not in args_schema_stream
+
+
+def test_agy_buffered_sink_reports_activity_without_content() -> None:
+    labels: list[str] = []
+    sink = agy_completion._stream_sink(None, on_activity=labels.append)  # pyright: ignore[reportPrivateUsage]
+    sink(json.dumps({"event": "init"}))
+    sink(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "agent_response", "text_delta": "x"},
+            }
+        )
+    )
+    sink("not json")
+    assert labels == ["init", "step_update:agent_response"]
 
 
 def test_agy_settings_and_completion_flags() -> None:
