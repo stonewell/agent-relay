@@ -35,6 +35,7 @@ from relay.core.registry import Config
 
 from .discovery import ModelCache, default_adapters
 from .envelope import EnvelopeError, prepare_envelope, validate_envelope
+from .logctx import REQUEST_ID
 from .models import ModelCatalog
 from .protocol import GatewayError, parse_request
 from .render import render_transcript
@@ -55,12 +56,25 @@ TRANSPORT_CHUNK_BYTES = 16384
 # The runtime enforces the request deadline itself; the transport backstop trails it slightly
 # so the runtime's own timeout response (or SSE error frame) is what clients normally see.
 DEADLINE_GRACE_S = 1.0
+# While a stream sends only heartbeats, note it in the log at this cadence.
+STREAM_WAIT_LOG_INTERVAL_S = 30.0
 HTTP_MESSAGES = {404: "route not found", 405: "method not allowed"}
 logger = logging.getLogger("uvicorn.error")
 
 
+def _route_kind(path: str) -> str:
+    if path == "/v1/chat/completions":
+        return "completion"
+    if path == "/v1/models" or path.startswith("/v1/models/"):
+        return "models"
+    return "health" if path == "/healthz" else "other"
+
+
 class RequestSummaryMiddleware:
-    """Log transport metadata without buffering or exposing request/response content."""
+    """Log transport metadata without buffering or exposing request/response content.
+
+    Routes add outcome hints (metadata only: ids, counts, codes) to ``scope["relay.log"]``.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -69,6 +83,7 @@ class RequestSummaryMiddleware:
         if scope["type"] != "http" or not logger.isEnabledFor(logging.DEBUG):
             await self.app(scope, receive, send)
             return
+        hints: dict[str, Any] = scope.setdefault("relay.log", {})
         method, path = scope["method"], scope["path"]
         started = time.monotonic()
         status: int | None = None
@@ -88,14 +103,18 @@ class RequestSummaryMiddleware:
         try:
             await self.app(scope, receive, tracked_send)
         finally:
+            kind = hints.pop("kind", None) or _route_kind(path)
             logger.debug(
-                "response method=%r path=%r status=%s bytes=%d complete=%s duration_ms=%.1f",
+                "response method=%r path=%r status=%s bytes=%d complete=%s duration_ms=%.1f "
+                "kind=%s%s",
                 method,
                 path,
                 status,
                 response_bytes,
                 complete,
                 (time.monotonic() - started) * 1000,
+                kind,
+                "".join(f" {key}={value}" for key, value in hints.items()),
             )
 
 
@@ -194,6 +213,7 @@ class BoundaryMiddleware:
                     401, "invalid authentication credentials", code="invalid_api_key"
                 )
         if error:
+            scope.setdefault("relay.log", {})["error_code"] = error.code or error.error_type
             response = JSONResponse(error.body(), status_code=error.status)
             await response(scope, receive, send)
             return
@@ -255,6 +275,7 @@ class BoundaryMiddleware:
                 await self.app(scope, buffered_receive, tracked_send)
         except TimeoutError:
             failure = GatewayError(504, "request deadline exceeded", code="deadline_exceeded")
+            scope.setdefault("relay.log", {})["error_code"] = failure.code
             if not started:
                 await JSONResponse(failure.body(), status_code=504)(scope, receive, send)
             elif is_sse and at_boundary:
@@ -332,6 +353,8 @@ def create_app(
 
     @app.exception_handler(GatewayError)
     async def gateway_error(_request: Request, exc: GatewayError) -> JSONResponse:
+        # Code only: error messages are never logged.
+        _request.scope.setdefault("relay.log", {})["error_code"] = exc.code or exc.error_type
         headers = {"Retry-After": "1"} if exc.status == 429 else None
         return JSONResponse(exc.body(), status_code=exc.status, headers=headers)
 
@@ -388,6 +411,8 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
+        started = time.monotonic()
+        hints: dict[str, Any] = request.scope.setdefault("relay.log", {})
         try:
             payload = json.loads(
                 await request.body(),
@@ -400,6 +425,11 @@ def create_app(
         candidates = catalog.candidates(parsed)
         model = candidates[0]
         handle: CompletionHandle | None = None
+        # Set before runtime.start: its task (and the worker thread) copy this context.
+        completion_id, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
+        REQUEST_ID.set(completion_id)
+        kind = f"{'stream' if parsed.stream else 'json'}+{'tools' if parsed.tools else 'plain'}"
+        hints.update(kind=kind, id=completion_id)
 
         def validate(result: CompletionResult) -> CompletionResult:
             if schema is None:
@@ -437,13 +467,30 @@ def create_app(
                 handle = runtime.start(
                     model.adapter, invocation, validate=validate, timeout_s=timeout_s
                 )
-                break
             except CompletionError as exc:
                 if exc.status != 429 or parsed.model != "relay/auto":
                     raise
+                continue
+            if logger.isEnabledFor(logging.DEBUG):
+                # Metadata and counts only: never prompt text, tool schemas or descriptions.
+                choice = parsed.tool_choice
+                logger.debug(
+                    "completion request kind=%s model=%s resolved=%s/%s effort=%s messages=%d "
+                    "tools=%d tool_choice=%s response_format=%s prompt_bytes=%d",
+                    kind,
+                    parsed.model,
+                    model.agent,
+                    model.model,
+                    effort,
+                    len(parsed.messages),
+                    len(parsed.tools or ()),
+                    choice if isinstance(choice, str) else choice.type,
+                    (parsed.response_format or {}).get("type", "none"),
+                    len(invocation.prompt.encode("utf-8", "surrogatepass")),
+                )
+            break
         if handle is None:
             raise GatewayError(429, "completion capacity exhausted", code="rate_limit_exceeded")
-        completion_id, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
         headers = {"X-Relay-Resolved-Model": f"{model.agent}/{model.model}"}
         ignored = [key for key in ("temperature", "top_p") if getattr(parsed, key) is not None]
         if ignored:
@@ -470,7 +517,19 @@ def create_app(
 
         request.scope["relay.cleanup"] = cleanup
 
+        def outcome(result: CompletionResult) -> None:
+            calls = len(result.envelope["tool_calls"]) if result.envelope else 0
+            hints.update(
+                finish_reason="tool_calls" if calls else result.finish_reason, tool_calls=calls
+            )
+            if result.usage is not None:
+                hints.update(
+                    prompt_tokens=result.usage.prompt_tokens,
+                    completion_tokens=result.usage.completion_tokens,
+                )
+
         def final(result: CompletionResult) -> dict[str, Any]:
+            outcome(result)
             calls: list[dict[str, Any]] = result.envelope["tool_calls"] if result.envelope else []
             return completion_response(
                 completion_id,
@@ -535,14 +594,41 @@ def create_app(
         async def stream() -> AsyncIterator[bytes]:
             nonlocal chunk_task
             heartbeats = 0
+            first_content_ms: int | None = None
+            quiet_since = started
             include_usage = bool(parsed.stream_options and parsed.stream_options.include_usage)
 
             def Slice(data: bytes) -> Iterator[bytes]:
                 for offset in range(0, len(data), TRANSPORT_CHUNK_BYTES):
                     yield data[offset : offset + TRANSPORT_CHUNK_BYTES]
 
+            def first_content() -> str:
+                return "false" if first_content_ms is None else str(first_content_ms)
+
+            def delivering(*, live: bool) -> None:
+                # Called before each content frame; restarts the heartbeat-only interval.
+                nonlocal first_content_ms, quiet_since
+                quiet_since = time.monotonic()
+                if first_content_ms is None:
+                    first_content_ms = round((quiet_since - started) * 1000)
+                    hints["buffered"] = not live
+
+            def waiting() -> None:
+                # After each heartbeat: one INFO line per interval of heartbeat-only output.
+                nonlocal quiet_since
+                now = time.monotonic()
+                if now - quiet_since >= STREAM_WAIT_LOG_INTERVAL_S:
+                    quiet_since = now
+                    logger.info(
+                        "stream waiting heartbeats=%d elapsed_s=%.0f first_content=%s",
+                        heartbeats,
+                        now - started,
+                        first_content(),
+                    )
+
             try:
                 if buffered is not None:
+                    delivering(live=False)
                     for data in response_events(buffered, include_usage):
                         for piece in Slice(data):
                             yield piece
@@ -552,8 +638,10 @@ def create_app(
                     while not handle.result.done():
                         yield heartbeat_event(completion_id, created, parsed.model)
                         heartbeats += 1
+                        waiting()
                         await asyncio.wait({handle.result}, timeout=KEEPALIVE_INTERVAL)
                     response = final(handle.result.result())
+                    delivering(live=False)
                     for data in response_events(response, include_usage):
                         for piece in Slice(data):
                             yield piece
@@ -561,6 +649,7 @@ def create_app(
 
                 role_sent = False
                 if first_chunk is not None:
+                    delivering(live=True)
                     for piece in Slice(
                         chunk_event(completion_id, created, parsed.model, {"role": "assistant"})
                     ):
@@ -578,11 +667,13 @@ def create_app(
                     if not done:
                         yield heartbeat_event(completion_id, created, parsed.model)
                         heartbeats += 1
+                        waiting()
                         continue
                     item = chunk_task.result()
                     chunk_task = None
                     if item is None:
                         break
+                    delivering(live=True)
                     if not role_sent:
                         for piece in Slice(
                             chunk_event(completion_id, created, parsed.model, {"role": "assistant"})
@@ -597,11 +688,13 @@ def create_app(
                 result = await handle.result
                 if not role_sent:
                     response = final(result)
+                    delivering(live=False)
                     for data in response_events(response, include_usage):
                         for piece in Slice(data):
                             yield piece
                     return
 
+                outcome(result)
                 content = result.content or ""
                 streamed = handle.streamed_content
                 if content.startswith(streamed):
@@ -626,17 +719,25 @@ def create_app(
                         yield piece
                 yield b"data: [DONE]\n\n"
             except CompletionError as exc:
+                hints["error_code"] = exc.code
                 yield event(GatewayError(exc.status, str(exc), exc.param, exc.code).body())
             except asyncio.CancelledError:
                 # Client went away (or the server is shutting down): attribute it, then let the
                 # cancellation propagate so `finally` still drains the handle and releases the slot.
-                logger.debug("completion stream cancelled by client heartbeats=%d", heartbeats)
+                logger.debug(
+                    "completion stream cancelled by client heartbeats=%d elapsed_s=%.0f "
+                    "first_content=%s",
+                    heartbeats,
+                    time.monotonic() - started,
+                    first_content(),
+                )
                 raise
             except Exception as exc:
                 # Unexpected backend failure: terminate the stream with a protocol-visible error
                 # frame instead of truncating it. Only the exception type is logged; messages can
                 # carry private prompt/completion content.
                 logger.error("completion stream failed: %s", type(exc).__name__)
+                hints["error_code"] = "internal_error"
                 yield event(
                     GatewayError(
                         500,
@@ -646,6 +747,10 @@ def create_app(
                     ).body()
                 )
             finally:
+                hints.update(
+                    heartbeats=heartbeats,
+                    first_content_ms="none" if first_content_ms is None else first_content_ms,
+                )
                 if chunk_task is not None and not chunk_task.done():
                     chunk_task.cancel()
                     with suppress(asyncio.CancelledError):

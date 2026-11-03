@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
 import secrets
 import sys
 from pathlib import Path
+from typing import Any
 
 from relay.adapters.completion import DEFAULT_MODEL_ALIASES, model_aliases
+from relay.core import registry
 from relay.core.registry import load_config
 
 from ..errors import report_error
 from ..exitcodes import Exit
+
+LOG_FILE_FORMAT = "%(asctime)s %(levelname)s req=%(request_id)s agent=%(agent)s %(message)s"
+LOG_FILE_BYTES = 10 * 1024 * 1024
+LOG_FILE_BACKUPS = 3
 
 
 def positive_int(value: str) -> int:
@@ -49,6 +56,34 @@ def add_model_option(parser: argparse.ArgumentParser) -> None:
             f"(default: {', '.join(DEFAULT_MODEL_ALIASES)})"
         ),
     )
+
+
+def log_file_path(port: int) -> Path:
+    """One rotating log file per relay instance, beside the user config."""
+    return registry.USER_CONFIG.parent / "logs" / f"relay-{port}.log"
+
+
+def log_config(base: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Extend uvicorn's logging config with a context-tagged file sink; console is unchanged."""
+    config = copy.deepcopy(base)
+    config.setdefault("filters", {})["relay_context"] = {
+        "()": "relay.gateway.logctx.ContextFilter"
+    }
+    config.setdefault("formatters", {})["relay_file"] = {"format": LOG_FILE_FORMAT}
+    config.setdefault("handlers", {})["relay_file"] = {
+        "class": "logging.handlers.RotatingFileHandler",
+        "filename": str(path),
+        "maxBytes": LOG_FILE_BYTES,
+        "backupCount": LOG_FILE_BACKUPS,
+        "encoding": "utf-8",
+        "delay": True,
+        "formatter": "relay_file",
+        "filters": ["relay_context"],
+    }
+    # "uvicorn.error" still propagates to the "uvicorn" console handler.
+    logger = config.setdefault("loggers", {}).setdefault("uvicorn.error", {"level": "INFO"})
+    logger["handlers"] = [*logger.get("handlers", []), "relay_file"]
+    return config
 
 
 def gateway_token(*, generate: bool = False, key: str | None = None) -> tuple[str, bool]:
@@ -88,6 +123,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         return report_error("relay serve: port must be between 1 and 65535", Exit.INVALID, False)
     try:
         import uvicorn
+        from uvicorn.config import LOGGING_CONFIG
 
         from relay.gateway.app import GatewayLimits, create_app
         from relay.gateway.discovery import ModelCache, default_cache_path
@@ -112,10 +148,13 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
             models=args.models,
             model_cache=ModelCache(default_cache_path()),
         )
-    except ValueError as exc:
+        log_path = log_file_path(args.port)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except (ValueError, OSError) as exc:
         return report_error(f"relay serve: {exc}", Exit.INVALID, False)
     if generated:
         print(f"RELAY_GATEWAY_TOKEN={token}", file=sys.stderr, flush=True)
+    print(f"relay log file: {log_path}", file=sys.stderr, flush=True)
     # workers stays 1: admission state (GatewayRuntime) is per-process, so more
     # workers would multiply the concurrency limit and break per-agent caps.
     # Scale with --concurrency instead; it maps to parallel backend threads.
@@ -129,6 +168,7 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         reload=False,
         access_log=False,
         log_level=args.log_level,
+        log_config=log_config(LOGGING_CONFIG, log_path),
         timeout_graceful_shutdown=2,
     )
     return Exit.OK

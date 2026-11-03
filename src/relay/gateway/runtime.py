@@ -31,6 +31,7 @@ from relay.adapters.completion import (
     stream_completion_chunks,
 )
 
+from .logctx import AGENT
 from .render import render_repair
 
 logger = logging.getLogger("uvicorn.error")
@@ -322,6 +323,8 @@ class GatewayRuntime:
         validate: Callable[[CompletionResult], CompletionResult] | None,
         limits: GatewayLimits,
     ) -> CompletionResult:
+        # This task runs in its own context copy; _call copies it into the worker thread.
+        AGENT.set(handle._agent)  # pyright: ignore[reportPrivateUsage]
         directory: Path | None = None
         deadline = time.monotonic() + limits.timeout_s
         try:
@@ -347,6 +350,8 @@ class GatewayRuntime:
                 except CompletionInvalid as exc:
                     if request.output_schema is None or attempt:
                         raise
+                    # Class name only: the message and raw output can carry completion content.
+                    logger.debug("completion repair retry error=%s", type(exc).__name__)
                     first_invalid = exc
                     current = replace(
                         request, prompt=render_repair(request.prompt, exc.raw, str(exc))

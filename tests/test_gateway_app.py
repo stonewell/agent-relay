@@ -31,6 +31,7 @@ from relay.adapters.completion import (
 )
 from relay.gateway import app as gateway_app
 from relay.gateway.app import GatewayLimits, RequestSummaryMiddleware, create_app
+from relay.gateway.logctx import ContextFilter
 from relay.gateway.models import ModelCatalog
 from relay.gateway.runtime import GatewayRuntime
 from test_gateway_models import FakeBackend, configuration
@@ -72,13 +73,18 @@ def test_request_response_summaries(
     if level not in {"debug", "trace"}:
         assert messages == []
         return
-    assert len(messages) == 2
+    assert len(messages) == 3
     assert messages[0] == "request method='POST' path='/v1/chat/completions'"
     assert messages[1].startswith(
+        f"completion request kind={'stream' if stream else 'json'}+plain model=fake "
+        "resolved=fake/default effort=None messages=1 tools=0 tool_choice=auto "
+        "response_format=none prompt_bytes="
+    )
+    assert messages[2].startswith(
         "response method='POST' path='/v1/chat/completions' status=200 "
         f"bytes={len(response.content)} complete=True duration_ms="
     )
-    assert float(messages[1].split("duration_ms=")[1]) >= 0
+    assert float(messages[2].split("duration_ms=")[1].split()[0]) >= 0
     assert all(
         secret not in "\n".join(messages)
         for secret in ("private-prompt", "private-answer", "private-query", "test-token")
@@ -105,8 +111,12 @@ def test_request_response_summaries_include_errors(
         )
     assert response.status_code == status
     messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
-    assert len(messages) == 2
-    assert f"status={status} bytes={len(response.content)} complete=True" in messages[1]
+    # Only a dispatched completion adds its request-hint line.
+    assert len(messages) == (3 if status == 502 else 2)
+    assert f"status={status} bytes={len(response.content)} complete=True" in messages[-1]
+    code = {401: "invalid_api_key", 400: "invalid_request_error", 502: "completion_failed"}
+    assert messages[-1].endswith(f" error_code={code[status]}")
+    assert "kind=json+plain" in messages[-1] if status == 502 else "kind=completion" in messages[-1]
 
 
 def test_response_summary_includes_unexpected_error_response(
@@ -130,6 +140,125 @@ def test_response_summary_includes_unexpected_error_response(
     assert len(messages) == 2
     assert f"status=500 bytes={len(response.content)} complete=True" in messages[1]
     assert "private-failure" not in "\n".join(messages)
+
+
+SENTINEL = "SENTINEL-c0ffee"
+
+
+class SlowBackend(FakeBackend):
+    delay = 0.3
+
+    def complete(
+        self,
+        request: CompletionRequest,
+        *,
+        cwd: Path,
+        cancel: threading.Event,
+        timeout_s: float,
+        max_output_bytes: int,
+    ) -> CompletionResult:
+        time.sleep(self.delay)
+        return super().complete(
+            request, cwd=cwd, cancel=cancel, timeout_s=timeout_s, max_output_bytes=max_output_bytes
+        )
+
+
+def test_completion_log_hints_share_request_id_and_never_log_content(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    monkeypatch.setattr(gateway_app, "STREAM_WAIT_LOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    backend = SlowBackend()
+    call = {"name": "edit", "arguments": {"x": SENTINEL}}
+    backend.results = [
+        CompletionResult(
+            envelope={"content": None, "tool_calls": [call]}, usage=CompletionUsage(7, 3)
+        ),
+        CompletionResult(content=f"answer {SENTINEL}", usage=CompletionUsage(2, 1)),
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": f"tool description {SENTINEL}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": "string", "description": SENTINEL}},
+                    "required": ["x"],
+                },
+            },
+        }
+    ]
+    messages = [{"role": "user", "content": f"prompt {SENTINEL}"}]
+    app = create_app(configuration(), token="test-token", adapters={"fake": backend})
+    context = ContextFilter()
+    caplog.handler.addFilter(context)
+    try:
+        with (
+            TestClient(
+                app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+            ) as client,
+            caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+        ):
+            streamed = client.post(
+                "/v1/chat/completions",
+                json={"model": "fake", "stream": True, "messages": messages, "tools": tools},
+            )
+            plain = client.post(
+                "/v1/chat/completions", json={"model": "fake", "messages": messages}
+            )
+    finally:
+        caplog.handler.removeFilter(context)
+    assert streamed.status_code == 200 and plain.status_code == 200
+    assert SENTINEL in streamed.text and SENTINEL in plain.text
+    records = [record for record in caplog.records if record.name == "uvicorn.error"]
+    responses = [record for record in records if record.getMessage().startswith("response ")]
+    assert len(responses) == 2
+    by_id: dict[str, list[str]] = {}
+    for response in responses:
+        request_id = response.getMessage().split(" id=")[1].split()[0]
+        assert request_id.startswith("chatcmpl-")
+        assert response.request_id == request_id  # type: ignore[attr-defined]
+        by_id[request_id] = [
+            record.getMessage()
+            for record in records
+            if record.request_id == request_id  # type: ignore[attr-defined]
+        ]
+    (stream_lines, plain_lines) = by_id.values()
+
+    assert stream_lines[0].startswith(
+        "completion request kind=stream+tools model=fake resolved=fake/default effort=None "
+        "messages=1 tools=1 tool_choice=auto response_format=none prompt_bytes="
+    )
+    waiting = [line for line in stream_lines if line.startswith("stream waiting heartbeats=")]
+    assert waiting and all(line.endswith(" first_content=false") for line in waiting)
+    stream_response = stream_lines[-1]
+    for hint in (
+        "kind=stream+tools",
+        "finish_reason=tool_calls",
+        "tool_calls=1",
+        "prompt_tokens=7",
+        "completion_tokens=3",
+        "buffered=True",
+    ):
+        assert f" {hint}" in stream_response
+    assert int(stream_response.split(" heartbeats=")[1].split()[0]) >= 1
+    assert int(stream_response.split(" first_content_ms=")[1].split()[0]) >= 0
+
+    assert plain_lines[0].startswith(
+        "completion request kind=json+plain model=fake resolved=fake/default effort=None "
+        "messages=1 tools=0 tool_choice=auto response_format=none prompt_bytes="
+    )
+    assert not any(line.startswith("stream waiting") for line in plain_lines)
+    for hint in ("kind=json+plain", "finish_reason=stop", "tool_calls=0", "prompt_tokens=2"):
+        assert f" {hint}" in plain_lines[-1]
+    assert " heartbeats=" not in plain_lines[-1]
+    # Metadata only: prompt, completion and tool schema text never reach the log.
+    assert SENTINEL not in caplog.text
+    assert all(SENTINEL not in record.getMessage() for record in caplog.records)
 
 
 def test_stream_summary_waits_for_delivery_and_reports_interruption(
@@ -664,7 +793,11 @@ def test_real_http_client_abort_is_attributed(
             connection.close()
             assert backend.finished.wait(2)
     messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
-    assert "completion stream cancelled by client heartbeats=1" in messages
+    assert any(
+        message.startswith("completion stream cancelled by client heartbeats=1 elapsed_s=")
+        and message.endswith(" first_content=false")
+        for message in messages
+    )
 
 
 def test_real_http_chunked_body_limit() -> None:

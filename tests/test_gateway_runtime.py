@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import shutil
 import threading
@@ -22,6 +23,7 @@ from relay.adapters.completion import (
     CompletionUsage,
 )
 from relay.gateway import runtime as module
+from relay.gateway.logctx import AGENT, REQUEST_ID, ContextFilter
 from relay.gateway.render import render_repair
 from relay.gateway.runtime import GatewayLimits, GatewayRuntime
 
@@ -352,3 +354,105 @@ def test_result_finished_as_deadline_passes_is_kept_not_discarded(
         assert runtime.active == 0
 
     asyncio.run(scenario())
+
+
+def _filtered(message: str) -> logging.LogRecord:
+    record = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1, message, None, None)
+    assert ContextFilter().filter(record)
+    return record
+
+
+def test_context_filter_marks_unset_and_follows_worker_threads() -> None:
+    record = _filtered("unset")
+    assert (record.request_id, record.agent) == ("-", "-")  # type: ignore[attr-defined]
+    seen: dict[str, tuple[str, str]] = {}
+
+    def scenario() -> None:
+        REQUEST_ID.set("chatcmpl-1")
+        AGENT.set("fake")
+        inside = _filtered("set")
+        seen["here"] = (inside.request_id, inside.agent)  # type: ignore[attr-defined]
+
+        def worker(key: str) -> None:
+            tagged = _filtered(key)
+            seen[key] = (tagged.request_id, tagged.agent)  # type: ignore[attr-defined]
+
+        copied = threading.Thread(target=contextvars.copy_context().run, args=(worker, "copied"))
+        plain = threading.Thread(target=worker, args=("plain",))
+        for thread in (copied, plain):
+            thread.start()
+            thread.join()
+
+    contextvars.copy_context().run(scenario)
+    assert seen == {
+        "here": ("chatcmpl-1", "fake"),
+        "copied": ("chatcmpl-1", "fake"),
+        # A bare thread does not inherit context; adapters must copy it explicitly.
+        "plain": ("-", "-"),
+    }
+    assert REQUEST_ID.get() is None and AGENT.get() is None
+
+
+def test_runtime_worker_inherits_request_id_and_sets_agent_without_leaking() -> None:
+    class ContextBackend(Backend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[tuple[str | None, str | None]] = []
+
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            self.seen.append((REQUEST_ID.get(), AGENT.get()))
+            return super().complete(
+                request,
+                cwd=cwd,
+                cancel=cancel,
+                timeout_s=timeout_s,
+                max_output_bytes=max_output_bytes,
+            )
+
+    async def scenario() -> None:
+        backend = ContextBackend()
+        runtime = GatewayRuntime(GatewayLimits(), {})
+        REQUEST_ID.set("chatcmpl-runtime")
+        handle = runtime.start(backend, CompletionRequest("x"))
+        await handle.result
+        await handle.drain()
+        assert backend.seen == [("chatcmpl-runtime", "fake")]
+        # The agent is set in the completion task's own context, not the caller's.
+        assert AGENT.get() is None
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_repair_retry_logs_exception_class_only(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        backend = Backend(
+            [
+                CompletionInvalid("private-repair-detail", raw="private-raw"),
+                CompletionResult(envelope={"content": "ok", "tool_calls": []}),
+            ]
+        )
+        runtime = GatewayRuntime(GatewayLimits(), {})
+        handle = runtime.start(backend, CompletionRequest("private-prompt", output_schema={}))
+        await handle.result
+        await handle.drain()
+        await runtime.shutdown()
+
+    caplog.set_level(logging.DEBUG, logger="uvicorn.error")
+    # A uvicorn config applied by another test may stop propagation to caplog's root handler.
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    asyncio.run(scenario())
+    assert "completion repair retry error=CompletionInvalid" in caplog.messages
+    for secret in ("private-repair-detail", "private-raw", "private-prompt"):
+        assert secret not in caplog.text

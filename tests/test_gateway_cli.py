@@ -11,8 +11,18 @@ import pytest
 
 from relay.cli.commands import serve
 from relay.cli.main import main
+from relay.core import registry
 from relay.core.registry import load_config
 from relay.gateway import discovery
+
+
+def isolate_user_config(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
+    """Point the user config (and so the log directory) at a temporary home."""
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    # USER_CONFIG is resolved at import time, so the module attribute is what serve reads.
+    monkeypatch.setattr(registry, "USER_CONFIG", home / ".config" / "relay" / "agents.yaml")
+    return home / ".config" / "relay" / "logs"
 
 
 @pytest.mark.parametrize(
@@ -104,13 +114,14 @@ def test_server_uses_global_config_and_fixed_process_options(
     monkeypatch.delenv("RELAY_GATEWAY_TOKEN", raising=False)
     cache = tmp_path / "cache" / "models.json"
     monkeypatch.setattr(discovery, "default_cache_path", lambda: cache)
+    log_file = isolate_user_config(monkeypatch, tmp_path / "home") / "relay-8765.log"
     arguments = ["-C", str(tmp_path), "serve", "--host", "::1", "--concurrency", "2", *options]
     assert main(arguments) == 0
     output = capsys.readouterr()
     assert output.out == ""
     token = str(calls["token"])
     assert len(token) >= 43
-    assert output.err == f"RELAY_GATEWAY_TOKEN={token}\n"
+    assert output.err == f"RELAY_GATEWAY_TOKEN={token}\nrelay log file: {log_file}\n"
     assert calls["uvicorn"] == {
         "host": "::1",
         "port": 8765,
@@ -118,8 +129,10 @@ def test_server_uses_global_config_and_fixed_process_options(
         "reload": False,
         "access_log": False,
         "log_level": log_level,
+        "log_config": serve.log_config(uvicorn.config.LOGGING_CONFIG, log_file),
         "timeout_graceful_shutdown": 2,
     }
+    assert log_file.parent.is_dir() and not log_file.exists()
     assert calls["limits"] == {
         "concurrency": 2,
         "timeout_s": 1800,
@@ -190,16 +203,82 @@ def test_server_cli_with_key_option(
     monkeypatch.setattr(uvicorn, "run", launch)
     monkeypatch.setenv("RELAY_GATEWAY_TOKEN", "ignored-env-token")
     monkeypatch.setattr(discovery, "default_cache_path", lambda: tmp_path / "cache.json")
+    logs = isolate_user_config(monkeypatch, tmp_path / "home")
 
     assert main(["serve", "--key", "cli-key-123"]) == 0
     output = capsys.readouterr()
     assert output.out == ""
-    assert output.err == ""
+    assert output.err == f"relay log file: {logs / 'relay-8765.log'}\n"
     assert calls["token"] == "cli-key-123"
 
     assert main(["serve", "--key", "invalid with spaces"]) == 2
     err_output = capsys.readouterr().err
     assert "relay serve: bearer token must be a nonempty printable ASCII token" in err_output
+
+
+def test_log_config_adds_rotating_context_file_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import contextvars
+    import logging
+    import logging.config
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    from relay.gateway.logctx import AGENT, REQUEST_ID
+
+    path = isolate_user_config(monkeypatch, tmp_path / "home") / "relay-9001.log"
+    assert serve.log_file_path(9001) == path
+    config = serve.log_config(LOGGING_CONFIG, path)
+    handler = config["handlers"]["relay_file"]
+    assert handler == {
+        "class": "logging.handlers.RotatingFileHandler",
+        "filename": str(path),
+        "maxBytes": 10 * 1024 * 1024,
+        "backupCount": 3,
+        "encoding": "utf-8",
+        "delay": True,
+        "formatter": "relay_file",
+        "filters": ["relay_context"],
+    }
+    assert config["filters"]["relay_context"] == {"()": "relay.gateway.logctx.ContextFilter"}
+    assert config["loggers"]["uvicorn.error"]["handlers"] == ["relay_file"]
+    # uvicorn's own console handler and the shared base config stay intact.
+    assert config["handlers"]["default"] == LOGGING_CONFIG["handlers"]["default"]
+    assert config["loggers"]["uvicorn"] == LOGGING_CONFIG["loggers"]["uvicorn"]
+    assert "handlers" not in LOGGING_CONFIG["loggers"]["uvicorn.error"]
+
+    # The dictConfig entries resolve and produce context-tagged lines (on a private logger).
+    path.parent.mkdir(parents=True)
+    probe = logging.getLogger("relay.test.logfile")
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "filters": config["filters"],
+            "formatters": {"relay_file": config["formatters"]["relay_file"]},
+            "handlers": {"relay_file": handler},
+            "loggers": {
+                probe.name: {"handlers": ["relay_file"], "level": "DEBUG", "propagate": False}
+            },
+        }
+    )
+    try:
+        probe.info("outside")
+
+        def tagged() -> None:
+            REQUEST_ID.set("chatcmpl-x")
+            AGENT.set("fake")
+            probe.debug("inside")
+
+        contextvars.copy_context().run(tagged)
+    finally:
+        for attached in probe.handlers[:]:
+            probe.removeHandler(attached)
+            attached.close()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].endswith(" INFO req=- agent=- outside")
+    assert lines[1].endswith(" DEBUG req=chatcmpl-x agent=fake inside")
 
 
 @pytest.mark.parametrize("token", ["", "has space", "line\nbreak", "nonascii-é"])
