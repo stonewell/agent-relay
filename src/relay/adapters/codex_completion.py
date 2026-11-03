@@ -457,7 +457,23 @@ def parse_completion(
                 param="messages",
             )
         message = f"Codex CLI completion failed: exit code {proc.exit_code}"
-        logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
+        reasons = " | ".join(
+            str(
+                event["message"]
+                if "message" in event
+                else event["error"].get("message", "")
+                if isinstance(event.get("error"), dict)
+                else ""
+            )
+            for event in events
+            if event.get("type") in {"turn.failed", "turn.cancelled", "error"}
+        )
+        logger.warning(
+            "%s; stderr: %s; events: %s",
+            message,
+            redact(proc.stderr[-2000:], secrets=secrets),
+            redact(reasons[-2000:], secrets=secrets),
+        )
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)
