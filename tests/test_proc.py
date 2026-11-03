@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -198,6 +199,92 @@ def test_group_is_never_signalled_after_the_leader_is_reaped(
     calls.clear()
     process.kill_tree()  # a late kill must not reach a group ID that may be reused
     assert calls == []
+
+
+# --- diagnostics logging -----------------------------------------------------------------------
+
+
+def silent_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "uvicorn.error" and record.getMessage().startswith("cli silent ")
+    ]
+
+
+def test_a_silent_child_logs_cli_silent_with_growing_silence(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(proc, "SILENCE_LOG_INTERVAL_S", 0.2)
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = run("import time; time.sleep(1.2)")
+    assert result.exit_code == 0
+    lines = silent_lines(caplog)
+    assert len(lines) >= 2
+    since = [float(line.split("since_output_s=")[1].split()[0]) for line in lines]
+    assert all(earlier < later for earlier, later in zip(since, since[1:]))
+    assert all("stdout_bytes=0 stderr_bytes=0" in line for line in lines)
+    exits = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cli exit ")]
+    assert len(exits) == 1
+    assert "code=0 timed_out=False" in exits[0]
+    assert "first_output_s=None" in exits[0]
+
+
+def test_a_chatty_child_logs_no_cli_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The interval leaves room for interpreter start-up before the first line.
+    monkeypatch.setattr(proc, "SILENCE_LOG_INTERVAL_S", 0.5)
+    code = "import time\nfor i in range(30):\n    print(i, flush=True)\n    time.sleep(0.05)\n"
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = run(code)
+    assert result.exit_code == 0
+    assert silent_lines(caplog) == []
+    exits = [r for r in caplog.records if r.getMessage().startswith("cli exit ")]
+    assert len(exits) == 1 and exits[0].levelno == logging.INFO
+    assert "first_output_s=None" not in exits[0].getMessage()
+
+
+def test_cli_exit_logs_flags_only_and_a_redacted_stderr_tail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "sk-fake-relay-secret-0123456789"
+    code = (
+        "import os, sys\n"
+        "sys.stdin.read()\n"
+        "print('STDOUT_SENTINEL')\n"
+        "sys.stderr.write('fatal: key=' + os.environ['RELAY_TEST_FAKE_KEY'] + '\\n')\n"
+        "sys.exit(2)\n"
+    )
+    argv = [PY, "-c", code, "--relay-flag", "--opt=VALUE_SENTINEL", "ARG_SENTINEL"]
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = run_process(
+            argv,
+            cwd=Path.cwd(),
+            env={**os.environ, "RELAY_TEST_FAKE_KEY": secret},
+            stdin="STDIN_SENTINEL",
+        )
+    assert result.exit_code == 2
+    assert "STDOUT_SENTINEL" in result.stdout
+    exits = [r for r in caplog.records if r.getMessage().startswith("cli exit ")]
+    assert len(exits) == 1
+    message = exits[0].getMessage()
+    assert exits[0].levelno == logging.WARNING
+    assert "code=2 timed_out=False" in message
+    assert "flags=-c --relay-flag --opt" in message
+    assert "fatal: key=<redacted>" in message
+    for leaked in (secret, "VALUE_SENTINEL", "ARG_SENTINEL", "STDOUT_SENTINEL", "STDIN_SENTINEL"):
+        assert leaked not in caplog.text
+
+
+def test_cli_exit_is_logged_for_a_timeout(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = run("import time; time.sleep(600)", timeout_s=0.5)
+    assert result.timed_out
+    exits = [r for r in caplog.records if r.getMessage().startswith("cli exit ")]
+    assert len(exits) == 1
+    assert exits[0].levelno == logging.WARNING
+    assert "code=None timed_out=True" in exits[0].getMessage()
 
 
 # --- command resolution ------------------------------------------------------------------------

@@ -11,13 +11,19 @@ process in the tree (``SIGTERM``, a short grace period, then ``SIGKILL``); on Wi
 child is assigned to a kill-on-close Job Object through ``ctypes`` and the tree is killed
 with ``TerminateJobObject`` (design section 15).
 
-This module imports nothing from the rest of the package, and its platform-specific imports
-are kept inside the ``sys.platform == "win32"`` branch so it imports on both OSes.
+This module imports only the stdlib-only :mod:`relay.core.env` (for log redaction) from the
+rest of the package, and its platform-specific imports are kept inside the
+``sys.platform == "win32"`` branch so it imports on both OSes.
+
+Each run logs metadata only (never stdin or stdout content) to the ``uvicorn.error`` logger: a
+``cli silent`` WARNING every :data:`SILENCE_LOG_INTERVAL_S` while a live child writes nothing,
+and one ``cli exit`` line when it finishes, with a redacted stderr tail on failure.
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -31,7 +37,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
+from relay.core.env import redact
+
+logger = logging.getLogger("uvicorn.error")
+
 IS_WINDOWS = sys.platform == "win32"
+
+SILENCE_LOG_INTERVAL_S = 30.0
+"""While a live child writes nothing, log a ``cli silent`` warning this often (seconds)."""
+
+_STDERR_TAIL_CHARS = 2000
+_FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 _CMD_EXTENSIONS = frozenset({".cmd", ".bat"})
@@ -506,11 +522,16 @@ class SupervisedProcess:
         popen: subprocess.Popen[str],
         kill_tree: Callable[[], None],
         close: Callable[[], None],
+        *,
+        flags: Sequence[str] = (),
+        secrets: Mapping[str, str] | None = None,
     ) -> None:
         self._popen = popen
         self._kill_tree = kill_tree
         self._close = close
         self._started = time.monotonic()
+        self._flags = tuple(flags)  # option names only, for diagnostics
+        self._secrets = dict(secrets or {})  # the child env, redacted from logged stderr
 
     @property
     def pid(self) -> int:
@@ -624,45 +645,150 @@ def _stream_run(
     cancellation = _CANCELLATION.get()
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     timed_out = False
+    error: str | None = None
+    started = self._started  # pyright: ignore[reportPrivateUsage]
+    flags = " ".join(self._flags) or "-"  # pyright: ignore[reportPrivateUsage]
+    # Output liveness, sampled from the pump byte counters on each poll (never the content).
+    first_output_at: float | None = None
+    last_output_at = last_silence_log = started
+    seen = 0
+
+    def observe(now: float) -> None:
+        nonlocal first_output_at, last_output_at, last_silence_log, seen
+        total = out_size[0] + err_size[0]
+        if total != seen:
+            seen = total
+            last_output_at = last_silence_log = now
+            if first_output_at is None:
+                first_output_at = now
+
     try:
-        while not _leader_exited(popen) and not overflow.is_set():
-            if cancellation is not None and cancellation.is_set():
-                self.kill_tree()
-                raise ProcessCancelled("attempt cancelled")
-            if deadline is not None and time.monotonic() >= deadline:
-                timed_out = True
-                self.kill_tree()
-                break
-            time.sleep(0.02)
-    except BaseException:
-        self.kill_tree()
-        raise
-    finally:
-        # Wait without reaping on POSIX: group kills below must not outlive the leader's PID.
-        while not _leader_exited(popen):
-            time.sleep(0.01)
-        for thread in threads:
-            thread.join(timeout=2.0)
-        if any(thread.is_alive() for thread in threads):
-            self.kill_tree()  # a descendant still holds a pipe open
-        self._close()  # pyright: ignore[reportPrivateUsage]
-        popen.wait()
-        if any(thread.is_alive() for thread in threads):
+        try:
+            while not _leader_exited(popen) and not overflow.is_set():
+                if cancellation is not None and cancellation.is_set():
+                    self.kill_tree()
+                    raise ProcessCancelled("attempt cancelled")
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    timed_out = True
+                    self.kill_tree()
+                    break
+                observe(now)
+                if now - last_silence_log >= SILENCE_LOG_INTERVAL_S:
+                    last_silence_log = now
+                    logger.warning(
+                        "cli silent elapsed_s=%.1f since_output_s=%.1f stdout_bytes=%d "
+                        "stderr_bytes=%d pid=%s flags=%s",
+                        now - started,
+                        now - last_output_at,
+                        out_size[0],
+                        err_size[0],
+                        popen.pid,
+                        flags,
+                    )
+                time.sleep(0.02)
+        except BaseException:
+            self.kill_tree()
+            raise
+        finally:
+            # Wait without reaping on POSIX: group kills below must not outlive the leader's PID.
+            while not _leader_exited(popen):
+                time.sleep(0.01)
             for thread in threads:
                 thread.join(timeout=2.0)
-        if any(thread.is_alive() for thread in threads):
-            raise ProcessDrainError("process pipes did not drain after tree termination")
-    if overflow.is_set():
-        raise OutputLimitExceeded(
-            f"agent output exceeded the {max_bytes}-byte capture limit; the attempt was stopped"
+            if any(thread.is_alive() for thread in threads):
+                self.kill_tree()  # a descendant still holds a pipe open
+            self._close()  # pyright: ignore[reportPrivateUsage]
+            popen.wait()
+            if any(thread.is_alive() for thread in threads):
+                for thread in threads:
+                    thread.join(timeout=2.0)
+            if any(thread.is_alive() for thread in threads):
+                raise ProcessDrainError("process pipes did not drain after tree termination")
+        if overflow.is_set():
+            raise OutputLimitExceeded(
+                f"agent output exceeded the {max_bytes}-byte capture limit; the attempt was stopped"
+            )
+        return ProcessResult(
+            exit_code=None if timed_out else self.returncode,
+            stdout="".join(out),
+            stderr="".join(err),
+            duration_s=time.monotonic() - started,
+            timed_out=timed_out,
         )
-    return ProcessResult(
-        exit_code=None if timed_out else self.returncode,
-        stdout="".join(out),
-        stderr="".join(err),
-        duration_s=time.monotonic() - self._started,  # pyright: ignore[reportPrivateUsage]
-        timed_out=timed_out,
+    except BaseException as exc:
+        error = type(exc).__name__
+        raise
+    finally:
+        with contextlib.suppress(Exception):  # diagnostics must never mask the outcome
+            now = time.monotonic()
+            observe(now)
+            _log_exit(
+                self,
+                code=None if timed_out else popen.returncode,
+                timed_out=timed_out,
+                error=error,
+                duration_s=now - started,
+                out_bytes=out_size[0],
+                err_bytes=err_size[0],
+                stderr="".join(err),
+                first_output_s=None if first_output_at is None else first_output_at - started,
+                since_output_s=now - last_output_at,
+                flags=flags,
+            )
+
+
+def _log_exit(
+    self: SupervisedProcess,
+    *,
+    code: int | None,
+    timed_out: bool,
+    error: str | None,
+    duration_s: float,
+    out_bytes: int,
+    err_bytes: int,
+    stderr: str,
+    first_output_s: float | None,
+    since_output_s: float,
+    flags: str,
+) -> None:
+    """Log one ``cli exit`` line: metadata, plus a redacted stderr tail on failure or stderr."""
+    failed = timed_out or error is not None or code != 0
+    message = (
+        "cli exit code=%s timed_out=%s duration_s=%.1f stdout_bytes=%d stderr_bytes=%d "
+        "first_output_s=%s since_last_output_s=%.1f flags=%s"
     )
+    args: list[object] = [
+        code,
+        timed_out,
+        duration_s,
+        out_bytes,
+        err_bytes,
+        "None" if first_output_s is None else f"{first_output_s:.1f}",
+        since_output_s,
+        flags,
+    ]
+    if error is not None:
+        message += " error=%s"
+        args.append(error)
+    if stderr:
+        message += "; stderr: %s"
+        secrets = self._secrets  # pyright: ignore[reportPrivateUsage]
+        # Redact a window wide enough that no secret is cut at the edge, then trim to the tail.
+        margin = max((len(value) for value in secrets.values()), default=0)
+        window = stderr[-(_STDERR_TAIL_CHARS + margin) :]
+        args.append(redact(window, secrets=secrets)[-_STDERR_TAIL_CHARS:])
+    logger.log(logging.WARNING if failed else logging.INFO, message, *args)
+
+
+def _option_names(argv: Sequence[str]) -> tuple[str, ...]:
+    """Option names from `argv` (``--name`` of ``--name=value``); never values or operands."""
+    names: list[str] = []
+    for arg in argv[1:]:
+        name = arg.split("=", 1)[0]
+        if _FLAG.fullmatch(name):
+            names.append(name)
+    return tuple(names)
 
 
 def _spawn(
@@ -678,6 +804,8 @@ def _spawn(
     else:
         argv = [str(arg) for arg in command]
         windows_command_line = None
+    # A cmd-shim argv holds only cmd.exe switches and the escaped inner line: log no flags.
+    flags = () if windows_command_line is not None else _option_names(argv)
     if IS_WINDOWS:
         # The raw command line, when present, must be handed to `Popen` as a single string
         # (no `list2cmdline` pass). Spawn suspended, assign to the kill-on-close Job Object,
@@ -707,7 +835,9 @@ def _spawn(
             _close_job(job)
             raise OSError(f"could not attach process {popen.pid} to a Job Object")
         owned = _JobHandle(job)
-        return SupervisedProcess(popen, _windows_killer(popen, owned), owned.close)
+        return SupervisedProcess(
+            popen, _windows_killer(popen, owned), owned.close, flags=flags, secrets=environment
+        )
     popen = subprocess.Popen(
         argv,
         cwd=str(cwd),
@@ -721,7 +851,7 @@ def _spawn(
         start_new_session=True,
     )
     kill_tree, close = _posix_killer(popen)
-    return SupervisedProcess(popen, kill_tree, close)
+    return SupervisedProcess(popen, kill_tree, close, flags=flags, secrets=environment)
 
 
 ProcessObserver = Callable[[str, int | None], None]
