@@ -979,7 +979,10 @@ def test_agy_watcher_thread_cleanly_terminates_without_leaking(
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self.target_func = kwargs.get("target") or (args[0] if args else None)
+            target = kwargs.get("target") or (args[0] if args else None)
+            wrapped = kwargs.get("args") or ()
+            # The adapter runs its watcher through contextvars.Context.run(fn).
+            self.target_func = wrapped[0] if wrapped and callable(wrapped[0]) else target
             captured_threads.append(self)
 
     monkeypatch.setattr(agy_completion.threading, "Thread", TrackingThread)
@@ -1673,3 +1676,32 @@ def test_agy_idle_watchdog_ignores_non_live_turn(
         max_output_bytes=10000,
     )
     assert result.content == "ok"
+
+
+def test_agy_logs_last_step_while_live_turn_is_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(agy_completion, "STEP_LOG_INTERVAL_S", 0.1)
+    code = (
+        "import json, sys, time\n"
+        "print(json.dumps({'event':'step_update','step_update':{'step_type':'thinking'}}),"
+        " flush=True)\n"
+        "time.sleep(0.6)\n"
+        "print(json.dumps({'event':'result','result':{'status':'SUCCESS','structured_output':{}}}))\n"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = adapter.complete(
+            CompletionRequest("hi", "default", output_schema={"type": "object"}),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    del result
+    assert "agy step events=1 last=step_update:thinking" in caplog.text

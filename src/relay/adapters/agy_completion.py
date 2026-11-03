@@ -6,6 +6,7 @@ Translates completion requests into `agy -p "<prompt>" --output-format json` inv
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -72,6 +73,7 @@ ENUMERATION_TIMEOUT_S = 15.0
 # A live (stream-json) turn that emits no event for this long is treated as hung. Thinking
 # is silent, so this is generous; agy itself retries a stalled model connection at 5 min.
 IDLE_TIMEOUT_S = 300.0
+STEP_LOG_INTERVAL_S = 30.0  # cadence of the "agy step" line while a live turn is quiet
 logger = logging.getLogger("uvicorn.error")
 
 MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
@@ -611,16 +613,29 @@ class AgyCompletionAdapter:
         stop_watcher = threading.Event()
 
         idle_expired = threading.Event()
+        step_log_at = [0.0]  # monotonic time before which the quiet-turn line is not repeated
 
         def _watch_marker() -> None:
             while not stop_watcher.is_set() and not process_cancel.is_set():
                 if cancel.is_set():
                     process_cancel.set()
                     return
-                if live and time.monotonic() - activity["at"] > IDLE_TIMEOUT_S:
-                    idle_expired.set()
-                    process_cancel.set()
-                    return
+                if live:
+                    quiet = time.monotonic() - activity["at"]
+                    if quiet > IDLE_TIMEOUT_S:
+                        idle_expired.set()
+                        process_cancel.set()
+                        return
+                    now = time.monotonic()
+                    if quiet >= STEP_LOG_INTERVAL_S and now >= step_log_at[0]:
+                        # Names the last step so a long silent turn can be told from a hung one.
+                        logger.info(
+                            "agy step events=%d last=%s since_event_s=%.0f",
+                            activity["events"],
+                            activity["label"],
+                            quiet,
+                        )
+                        step_log_at[0] = now + STEP_LOG_INTERVAL_S
                 if tool_marker.exists():
                     tool_detected.set()
                     process_cancel.set()
@@ -650,7 +665,9 @@ class AgyCompletionAdapter:
             else discard_output
         )
 
-        watcher_thread = threading.Thread(target=_watch_marker, daemon=True)
+        watcher_thread = threading.Thread(
+            target=contextvars.copy_context().run, args=(_watch_marker,), daemon=True
+        )
         watcher_thread.start()
         try:
             with (
