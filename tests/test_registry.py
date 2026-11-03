@@ -74,6 +74,25 @@ def test_duplicate_yaml_keys_are_rejected() -> None:
         read_source("defaults: { concurrency: 1, concurrency: 2 }", "dup")
 
 
+def test_unhashable_yaml_key_is_a_config_error() -> None:
+    with pytest.raises(ConfigError, match="unhashable key"):
+        read_source("? [a, b]\n: 1\n", "unhashable")
+
+
+def test_yaml_merge_keys_resolve_and_may_be_overridden() -> None:
+    text = """
+    base: &base { cmd: a, enabled: false }
+    agents:
+      a:
+        <<: *base
+        enabled: true
+    """
+    data = read_source(dedent(text), "merge")
+    assert data["agents"]["a"] == {"cmd": "a", "enabled": True}
+    with pytest.raises(ConfigError, match="duplicate key"):
+        read_source("base: &b { x: 1 }\nm: { <<: *b, y: 1, y: 2 }\n", "dup")
+
+
 def test_invalid_yaml_and_non_mapping_are_rejected() -> None:
     with pytest.raises(ConfigError, match="invalid YAML"):
         read_source("a: [unclosed", "bad")

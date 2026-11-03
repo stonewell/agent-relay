@@ -40,6 +40,8 @@ _CREATE_SUSPENDED = 0x00000004  # Windows: start the process with its main threa
 
 # `os.killpg` does not exist on Windows; fall back to killing the direct child.
 _killpg = getattr(os, "killpg", None)
+# Detects leader exit without reaping it (absent on Windows and on macOS before Python 3.13).
+_waitid = None if IS_WINDOWS else getattr(os, "waitid", None)
 
 
 OutputSink = Callable[[str], None]
@@ -109,18 +111,17 @@ def _has_extension(name: str) -> bool:
 def _iter_candidates(
     cmd: str, path_value: str, extensions: Sequence[str], explicit: bool
 ) -> Iterator[str]:
+    # On Windows an extensionless file (e.g. npm's POSIX-sh `claude` beside `claude.cmd`)
+    # cannot be spawned, so a command without an extension is tried with PATHEXT only.
+    suffixes: Sequence[str] = extensions if extensions and not _has_extension(cmd) else ("",)
     if explicit:
-        yield cmd
-        if extensions and not _has_extension(cmd):
-            yield from (cmd + ext for ext in extensions)
+        yield from (cmd + ext for ext in suffixes)
         return
     for directory in path_value.split(os.pathsep):
         if not directory:
             continue
         candidate = os.path.join(directory, cmd)
-        yield candidate
-        if extensions and not _has_extension(cmd):
-            yield from (candidate + ext for ext in extensions)
+        yield from (candidate + ext for ext in suffixes)
 
 
 def _cmd_shim_command_line(shim: str, args: Sequence[str], comspec: str) -> str:
@@ -401,26 +402,61 @@ else:
         return True
 
 
+def _leader_exited(popen: subprocess.Popen[str]) -> bool:
+    """Whether the child exited; on POSIX (with ``waitid``) it is left unreaped.
+
+    An unreaped (zombie) leader pins its PID, and so its process-group ID, so a later
+    ``killpg`` cannot reach an unrelated group that reused the number.
+    """
+    if popen.returncode is not None:
+        return True
+    if _waitid is None:
+        return popen.poll() is not None
+    try:
+        flags = os.WEXITED | os.WNOHANG | os.WNOWAIT  # pyright: ignore[reportAttributeAccessIssue]
+        return _waitid(os.P_PID, popen.pid, flags) is not None  # pyright: ignore[reportAttributeAccessIssue]
+    except ChildProcessError:
+        return popen.poll() is not None
+
+
 def _wait_exit(popen: subprocess.Popen[str], grace: float) -> None:
     deadline = time.monotonic() + grace
-    while popen.poll() is None and time.monotonic() < deadline:
+    while not _leader_exited(popen) and time.monotonic() < deadline:
         time.sleep(0.01)
 
 
-def _posix_killer(popen: subprocess.Popen[str]) -> Callable[[], None]:
+def _posix_killer(
+    popen: subprocess.Popen[str],
+) -> tuple[Callable[[], None], Callable[[], None]]:
+    """Return ``(kill_tree, close)``; ``close`` sweeps the group, then reaps the leader.
+
+    The group is signalled only while the leader is unreaped (see :func:`_leader_exited`);
+    the lock keeps a late pump-thread kill from racing the reap in ``close``.
+    """
+    lock = threading.RLock()
+
+    def signal_group(sig: int) -> None:
+        if popen.returncode is None or _waitid is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                _killpg(popen.pid, sig)  # pyright: ignore[reportOptionalCall]
+
     def kill_tree() -> None:
         if _killpg is None:
             with contextlib.suppress(OSError):
                 popen.kill()
             return
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            _killpg(popen.pid, signal.SIGTERM)
-        _wait_exit(popen, _TERM_GRACE)
-        # The leader may exit while descendants keep running and hold the pipes open.
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            _killpg(popen.pid, getattr(signal, "SIGKILL", 9))
+        with lock:
+            signal_group(signal.SIGTERM)
+            _wait_exit(popen, _TERM_GRACE)
+            # The leader may exit while descendants keep running and hold the pipes open.
+            signal_group(getattr(signal, "SIGKILL", 9))
 
-    return kill_tree
+    def close() -> None:
+        with lock:
+            kill_tree()
+            popen.wait()
+
+    return kill_tree, close
 
 
 class _JobHandle:
@@ -501,55 +537,14 @@ class SupervisedProcess:
     ) -> ProcessResult:
         """Drive the child to completion, capturing output and enforcing `timeout_s`.
 
-        With a `sink`, stdout is drained continuously on its own thread and every line is also
-        offered to the sink; capture and final parsing stay independent of whatever the sink
+        Stdout and stderr are drained continuously on their own threads, and stdin is fed on
+        another, so the timeout and cancellation are enforced even when the child or a
+        descendant stops reading or keeps a pipe open. With a `sink`, every stdout line is
+        also offered to it; capture and final parsing stay independent of whatever the sink
         does (design section 11). Capture is bounded by `max_output_bytes`: exceeding it kills
         the tree and raises :class:`OutputLimitExceeded` instead of truncating silently.
         """
-        if sink is not None:
-            return _stream_run(self, stdin, timeout_s, sink, max_output_bytes)
-        timed_out = False
-        stdout = ""
-        stderr = ""
-        try:
-            try:
-                cancellation = _CANCELLATION.get()
-                if cancellation is None:
-                    stdout, stderr = self._popen.communicate(input=stdin, timeout=timeout_s)
-                else:
-                    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
-                    while True:
-                        if cancellation.is_set():
-                            self.kill_tree()
-                            self._popen.communicate()
-                            raise ProcessCancelled("attempt cancelled")
-                        remaining = deadline - time.monotonic() if deadline is not None else 0.1
-                        if remaining <= 0:
-                            raise subprocess.TimeoutExpired(self._popen.args, timeout_s or 0)
-                        try:
-                            stdout, stderr = self._popen.communicate(
-                                input=stdin, timeout=min(0.1, remaining)
-                            )
-                            break
-                        except subprocess.TimeoutExpired:
-                            stdin = None
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                self.kill_tree()
-                stdout, stderr = self._popen.communicate()
-        except BaseException:
-            self.kill_tree()
-            self._popen.communicate()
-            raise
-        finally:
-            self._close()
-        return ProcessResult(
-            exit_code=None if timed_out else self.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
-            duration_s=time.monotonic() - self._started,
-            timed_out=timed_out,
-        )
+        return _stream_run(self, stdin, timeout_s, sink, max_output_bytes)
 
 
 def _stream_pump(
@@ -593,7 +588,7 @@ def _stream_run(
     self: SupervisedProcess,
     stdin: str | None,
     timeout_s: float | None,
-    sink: OutputSink,
+    sink: OutputSink | None,
     max_bytes: int,
 ) -> ProcessResult:
     popen = self._popen  # pyright: ignore[reportPrivateUsage]
@@ -630,7 +625,7 @@ def _stream_run(
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     timed_out = False
     try:
-        while popen.poll() is None and not overflow.is_set():
+        while not _leader_exited(popen) and not overflow.is_set():
             if cancellation is not None and cancellation.is_set():
                 self.kill_tree()
                 raise ProcessCancelled("attempt cancelled")
@@ -643,12 +638,15 @@ def _stream_run(
         self.kill_tree()
         raise
     finally:
-        popen.wait()
+        # Wait without reaping on POSIX: group kills below must not outlive the leader's PID.
+        while not _leader_exited(popen):
+            time.sleep(0.01)
         for thread in threads:
             thread.join(timeout=2.0)
         if any(thread.is_alive() for thread in threads):
             self.kill_tree()  # a descendant still holds a pipe open
         self._close()  # pyright: ignore[reportPrivateUsage]
+        popen.wait()
         if any(thread.is_alive() for thread in threads):
             for thread in threads:
                 thread.join(timeout=2.0)
@@ -722,7 +720,8 @@ def _spawn(
         errors="replace",
         start_new_session=True,
     )
-    return SupervisedProcess(popen, _posix_killer(popen), _posix_killer(popen))
+    kill_tree, close = _posix_killer(popen)
+    return SupervisedProcess(popen, kill_tree, close)
 
 
 ProcessObserver = Callable[[str, int | None], None]

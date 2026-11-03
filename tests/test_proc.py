@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from relay.core.platform.proc import run_process
+from relay.core.platform import proc
+from relay.core.platform.proc import (
+    CommandNotFound,
+    ResolvedCommand,
+    resolve_command,
+    run_process,
+)
 
 WINDOWS = sys.platform == "win32"
 PY = sys.executable
@@ -146,3 +152,90 @@ def test_timeout_kills_stubborn_descendant_after_parent_exits() -> None:
     assert result.timed_out
     grandchild = int(next(line for line in result.stdout.splitlines() if line.isdigit()))
     assert wait_dead(grandchild)
+
+
+def test_descendant_holding_the_pipes_does_not_hang_a_finished_run() -> None:
+    code = (
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        "print('done', flush=True)\n"
+    )
+    started = time.monotonic()
+    result = run(code, timeout_s=60)
+    assert time.monotonic() - started < 20
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert result.stdout == "done\n"
+
+
+def test_timeout_is_enforced_when_the_child_never_reads_stdin() -> None:
+    started = time.monotonic()
+    result = run("import time; time.sleep(600)", stdin="x" * (4 * 1024 * 1024), timeout_s=1.0)
+    assert result.timed_out
+    assert time.monotonic() - started < 20
+
+
+@pytest.mark.skipif(
+    WINDOWS or proc._waitid is None,  # pyright: ignore[reportPrivateUsage]
+    reason="POSIX non-reaping leader wait",
+)
+def test_group_is_never_signalled_after_the_leader_is_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = proc._killpg  # pyright: ignore[reportPrivateUsage]
+    assert real is not None
+    calls: list[int | None] = []
+
+    def record(pid: int, sig: int) -> None:
+        calls.append(process.returncode)
+        real(pid, sig)
+
+    monkeypatch.setattr(proc, "_killpg", record)
+    process = proc._spawn([PY, "-c", "pass"], cwd=tmp_path, env=dict(os.environ))  # pyright: ignore[reportPrivateUsage]
+    result = process.run()
+    assert result.exit_code == 0
+    assert calls and all(code is None for code in calls)  # swept before the reap
+    calls.clear()
+    process.kill_tree()  # a late kill must not reach a group ID that may be reused
+    assert calls == []
+
+
+# --- command resolution ------------------------------------------------------------------------
+
+
+def shim_dir(tmp_path: Path) -> Path:
+    (tmp_path / "claude").write_text("#!/bin/sh\n")  # npm's POSIX-sh shim
+    (tmp_path / "claude.cmd").write_text("@echo off\r\n")
+    return tmp_path
+
+
+def test_windows_resolution_skips_an_extensionless_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(proc, "IS_WINDOWS", True)
+    directory = shim_dir(tmp_path)
+    env = {"PATH": str(directory), "PATHEXT": ".EXE;.CMD", "COMSPEC": "cmd.exe"}
+    for cmd in ("claude", str(directory / "claude")):
+        resolved = resolve_command(cmd, ("-p",), env=env, cwd=tmp_path)
+        assert resolved.argv[0] == "cmd.exe"
+        assert resolved.windows_command_line is not None
+        assert "claude.cmd" in resolved.windows_command_line.lower()
+
+
+def test_windows_resolution_rejects_an_extensionless_file_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(proc, "IS_WINDOWS", True)
+    (tmp_path / "claude").write_text("#!/bin/sh\n")
+    with pytest.raises(CommandNotFound):
+        resolve_command("claude", env={"PATH": str(tmp_path), "PATHEXT": ".EXE;.CMD"})
+
+
+def test_posix_resolution_uses_the_extensionless_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(proc, "IS_WINDOWS", False)
+    directory = shim_dir(tmp_path)
+    (directory / "claude").chmod(0o755)
+    resolved = resolve_command("claude", ("-p",), env={"PATH": str(directory)}, cwd=tmp_path)
+    assert resolved == ResolvedCommand(argv=(str(directory / "claude"), "-p"))
