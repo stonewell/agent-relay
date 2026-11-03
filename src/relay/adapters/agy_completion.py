@@ -69,6 +69,9 @@ COMPLETION_FLAGS: tuple[str, ...] = (
 )
 PROMPT_LIMIT_BYTES = 30_000 if sys.platform == "win32" else 120_000
 ENUMERATION_TIMEOUT_S = 15.0
+# A live (stream-json) turn that emits no event for this long is treated as hung. Thinking
+# is silent, so this is generous; agy itself retries a stalled model connection at 5 min.
+IDLE_TIMEOUT_S = 300.0
 logger = logging.getLogger("uvicorn.error")
 
 MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
@@ -607,9 +610,15 @@ class AgyCompletionAdapter:
         tool_detected = threading.Event()
         stop_watcher = threading.Event()
 
+        idle_expired = threading.Event()
+
         def _watch_marker() -> None:
             while not stop_watcher.is_set() and not process_cancel.is_set():
                 if cancel.is_set():
+                    process_cancel.set()
+                    return
+                if live and time.monotonic() - activity["at"] > IDLE_TIMEOUT_S:
+                    idle_expired.set()
                     process_cancel.set()
                     return
                 if tool_marker.exists():
@@ -702,6 +711,12 @@ class AgyCompletionAdapter:
                 raise CompletionError(
                     "Antigravity attempted model-side tools", code="backend_tool_use"
                 ) from exc
+            if idle_expired.is_set():
+                raise CompletionError(
+                    f"Antigravity produced no output for {IDLE_TIMEOUT_S:.0f}s",
+                    status=504,
+                    code="timeout",
+                ) from exc
             raise CompletionError(
                 "Completion cancelled", status=503, code="request_cancelled"
             ) from exc
@@ -719,12 +734,14 @@ class AgyCompletionAdapter:
             if live:
                 # Separates "working" (steps seen recently) from "hung" (none) after the fact.
                 now = time.monotonic()
-                logger.info(
-                    "agy turn ended after %.1fs: events=%d last=%s %.1fs before end",
+                logger.log(
+                    logging.WARNING if sys.exc_info()[0] is not None else logging.INFO,
+                    "agy turn ended after %.1fs: events=%d last=%s %.1fs before end idle_kill=%s",
                     now - started,
                     activity["events"],
                     activity["label"],
                     now - activity["at"],
+                    idle_expired.is_set(),
                 )
 
 

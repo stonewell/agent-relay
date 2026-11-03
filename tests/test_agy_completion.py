@@ -1624,3 +1624,52 @@ def test_agy_parse_completion_malformed_function_call_invalid() -> None:
     assert exc_ctx.value.status == 400
     assert exc_ctx.value.code == "context_length_exceeded"
 
+
+
+def test_agy_idle_watchdog_kills_silent_live_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 0.3)
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", "import time; time.sleep(30)")
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
+    start = time.monotonic()
+    with pytest.raises(CompletionError) as exc_info:
+        adapter.complete(
+            CompletionRequest("hi", "default", output_schema={"type": "object"}),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    assert exc_info.value.code == "timeout"
+    assert exc_info.value.status == 504
+    assert "no output" in str(exc_info.value)
+    assert time.monotonic() - start < 15
+
+
+def test_agy_idle_watchdog_ignores_non_live_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 0.1)
+    code = (
+        "import time, json; time.sleep(0.6); "
+        "print(json.dumps({'status':'SUCCESS','response':'ok'}))"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
+    result = adapter.complete(
+        CompletionRequest("hi", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=30.0,
+        max_output_bytes=10000,
+    )
+    assert result.content == "ok"
