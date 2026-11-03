@@ -48,6 +48,7 @@ SILENCE_LOG_INTERVAL_S = 30.0
 
 _STDERR_TAIL_CHARS = 2000
 _FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_.-]*")
+_CONFIG_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 _CMD_EXTENSIONS = frozenset({".cmd", ".bat"})
@@ -784,10 +785,16 @@ def _log_exit(
 def _option_names(argv: Sequence[str]) -> tuple[str, ...]:
     """Option names from `argv` (``--name`` of ``--name=value``); never values or operands."""
     names: list[str] = []
-    for arg in argv[1:]:
+    args = argv[1:]
+    for index, arg in enumerate(args):
         name = arg.split("=", 1)[0]
         if _FLAG.fullmatch(name):
             names.append(name)
+            # `-c key=value` config override: also show the key (never the value).
+            if name == "-c" and "=" not in arg and index + 1 < len(args):
+                key, sep, _ = args[index + 1].partition("=")
+                if sep and _CONFIG_KEY.fullmatch(key):
+                    names[-1] = f"-c {key}"
     return tuple(names)
 
 
