@@ -7,6 +7,7 @@ import logging
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,31 @@ def test_unconfirmed_termination_quarantines_capacity_and_retains_scratch(
         # This fake has no live process; manually remove its deliberately retained residue.
         (backend.paths[0] / "scratch").unlink()
         backend.paths[0].rmdir()
+
+    asyncio.run(scenario())
+
+
+def test_completions_never_queue_behind_a_saturated_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "DRAIN_GRACE_S", 0.03)
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        blocker = threading.Event()
+        occupied = loop.run_in_executor(None, blocker.wait, 5)
+        try:
+            runtime = GatewayRuntime(GatewayLimits(concurrency=2, timeout_s=0.5), {})
+            handles = [runtime.start(Backend(), CompletionRequest("x")) for _ in range(2)]
+            for handle in handles:
+                assert (await handle.result).content == "ok"
+                await handle.drain()
+            assert runtime.healthy and runtime.active == 0
+            await runtime.shutdown()
+        finally:
+            blocker.set()
+            await occupied
 
     asyncio.run(scenario())
 

@@ -119,6 +119,8 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
     # workers stays 1: admission state (GatewayRuntime) is per-process, so more
     # workers would multiply the concurrency limit and break per-agent caps.
     # Scale with --concurrency instead; it maps to parallel backend threads.
+    # Ctrl+C must not wait up to --timeout for open streams: after a short grace uvicorn
+    # cancels them, and lifespan shutdown cancels and drains their completions.
     uvicorn.run(
         app,
         host=args.host,
@@ -127,5 +129,6 @@ def run(args: argparse.Namespace, repo_root: Path) -> int:
         reload=False,
         access_log=False,
         log_level=args.log_level,
+        timeout_graceful_shutdown=2,
     )
     return Exit.OK

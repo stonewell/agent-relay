@@ -8,6 +8,7 @@ without a format checker), so they cannot weaken argument validation.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Iterator
 from typing import Any, Protocol, cast
@@ -30,7 +31,7 @@ ANNOTATION_KEYS = frozenset(
         "readOnly",
         "writeOnly",
         "format",
-        # Common generator output; argument validation may still enforce it.
+        # Common generator output; stripped before argument validation (no regex evaluation).
         "pattern",
         "contentEncoding",
         "contentMediaType",
@@ -164,6 +165,39 @@ def validate_schema(schema: dict[str, Any]) -> int:
     return weight
 
 
+def _without_patterns(schema: dict[str, Any]) -> dict[str, Any]:
+    """Copy a validated schema without ``pattern`` wherever it applies as a keyword.
+
+    Follows exactly the schema positions ``validate_schema`` walks (including local
+    ``$ref`` targets), so property names or enum/default data named ``pattern`` are kept.
+    """
+    root = copy.deepcopy(schema)
+
+    def strip(node: Any, refs: frozenset[str]) -> None:
+        if not isinstance(node, dict):
+            return
+        node = cast("dict[str, Any]", node)
+        node.pop("pattern", None)
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/") and ref not in refs:
+            target: Any = root
+            for part in ref[2:].split("/"):
+                target = target[part.replace("~1", "/").replace("~0", "~")]
+            strip(target, refs | {ref})
+        for key in ("properties", "$defs", "definitions"):
+            for child in cast("dict[str, Any]", node.get(key, {})).values():
+                strip(child, refs)
+        for key in ("additionalProperties", "items"):
+            if key in node:
+                strip(node[key], refs)
+        for key in ("anyOf", "oneOf", "allOf"):
+            for child in cast("list[Any]", node.get(key, [])):
+                strip(child, refs)
+
+    strip(root, frozenset())
+    return root
+
+
 def prepare_envelope(request: ChatRequest) -> dict[str, Any] | None:
     if not request.tools:
         return None
@@ -235,9 +269,14 @@ def validate_envelope(
             work += costs[call["name"]] * _value_weight(call["arguments"])
             if work > MAX_VALIDATION_WORK:
                 raise EnvelopeError("tool arguments exceed validation work budget")
+        # `pattern` is an annotation here: a regex such as ^(a+)+$ must never run on the
+        # worker thread (catastrophic backtracking would outlive the deadline and quarantine).
+        unpatterned = {
+            name: _without_patterns(definitions[name]) for name in {c["name"] for c in calls}
+        }
         for call in calls:
             error = next(
-                cast(_Validator, Draft202012Validator(definitions[call["name"]])).iter_errors(
+                cast(_Validator, Draft202012Validator(unpatterned[call["name"]])).iter_errors(
                     call["arguments"]
                 ),
                 None,

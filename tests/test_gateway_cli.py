@@ -118,6 +118,7 @@ def test_server_uses_global_config_and_fixed_process_options(
         "reload": False,
         "access_log": False,
         "log_level": log_level,
+        "timeout_graceful_shutdown": 2,
     }
     assert calls["limits"] == {
         "concurrency": 2,

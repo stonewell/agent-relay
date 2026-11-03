@@ -946,3 +946,73 @@ def test_stream_completion_chunks_context() -> None:
         sink("test")
     assert current_chunk_sink() is None
     assert chunks == ["test"]
+
+
+def test_runtime_owns_the_shared_request_deadline() -> None:
+    # Body read, app and runtime share one budget; the runtime's 504 wins the transport backstop.
+    backend = WaitingBackend()
+    app = create_app(
+        configuration(),
+        token="test-token",
+        adapters={"fake": backend},
+        limits=GatewayLimits(timeout_s=0.3),
+    )
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "fake", "messages": [{"role": "user", "content": "x"}]},
+        )
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "timeout"
+    assert backend.finished.is_set()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_deadline_error_frame_only_follows_a_complete_sse_frame(
+    monkeypatch: pytest.MonkeyPatch, partial: bool
+) -> None:
+    monkeypatch.setattr(gateway_app, "DEADLINE_GRACE_S", 0.0)
+    delivered: list[Message] = []
+    frame = b"data: {}\n\n"
+
+    async def streaming_app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        body = frame[:5] if partial else frame
+        await send({"type": "http.response.body", "body": body, "more_body": True})
+        await asyncio.sleep(5)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        delivered.append(message)
+
+    middleware = gateway_app.BoundaryMiddleware(
+        streaming_app, token="t", max_bytes=1024, timeout_s=0.05
+    )
+    scope: Scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/healthz",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+    started = time.monotonic()
+    if partial:
+        # Never append an error frame to a cut event; the transport is closed instead.
+        with pytest.raises(TimeoutError):
+            asyncio.run(middleware(scope, receive, send))
+        assert len(delivered) == 2
+    else:
+        asyncio.run(middleware(scope, receive, send))
+        assert len(delivered) == 3
+        assert delivered[-1]["more_body"] is False
+        assert b"deadline_exceeded" in delivered[-1]["body"]
+    assert time.monotonic() - started < 2

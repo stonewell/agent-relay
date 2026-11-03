@@ -10,6 +10,7 @@ its limits reported as null until a probe succeeds.
 from __future__ import annotations
 
 import asyncio
+import functools
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -265,7 +266,11 @@ class ModelCatalog:
                 return asyncio.run_coroutine_threadsafe(run_probe(adapter, alias), loop).result()
 
             async def run() -> None:
-                await asyncio.to_thread(self.observe, probe=True, probe_model=probe_model)
+                # The runtime's pool reserves one thread for this discovery run.
+                await loop.run_in_executor(
+                    runtime.executor,
+                    functools.partial(self.observe, probe=True, probe_model=probe_model),
+                )
 
             self._task = asyncio.create_task(run())
             self._task.add_done_callback(

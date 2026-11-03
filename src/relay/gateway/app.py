@@ -16,6 +16,7 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import urlsplit
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
@@ -51,6 +52,9 @@ __all__ = ["GatewayLimits", "create_app"]
 # Client stall timers are finite: a 15 s cadence raced the observed ~15 s client tolerance.
 KEEPALIVE_INTERVAL = 5.0
 TRANSPORT_CHUNK_BYTES = 16384
+# The runtime enforces the request deadline itself; the transport backstop trails it slightly
+# so the runtime's own timeout response (or SSE error frame) is what clients normally see.
+DEADLINE_GRACE_S = 1.0
 HTTP_MESSAGES = {404: "route not found", 405: "method not allowed"}
 logger = logging.getLogger("uvicorn.error")
 
@@ -141,6 +145,8 @@ class BoundaryMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        # One budget from arrival covers the body read, the app and the runtime.
+        deadline = time.monotonic() + self.timeout_s
         headers: dict[bytes, list[bytes]] = {}
         for key, value in scope["headers"]:
             headers.setdefault(key.lower(), []).append(value)
@@ -192,11 +198,10 @@ class BoundaryMiddleware:
             await response(scope, receive, send)
             return
         body = bytearray()
-        body_deadline = time.monotonic() + self.timeout_s
         while True:
             try:
                 message = await asyncio.wait_for(
-                    receive(), timeout=max(0.001, body_deadline - time.monotonic())
+                    receive(), timeout=max(0.001, deadline - time.monotonic())
                 )
             except TimeoutError:
                 response = JSONResponse(
@@ -226,25 +231,33 @@ class BoundaryMiddleware:
 
         started = False
         is_sse = False
+        at_boundary = True
 
         async def tracked_send(message: Any) -> None:
-            nonlocal started, is_sse
+            nonlocal started, is_sse, at_boundary
             if message["type"] == "http.response.start":
                 started = True
                 is_sse = any(
                     key.lower() == b"content-type" and value.startswith(b"text/event-stream")
                     for key, value in message.get("headers", [])
                 )
+            chunk = message.get("body", b"") if message["type"] == "http.response.body" else b""
+            if chunk:
+                # Unknown until delivered: an interrupted send may be partially written.
+                at_boundary = False
             await send(message)
+            if chunk:
+                at_boundary = chunk.endswith(b"\n\n")
 
+        scope["relay.deadline"] = deadline
         try:
-            async with asyncio.timeout(self.timeout_s):
+            async with asyncio.timeout(max(0.0, deadline + DEADLINE_GRACE_S - time.monotonic())):
                 await self.app(scope, buffered_receive, tracked_send)
         except TimeoutError:
             failure = GatewayError(504, "request deadline exceeded", code="deadline_exceeded")
             if not started:
                 await JSONResponse(failure.body(), status_code=504)(scope, receive, send)
-            elif is_sse:
+            elif is_sse and at_boundary:
                 # A slow/disconnected socket may also prevent delivery of this terminal error.
                 with suppress(TimeoutError, OSError):
                     await asyncio.wait_for(
@@ -258,8 +271,8 @@ class BoundaryMiddleware:
                         timeout=1,
                     )
             else:
-                # A partial non-streaming body cannot be replaced with another JSON
-                # response. Let the server close the incomplete HTTP transport.
+                # A partial non-streaming body, or an SSE frame cut mid-event, cannot be
+                # terminated well-formed. Let the server close the incomplete HTTP transport.
                 raise
         finally:
             cleanup = scope.get("relay.cleanup")
@@ -406,6 +419,9 @@ def create_app(
                 result, content=content, envelope={"content": content, "tool_calls": calls}
             )
 
+        # Share the budget computed at request arrival so the runtime's deadline expires first.
+        deadline: float | None = request.scope.get("relay.deadline")
+        timeout_s = None if deadline is None else max(0.001, deadline - time.monotonic())
         for model in candidates:
             effort = (
                 parsed.reasoning_effort if parsed.reasoning_effort is not None else model.effort
@@ -418,7 +434,9 @@ def create_app(
                 parsed.output_tokens,
             )
             try:
-                handle = runtime.start(model.adapter, invocation, validate=validate)
+                handle = runtime.start(
+                    model.adapter, invocation, validate=validate, timeout_s=timeout_s
+                )
                 break
             except CompletionError as exc:
                 if exc.status != 429 or parsed.model != "relay/auto":
@@ -440,12 +458,15 @@ def create_app(
         watcher = asyncio.create_task(disconnected())
 
         async def cleanup() -> None:
-            watcher.cancel()
-            with suppress(asyncio.CancelledError):
-                await watcher
-            if not handle.result.done():
-                handle.cancel()
-            await handle.drain()
+            # A cancelled anyio scope (client disconnect) re-cancels every await; shield so
+            # drain blocks on the worker instead of busy-spinning until it finishes.
+            with anyio.CancelScope(shield=True):
+                watcher.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watcher
+                if not handle.result.done():
+                    handle.cancel()
+                await handle.drain()
 
         request.scope["relay.cleanup"] = cleanup
 

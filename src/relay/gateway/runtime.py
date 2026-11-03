@@ -7,6 +7,8 @@ the route must call ``handle.drain()`` after sending or abandoning its response.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import logging
 import math
 import shutil
@@ -14,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -95,7 +98,13 @@ class GatewayRuntime:
         self._handles: set[CompletionHandle] = set()
         self._closed = False
         self._healthy = True
-        self._workers: set[asyncio.Task[CompletionResult]] = set()
+        self._workers: set[asyncio.Future[CompletionResult]] = set()
+        # Admission bounds completion workers to `concurrency`; +1 for the single discovery
+        # thread. A dedicated pool means an admitted worker never queues behind unrelated
+        # default-executor work (which would look like an unconfirmed termination).
+        self.executor = ThreadPoolExecutor(
+            max_workers=limits.concurrency + 1, thread_name_prefix="relay-completion"
+        )
 
     @property
     def active(self) -> int:
@@ -201,6 +210,8 @@ class GatewayRuntime:
                     await asyncio.shield(drainage)
                 except asyncio.CancelledError:
                     continue
+        # Drained workers are done; never block the loop on a quarantined (stuck) thread.
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
     async def _call(
         self,
@@ -256,12 +267,14 @@ class GatewayRuntime:
             # the loop below still times out a worker that has not finished by the deadline.
             return validate(result) if validate is not None else result
 
-        worker = asyncio.create_task(asyncio.to_thread(invoke_and_validate))
+        worker = loop.run_in_executor(
+            self.executor, functools.partial(contextvars.copy_context().run, invoke_and_validate)
+        )
         self._workers.add(worker)
         worker.add_done_callback(self._workers.discard)
         interrupted = False
         try:
-            # Polling observes disconnect without cancelling the to_thread task itself.
+            # Polling observes disconnect without cancelling the worker future itself.
             while not worker.done() and not cancellation.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

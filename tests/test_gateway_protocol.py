@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -263,6 +264,47 @@ def test_pattern_keyword_is_accepted_and_reaches_the_backend() -> None:
         envelope_schema,
     )
     assert calls[0]["arguments"] == {"x": "aaa"}
+
+
+def test_catastrophic_pattern_is_never_evaluated_during_argument_validation() -> None:
+    evil = "^(a+)+$"
+    schema = {
+        "type": "object",
+        "$defs": {"s": {"type": "string", "pattern": evil}},
+        "properties": {
+            "x": {"type": "string", "pattern": evil},
+            "y": {"$ref": "#/$defs/s"},
+            # A property *named* pattern is data, not the keyword, and stays enforced.
+            "pattern": {"type": "string"},
+        },
+        "required": ["x", "pattern"],
+    }
+    validate_schema(schema)
+    request = parse_request(
+        tool_request(
+            tools=[{"type": "function", "function": {"name": "edit", "parameters": schema}}]
+        )
+    )
+    envelope_schema = prepare_envelope(request)
+    assert envelope_schema is not None
+    hostile = "a" * 27 + "!"
+
+    def envelope(arguments: dict[str, object]) -> str:
+        return json.dumps(
+            {"content": None, "tool_calls": [{"name": "edit", "arguments": arguments}]}
+        )
+
+    started = time.monotonic()
+    _, calls = validate_envelope(
+        envelope({"x": hostile, "y": hostile, "pattern": "p"}), request, envelope_schema
+    )
+    assert time.monotonic() - started < 1
+    assert calls[0]["arguments"]["x"] == hostile
+    with pytest.raises(EnvelopeError):
+        validate_envelope(envelope({"x": hostile, "pattern": 1}), request, envelope_schema)
+    # The request's schema is not mutated by stripping.
+    assert request.tools is not None
+    assert request.tools[0].function.parameters["properties"]["x"]["pattern"] == evil
 
 
 def test_repair_render_is_bounded_json_data_after_the_transcript() -> None:
