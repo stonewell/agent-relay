@@ -17,7 +17,8 @@ rest of the package, and its platform-specific imports are kept inside the
 
 Each run logs metadata only (never stdin or stdout content) to the ``uvicorn.error`` logger: a
 ``cli silent`` WARNING every :data:`SILENCE_LOG_INTERVAL_S` while a live child writes nothing,
-and one ``cli exit`` line when it finishes, with a redacted stderr tail on failure.
+a ``cli stalled`` WARNING naming the limit when a no-output watchdog kills the tree, and one
+``cli exit`` line when it finishes, with a redacted stderr tail on failure.
 """
 
 from __future__ import annotations
@@ -74,6 +75,20 @@ class OutputLimitExceeded(RuntimeError):
 
 class ProcessDrainError(RuntimeError):
     """A child or inherited pipe remains alive after the termination/drain grace period."""
+
+
+class ProcessStalled(RuntimeError):
+    """The child wrote nothing past a no-output limit; the process tree was stopped.
+
+    `limit` is ``"first-output"`` (nothing written since spawn) or ``"idle"`` (silent since
+    the last output); `silent_s` is how long it had been silent and `limit_s` the limit.
+    """
+
+    def __init__(self, limit: str, silent_s: float, limit_s: float) -> None:
+        super().__init__(f"no output for {silent_s:.1f}s ({limit} limit {limit_s:.1f}s)")
+        self.limit = limit
+        self.silent_s = silent_s
+        self.limit_s = limit_s
 
 
 class CommandNotFound(FileNotFoundError):
@@ -556,6 +571,8 @@ class SupervisedProcess:
         *,
         sink: OutputSink | None = None,
         max_output_bytes: int = MAX_CAPTURE_BYTES,
+        first_output_timeout_s: float | None = None,
+        idle_timeout_s: float | None = None,
     ) -> ProcessResult:
         """Drive the child to completion, capturing output and enforcing `timeout_s`.
 
@@ -565,8 +582,15 @@ class SupervisedProcess:
         also offered to it; capture and final parsing stay independent of whatever the sink
         does (design section 11). Capture is bounded by `max_output_bytes`: exceeding it kills
         the tree and raises :class:`OutputLimitExceeded` instead of truncating silently.
+
+        No-output watchdog: when nothing reaches stdout or stderr within
+        `first_output_timeout_s` of spawn, or for `idle_timeout_s` after the last output, the
+        tree is killed and :class:`ProcessStalled` is raised (distinct from the overall
+        `timeout_s`, which returns ``timed_out=True``).
         """
-        return _stream_run(self, stdin, timeout_s, sink, max_output_bytes)
+        return _stream_run(
+            self, stdin, timeout_s, sink, max_output_bytes, first_output_timeout_s, idle_timeout_s
+        )
 
 
 def _stream_pump(
@@ -612,6 +636,8 @@ def _stream_run(
     timeout_s: float | None,
     sink: OutputSink | None,
     max_bytes: int,
+    first_output_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
 ) -> ProcessResult:
     popen = self._popen  # pyright: ignore[reportPrivateUsage]
     out: list[str] = []
@@ -653,6 +679,8 @@ def _stream_run(
     first_output_at: float | None = None
     last_output_at = last_silence_log = started
     seen = 0
+    stalled: ProcessStalled | None = None
+    stalled_exited = False
 
     def observe(now: float) -> None:
         nonlocal first_output_at, last_output_at, last_silence_log, seen
@@ -662,6 +690,15 @@ def _stream_run(
             last_output_at = last_silence_log = now
             if first_output_at is None:
                 first_output_at = now
+
+    def watchdog(now: float) -> ProcessStalled | None:
+        """The no-output limit that has expired, if any (after `observe`)."""
+        if first_output_at is None:
+            if first_output_timeout_s is not None and now - started >= first_output_timeout_s:
+                return ProcessStalled("first-output", now - started, first_output_timeout_s)
+        elif idle_timeout_s is not None and now - last_output_at >= idle_timeout_s:
+            return ProcessStalled("idle", now - last_output_at, idle_timeout_s)
+        return None
 
     try:
         try:
@@ -675,6 +712,24 @@ def _stream_run(
                     self.kill_tree()
                     break
                 observe(now)
+                stalled = watchdog(now)
+                if stalled is not None:
+                    logger.warning(
+                        "cli stalled limit=%s limit_s=%.1f since_output_s=%.1f elapsed_s=%.1f "
+                        "stdout_bytes=%d stderr_bytes=%d pid=%s flags=%s",
+                        stalled.limit,
+                        stalled.limit_s,
+                        stalled.silent_s,
+                        now - started,
+                        out_size[0],
+                        err_size[0],
+                        popen.pid,
+                        flags,
+                    )
+                    # The leader may have written its last output and exited within this poll.
+                    stalled_exited = _leader_exited(popen)
+                    self.kill_tree()
+                    break
                 if now - last_silence_log >= SILENCE_LOG_INTERVAL_S:
                     last_silence_log = now
                     logger.warning(
@@ -710,6 +765,12 @@ def _stream_run(
             raise OutputLimitExceeded(
                 f"agent output exceeded the {max_bytes}-byte capture limit; the attempt was stopped"
             )
+        if stalled is not None:
+            # Output the pumps had not counted yet at the stall decision, from a leader that
+            # had already exited on its own, is a finished run, not a stall.
+            if not (stalled_exited and out_size[0] + err_size[0] != seen):
+                raise stalled
+            logger.info("cli stall dropped: late output from exited leader pid=%s", popen.pid)
         return ProcessResult(
             exit_code=None if timed_out else self.returncode,
             stdout="".join(out),
@@ -926,6 +987,8 @@ def run_process(
     env: Mapping[str, str],
     stdin: str | None = None,
     timeout_s: float | None = None,
+    first_output_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
 ) -> ProcessResult:
     """Spawn `argv` (already resolved, no shell), capture output, enforce `timeout_s`.
 
@@ -933,7 +996,8 @@ def run_process(
     whose ``windows_command_line`` (for ``.cmd``/``.bat`` shims) is passed to ``Popen``
     verbatim on Windows. On timeout the whole process tree is killed. `stdin`, when given, is
     the prompt text piped to the child's stdin and then closed; otherwise stdin is closed
-    immediately so the child cannot hang waiting for input.
+    immediately so the child cannot hang waiting for input. The optional no-output limits
+    kill the tree and raise :class:`ProcessStalled` (see :meth:`SupervisedProcess.run`).
     """
     observer = _PROCESS_OBSERVER.get()
     cancellation = _CANCELLATION.get()
@@ -951,9 +1015,15 @@ def run_process(
         raise
     try:
         streaming = _OUTPUT_SINK.get()
-        if streaming is None:
-            return process.run(stdin, timeout_s)
-        return process.run(stdin, timeout_s, sink=streaming[0], max_output_bytes=streaming[1])
+        sink, max_bytes = (None, MAX_CAPTURE_BYTES) if streaming is None else streaming
+        return process.run(
+            stdin,
+            timeout_s,
+            sink=sink,
+            max_output_bytes=max_bytes,
+            first_output_timeout_s=first_output_timeout_s,
+            idle_timeout_s=idle_timeout_s,
+        )
     finally:
         if observer is not None:
             observer("finished", process.pid)
