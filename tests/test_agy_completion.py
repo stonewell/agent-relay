@@ -51,7 +51,8 @@ def agy_response(**values: Any) -> ProcessResult:
 def test_agy_completion_adapter_arguments() -> None:
     req = CompletionRequest("test prompt", "default")
     args = AgyCompletionAdapter.arguments(req)
-    assert args[:4] == ("-p", "-", "--output-format", "json")
+    assert args[:2] == ("--output-format", "json")
+    assert "-p" not in args
     assert COMPLETION_FLAGS == (
         "--agent",
         "relay-completion",
@@ -70,7 +71,8 @@ def test_agy_completion_adapter_arguments() -> None:
 
     # stream=True with output_schema is None uses stream-json
     args_stream = AgyCompletionAdapter.arguments(req, stream=True)
-    assert args_stream[:4] == ("-p", "-", "--output-format", "stream-json")
+    assert args_stream[:2] == ("--output-format", "stream-json")
+    assert "-p" not in args_stream
     for flag in COMPLETION_FLAGS:
         assert flag in args_stream
 
@@ -98,13 +100,15 @@ def test_agy_completion_adapter_arguments() -> None:
     # prompt is piped via stdin so schema instructions are not in args
     req_schema = CompletionRequest("test prompt", "default", output_schema={"type": "object"})
     args_schema = AgyCompletionAdapter.arguments(req_schema)
-    assert args_schema[:4] == ("-p", "-", "--output-format", "json")
+    assert args_schema[:2] == ("--output-format", "json")
+    assert "-p" not in args_schema
     assert "--json-schema" not in args_schema
     assert "test prompt" not in args_schema
 
     args_schema_stream = AgyCompletionAdapter.arguments(req_schema, stream=True)
     # Tool turns stream events for liveness; content stays buffered by the caller.
-    assert args_schema_stream[:4] == ("-p", "-", "--output-format", "stream-json")
+    assert args_schema_stream[:2] == ("--output-format", "stream-json")
+    assert "-p" not in args_schema_stream
     assert "--json-schema" not in args_schema_stream
     assert "test prompt" not in args_schema_stream
 
@@ -1161,7 +1165,8 @@ def test_agy_completion_large_prompt_piped_via_stdin(
     assert len(captured_command) == 1
     cmd_args = captured_command[0].argv
     assert large_prompt not in cmd_args
-    assert cmd_args[:3] == ("agy", "-p", "-")
+    assert cmd_args[:3] == ("agy", "--output-format", "stream-json")
+    assert "-p" not in cmd_args
 
     # Prompt + schema_instructions also piped via stdin
     captured_stdin.clear()
@@ -1736,7 +1741,8 @@ def test_agy_non_streaming_turn_uses_stream_json_and_is_watched(
             timeout_s=30.0,
             max_output_bytes=10000,
         )
-    assert seen[0][2:4] == ("--output-format", "stream-json")
+    assert seen[0][:2] == ("--output-format", "stream-json")
+    assert "-p" not in seen[0]
     assert (exc_info.value.status, exc_info.value.code) == (504, "timeout")
     assert "idle limit" in str(exc_info.value)
     assert f"prompt {len(b'hi')} bytes" in str(exc_info.value)

@@ -1,6 +1,6 @@
 """Antigravity (`agy`) completion backend.
 
-Translates completion requests into `agy -p - --output-format stream-json`
+Translates completion requests into `agy --output-format stream-json`
 invocations with prompt delivered via stdin; the events double as the heartbeat
 for the shared no-output watchdog.
 """
@@ -648,7 +648,7 @@ class AgyCompletionAdapter:
     @staticmethod
     def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
         output_format = "stream-json" if stream else "json"
-        args = ["-p", "-", "--output-format", output_format, *COMPLETION_FLAGS]
+        args = ["--output-format", output_format, *COMPLETION_FLAGS]
         model, effort = _resolve_model_and_effort(request.model, request.effort)
         if model != "default":
             args += ["--model", model]
