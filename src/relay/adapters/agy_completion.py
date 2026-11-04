@@ -47,6 +47,7 @@ from relay.core.platform.proc import (
     ProcessDrainError,
     ProcessResult,
     cancel_processes_when,
+    observe_processes,
     resolve_command,
     run_process,
     stream_output,
@@ -74,6 +75,7 @@ ENUMERATION_TIMEOUT_S = 15.0
 # is silent, so this is generous; agy itself retries a stalled model connection at 5 min.
 IDLE_TIMEOUT_S = 300.0
 STEP_LOG_INTERVAL_S = 30.0  # cadence of the "agy step" line while a live turn is quiet
+RESULT_EXIT_GRACE_S = 5.0
 logger = logging.getLogger("uvicorn.error")
 
 MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
@@ -398,21 +400,21 @@ def _stream_sink(
     cancel_event: threading.Event | None = None,
     tool_detected: threading.Event | None = None,
     on_activity: Callable[[str], None] | None = None,
+    on_result: Callable[[dict[str, Any], str], None] | None = None,
+    captured_lines: list[str] | None = None,
 ) -> Callable[[str], None]:
     """Consume stream-json lines. `sink` is None for buffered (tool) turns: events are
     then only liveness signals (`on_activity`) and tool-use detection, never content."""
     emitted = ""
     failed = False
-    if sink is None:
-        def emit(_text: str) -> None:
-            return
-    else:
-        emit = sink
+    emit: CompletionChunkSink = sink if sink is not None else (lambda _: None)
 
     def on_line(line: str) -> None:
         nonlocal emitted, failed
         if failed:
             return
+        if captured_lines is not None:
+            captured_lines.append(line if line.endswith("\n") else line + "\n")
         if tool_marker is not None and tool_marker.exists():
             failed = True
             if tool_detected is not None:
@@ -441,8 +443,15 @@ def _stream_sink(
             return
         if event.get("event") == "result" and isinstance(event.get("result"), dict):
             res = cast("dict[str, Any]", event["result"])
-            if res.get("status") in {"ERROR", "INVALID"} or res.get("is_error") is True:
+            if (
+                res.get("status") in {"ERROR", "INVALID"}
+                or res.get("status") not in (None, "SUCCESS")
+                or res.get("is_error") is True
+            ):
                 failed = True
+                return
+            if on_result is not None:
+                on_result(res, line)
             return
         if event.get("status") in {"ERROR", "INVALID"} or event.get("is_error") is True:
             failed = True
@@ -613,7 +622,15 @@ class AgyCompletionAdapter:
         stop_watcher = threading.Event()
 
         idle_expired = threading.Event()
+        result_received = threading.Event()
+        result_at = [0.0]
+        captured_lines: list[str] = []
+        child_pid: list[int | None] = [None]
         step_log_at = [0.0]  # monotonic time before which the quiet-turn line is not repeated
+
+        def _observe_process(phase: str, pid: int | None) -> None:
+            if phase == "started":
+                child_pid[0] = pid
 
         def _watch_marker() -> None:
             while not stop_watcher.is_set() and not process_cancel.is_set():
@@ -621,6 +638,18 @@ class AgyCompletionAdapter:
                     process_cancel.set()
                     return
                 if live:
+                    if result_received.is_set():
+                        grace_elapsed = time.monotonic() - result_at[0]
+                        if grace_elapsed >= RESULT_EXIT_GRACE_S:
+                            logger.warning(
+                                "agy result received but process still running after %.1fs grace; "
+                                "killing pid=%s events=%d",
+                                RESULT_EXIT_GRACE_S,
+                                child_pid[0] if child_pid[0] is not None else "-",
+                                activity["events"],
+                            )
+                            process_cancel.set()
+                            return
                     quiet = time.monotonic() - activity["at"]
                     if quiet > IDLE_TIMEOUT_S:
                         idle_expired.set()
@@ -653,6 +682,11 @@ class AgyCompletionAdapter:
             activity["at"] = time.monotonic()
             activity["label"] = label
 
+        def note_result(_res: dict[str, Any], _line: str) -> None:
+            if not result_received.is_set():
+                result_at[0] = time.monotonic()
+                result_received.set()
+
         line_sink = (
             _stream_sink(
                 chunk_sink if streaming else None,
@@ -660,6 +694,8 @@ class AgyCompletionAdapter:
                 cancel_event=process_cancel,
                 tool_detected=tool_detected,
                 on_activity=note_activity,
+                on_result=note_result,
+                captured_lines=captured_lines,
             )
             if live
             else discard_output
@@ -669,12 +705,13 @@ class AgyCompletionAdapter:
             target=contextvars.copy_context().run, args=(_watch_marker,), daemon=True
         )
         watcher_thread.start()
+        env = self._environment()
         try:
             with (
                 cancel_processes_when(process_cancel),
+                observe_processes(_observe_process),
                 stream_output(line_sink, max_bytes=max_output_bytes),
             ):
-                env = self._environment()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
@@ -728,6 +765,21 @@ class AgyCompletionAdapter:
                 raise CompletionError(
                     "Antigravity attempted model-side tools", code="backend_tool_use"
                 ) from exc
+            if cancel.is_set():
+                raise CompletionError(
+                    "Completion cancelled", status=503, code="request_cancelled"
+                ) from exc
+            if result_received.is_set() and captured_lines:
+                return parse_completion(
+                    ProcessResult(
+                        0,
+                        stdout="".join(captured_lines),
+                        duration_s=time.monotonic() - started,
+                    ),
+                    structured=request.output_schema is not None,
+                    request_model=request.model,
+                    secrets=env,
+                )
             if idle_expired.is_set():
                 raise CompletionError(
                     f"Antigravity produced no output for {IDLE_TIMEOUT_S:.0f}s",
@@ -854,7 +906,9 @@ def parse_completion(
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
-        if structured and ((payload is not None and payload.get("status") == "INVALID") or malformed):
+        if structured and (
+            (payload is not None and payload.get("status") == "INVALID") or malformed
+        ):
             raw_content = (
                 str(payload.get("response") or payload.get("result") or "")
                 if payload is not None

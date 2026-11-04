@@ -1705,3 +1705,41 @@ def test_agy_logs_last_step_while_live_turn_is_quiet(
         )
     del result
     assert "agy step events=1 last=step_update:thinking" in caplog.text
+
+
+def test_agy_result_exit_grace_returns_result_and_kills_hung_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(agy_completion, "RESULT_EXIT_GRACE_S", 0.2)
+    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 30.0)
+    code = (
+        "import json, sys, time\n"
+        "print(json.dumps({'event':'step_update','step_update':{'step_type':'agent_response','text_delta':'OK'}}), flush=True)\n"
+        "print(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'OK','usage':{'input_tokens':10,'output_tokens':2}}}), flush=True)\n"
+        "time.sleep(30)\n"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
+    chunks: list[str] = []
+    start = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+        result = adapter.complete(
+            CompletionRequest("hi", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+            on_chunk=chunks.append,
+        )
+    elapsed = time.monotonic() - start
+    assert result.content == "OK"
+    assert result.usage == CompletionUsage(10, 2, None, None)
+    assert chunks == ["OK"]
+    assert elapsed < 5.0
+    assert "agy result received but process still running after 0.2s grace; killing pid=" in caplog.text
+    assert "events=2" in caplog.text
+
