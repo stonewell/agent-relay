@@ -9,6 +9,28 @@ Open work items for relay, newest first. Each item is a self-contained brief: th
 
 ## Open Items
 
+### 2. Stream agy tool-bearing turns incrementally; post-fix measurement
+
+**Status:** open — baseline recorded, no post-fix data  
+**Area:** `src/relay/adapters/agy_completion.py` (`streaming` at ~650, `_stream_sink` at ~434), `src/relay/adapters/json_stream.py`
+
+#### Problem
+
+The incremental-content fix (archive item 1) is wired into the claude adapter only. agy still sets `streaming = chunk_sink is not None and request.output_schema is None` and passes `sink=None` for schema turns, so by code reading agy tool-bearing turns still emit no content until completion. Not yet confirmed by measurement.
+
+#### Baseline (agy, `relay-8765.log`, pre-fix, last written 2026-11-03)
+
+167/167 requests `stream+tools`; backend first token mean 2.8 s; added buffering latency mean 31.9 s, median 26.6 s, p90 49.6 s, max 152.6 s; 777 heartbeats; 111 waiting warnings; client aborts at ~50.3 s.
+
+#### Next steps
+
+1. Restart the gateway on the current build, run real agy traffic, and re-run the same log analysis. Compare against the baseline.
+2. If the delay persists, feed `IncrementalJsonContentDecoder` from agy's text events (`step_update.text_delta` / `content_block_delta`) for schema turns. Confirm which event carries the envelope first.
+
+#### Acceptance Criteria
+
+Post-fix added latency is far below the 31.9 s mean and no ~50 s watchdog aborts occur on the same traffic mix.
+
 ### 1. Recoverable quarantine instead of a permanent global lockout
 
 **Status:** open — mitigation shipped, root cause open  
