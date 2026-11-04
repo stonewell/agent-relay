@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .yamlio import load_yaml
 
@@ -40,6 +47,17 @@ class Agent(_Strict):
     concurrency: int | None = Field(default=None, ge=1)
     env: dict[str, str] = {}
     models: dict[str, str] = {}
+    # No-output watchdog overrides (seconds). `first_output_timeout_s` is the base first-output
+    # limit (prompt-size scaling is added); `idle_timeout_s` bounds silence after first output.
+    first_output_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    idle_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+    @field_validator("first_output_timeout_s", "idle_timeout_s", mode="before")
+    @classmethod
+    def _not_bool(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("must be a positive, finite number of seconds")
+        return value
 
 
 class Config(_Strict):

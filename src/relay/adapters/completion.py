@@ -163,6 +163,51 @@ class CompletionError(RuntimeError):
         self.param = param
 
 
+FIRST_OUTPUT_BASE_S = 120.0
+"""Default first-output limit for a small prompt (seconds); ``Agent.first_output_timeout_s``."""
+FIRST_OUTPUT_PER_100KB_S = 30.0
+"""Seconds added to the first-output limit per 100 KiB of prompt (prefill and stdin feed)."""
+IDLE_TIMEOUT_S = 300.0
+"""Default limit on silence after the first output (seconds); ``Agent.idle_timeout_s``."""
+_100_KIB = 100 * 1024
+
+
+def silence_limits(
+    prompt_bytes: int,
+    remaining_s: float,
+    *,
+    first_output_s: float | None = None,
+    idle_s: float | None = None,
+    idle_default: float | None = IDLE_TIMEOUT_S,
+) -> tuple[float | None, float | None]:
+    """The ``(first_output, idle)`` no-output limits for one CLI run.
+
+    The first-output limit is ``base + FIRST_OUTPUT_PER_100KB_S * prompt_bytes / 100 KiB``,
+    where `first_output_s` overrides the base; the idle limit is `idle_s` or `idle_default`
+    (:data:`IDLE_TIMEOUT_S`; None for backends whose events are too coarse to bound
+    silence, so only an explicit `idle_s` applies). Both assume the CLI emits events while
+    it works (every backend runs an event-stream output mode). A limit that would not
+    expire before `remaining_s` is dropped (None): the request deadline already covers it.
+    """
+    base = FIRST_OUTPUT_BASE_S if first_output_s is None else first_output_s
+    idle = idle_default if idle_s is None else idle_s
+    first = base + FIRST_OUTPUT_PER_100KB_S * prompt_bytes / _100_KIB
+    return (
+        first if first < remaining_s else None,
+        idle if idle is not None and idle < remaining_s else None,
+    )
+
+
+def stalled_error(backend: str, limit: str, silent_s: float, prompt_bytes: int) -> CompletionError:
+    """Public 504 for a watchdog kill: which limit fired, silence and prompt size, no content."""
+    return CompletionError(
+        f"{backend} CLI produced no output for {silent_s:.1f}s ({limit} limit); "
+        f"prompt {prompt_bytes} bytes",
+        status=504,
+        code="timeout",
+    )
+
+
 class CompletionInvalid(CompletionError):
     def __init__(
         self, message: str, *, raw: str = "", usage: CompletionUsage | None = None
