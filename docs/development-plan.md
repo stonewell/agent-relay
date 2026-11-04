@@ -19,8 +19,7 @@ Consequences:
 
 - Time-to-first-token becomes time-to-complete-turn. Any client with a first-token deadline fails on every backend slower than that deadline, regardless of backend health.
 - The observed abort is exactly that: `bytes=890` is five 178-byte heartbeat frames and no content; 5 s + 5 x 5 s ≈ 30.4 s.
-- The deadline does not belong to this repo. The caller is the `opencode-runtime-fallback` plugin's first-token watchdog, default `timeout_seconds: 30` (dist `chunk-0wvy6bk9.js:10`), armed only while the session has not yet received content (`v1.js:1057`, `!sessionFirstTokenReceived`). Empty-delta heartbeats never clear it, which is why the keepalive pass cannot help here.
-- Because the guard is per-session and latches on first real content, only a session's first slow turn is killed; later turns on that session complete normally (observed `duration_ms=280869.4 complete=True`). This makes the defect intermittent and easy to misread as flakiness.
+- Because the caller's first-token guard is per-session and latches on first real content, only a session's first slow turn is killed; later turns on that session complete normally (observed `duration_ms=280869.4 complete=True`). This makes the defect intermittent and easy to misread as flakiness.
 
 #### Why it is still open
 
@@ -35,8 +34,7 @@ Fixing it relay-side means adapters must yield deltas as the backend produces th
 
 1. **Stream the first content delta.** Adapt the adapter contract to yield deltas, emit the role chunk and first content chunk as soon as the backend emits them, and keep buffering only for envelope validation. Correct fix, largest change.
 2. **Emit the role chunk at stream open.** Cheap: send `{"role": "assistant"}` before the first heartbeat. Only helps clients that gate on stream initialization rather than on content; does not help a content-based watchdog.
-3. **Client-side timeout.** Configure the caller's first-token watchdog (`timeout_seconds: 0` or a large value) or move its consumers off backends slower than the deadline. No relay change; leaves the latent failure for every other client.
-4. **Document the constraint.** State that backends are non-streaming and that clients must not impose a first-token deadline shorter than the slowest backend turn.
+3. **Document the constraint.** State that backends are non-streaming and that clients must not impose a first-token deadline shorter than the slowest backend turn.
 
 #### Acceptance criteria
 
