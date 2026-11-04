@@ -430,8 +430,8 @@ def _leader_exited(popen: subprocess.Popen[str]) -> bool:
     if _waitid is None:
         return popen.poll() is not None
     try:
-        flags = os.WEXITED | os.WNOHANG | os.WNOWAIT  # pyright: ignore[reportAttributeAccessIssue]
-        return _waitid(os.P_PID, popen.pid, flags) is not None  # pyright: ignore[reportAttributeAccessIssue]
+        flags = os.WEXITED | os.WNOHANG | os.WNOWAIT  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType, reportUnknownMemberType]
+        return _waitid(os.P_PID, popen.pid, flags) is not None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
     except ChildProcessError:
         return popen.poll() is not None
 
@@ -787,14 +787,18 @@ def _option_names(argv: Sequence[str]) -> tuple[str, ...]:
     names: list[str] = []
     args = argv[1:]
     for index, arg in enumerate(args):
-        name = arg.split("=", 1)[0]
-        if _FLAG.fullmatch(name):
-            names.append(name)
-            # `-c key=value` config override: also show the key (never the value).
-            if name == "-c" and "=" not in arg and index + 1 < len(args):
-                key, sep, _ = args[index + 1].partition("=")
-                if sep and _CONFIG_KEY.fullmatch(key):
-                    names[-1] = f"-c {key}"
+        name, eq, attached = arg.partition("=")
+        if not _FLAG.fullmatch(name):
+            continue
+        # Config overrides also show the key (never the value): `-c key=value`,
+        # `-c=key=value`, `-ckey=value`, `--config key=value` and `--config=key=value`.
+        flag, override = name, ""
+        if name in ("-c", "--config"):
+            override = attached if eq else (args[index + 1] if index + 1 < len(args) else "")
+        elif eq and name.startswith("-c") and not name.startswith("--"):
+            flag, override = "-c", name[2:] + "=" + attached
+        key, sep, _ = override.partition("=")
+        names.append(f"{flag} {key}" if sep and _CONFIG_KEY.fullmatch(key) else name)
     return tuple(names)
 
 

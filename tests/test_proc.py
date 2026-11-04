@@ -222,7 +222,7 @@ def test_a_silent_child_logs_cli_silent_with_growing_silence(
     lines = silent_lines(caplog)
     assert len(lines) >= 2
     since = [float(line.split("since_output_s=")[1].split()[0]) for line in lines]
-    assert all(earlier < later for earlier, later in zip(since, since[1:]))
+    assert all(earlier < later for earlier, later in zip(since, since[1:], strict=False))
     assert all("stdout_bytes=0 stderr_bytes=0" in line for line in lines)
     exits = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cli exit ")]
     assert len(exits) == 1
@@ -275,6 +275,34 @@ def test_cli_exit_logs_flags_only_and_a_redacted_stderr_tail(
     assert "fatal: key=<redacted>" in message
     for leaked in (secret, "VALUE_SENTINEL", "ARG_SENTINEL", "STDOUT_SENTINEL", "STDIN_SENTINEL"):
         assert leaked not in caplog.text
+
+
+def test_option_names_show_config_keys_in_every_form_but_never_values() -> None:
+    argv = [
+        "agy",
+        "-c",
+        "model=V1",
+        "-c=sandbox=V2",
+        "-capproval_policy=V3",
+        "--config",
+        "a.b=V4",
+        "--config=x_y=V5",
+        "-c",
+        "not a key",
+        "--opt=V6",
+        "ARG",
+    ]
+    names = proc._option_names(argv)  # pyright: ignore[reportPrivateUsage]
+    assert names == (
+        "-c model",
+        "-c sandbox",
+        "-c approval_policy",
+        "--config a.b",
+        "--config x_y",
+        "-c",
+        "--opt",
+    )
+    assert not any(value in " ".join(names) for value in ("V1", "V2", "V3", "V4", "V5", "V6"))
 
 
 def test_cli_exit_is_logged_for_a_timeout(caplog: pytest.LogCaptureFixture) -> None:

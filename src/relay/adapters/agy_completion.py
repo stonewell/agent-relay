@@ -375,6 +375,14 @@ def _observed(payload: dict[str, Any], request_model: str = "default") -> Observ
     return ObservedModel(model_name, context, output)
 
 
+_SUCCESS_STATUSES = frozenset({"success", "ok", "completed", "done"})
+
+
+def _success_status(status: object) -> bool:
+    """No status, or a success variant in any case; ERROR, INVALID, CANCELED etc. fail."""
+    return status is None or (isinstance(status, str) and status.lower() in _SUCCESS_STATUSES)
+
+
 def _tool_activity(event: dict[str, Any]) -> bool:
     if event.get("event") == "step_update" and isinstance(event.get("step_update"), dict):
         step = cast("dict[str, Any]", event["step_update"])
@@ -396,44 +404,30 @@ def _activity_label(event: dict[str, Any]) -> str:
 
 
 def _is_malformed_step(event: dict[str, Any]) -> tuple[bool, str]:
-    if event.get("event") == "step_update" and isinstance(event.get("step_update"), dict):
-        step = cast("dict[str, Any]", event["step_update"])
-        step_type = step.get("step_type")
-        has_error = (
-            step_type == "error_message"
-            or "error_message" in step
-            or "error" in step
-            or "error_message" in event
-            or "error" in event
-        )
-        if has_error:
-            diagnostic = (
-                str(step.get("error_message") or "")
-                + " "
-                + str(step.get("message") or "")
-                + " "
-                + str(step.get("error") or "")
-                + " "
-                + str(step.get("text") or "")
-                + " "
-                + str(event.get("error_message") or "")
-                + " "
-                + str(event.get("error") or "")
-                + " "
-                + json.dumps(step)
-            ).lower()
-            for marker in MALFORMED_FUNCTION_CALL_MARKERS:
-                if marker in diagnostic:
-                    err_msg = str(
-                        step.get("error_message")
-                        or step.get("message")
-                        or step.get("error")
-                        or step.get("text")
-                        or event.get("error_message")
-                        or event.get("error")
-                        or marker
-                    )
-                    return True, err_msg
+    """A step reporting a malformed function call, and that error's text.
+
+    Only non-empty error fields are inspected; `message`/`text` count as error fields only
+    on an `error_message` step, so model text that merely mentions a marker never matches.
+    """
+    if event.get("event") != "step_update" or not isinstance(event.get("step_update"), dict):
+        return False, ""
+    step = cast("dict[str, Any]", event["step_update"])
+    error_step = step.get("step_type") == "error_message"
+    fields = (
+        (step, "error_message", True),
+        (step, "message", error_step),
+        (step, "error", True),
+        (step, "text", error_step),
+        (event, "error_message", True),
+        (event, "error", True),
+    )
+    for source, key, is_error_field in fields:
+        value = source.get(key)
+        if not is_error_field or not value:
+            continue
+        text = value if isinstance(value, str) else json.dumps(value)
+        if any(marker in text.lower() for marker in MALFORMED_FUNCTION_CALL_MARKERS):
+            return True, text
     return False, ""
 
 
@@ -444,8 +438,7 @@ def _stream_sink(
     tool_detected: threading.Event | None = None,
     on_activity: Callable[[str], None] | None = None,
     on_result: Callable[[dict[str, Any], str], None] | None = None,
-    captured_lines: list[str] | None = None,
-    on_malformed: Callable[[str], None] | None = None,
+    on_malformed: Callable[[str, str], None] | None = None,
 ) -> Callable[[str], None]:
     """Consume stream-json lines. `sink` is None for buffered (tool) turns: events are
     then only liveness signals (`on_activity`) and tool-use detection, never content."""
@@ -457,8 +450,6 @@ def _stream_sink(
         nonlocal emitted, failed
         if failed:
             return
-        if captured_lines is not None:
-            captured_lines.append(line if line.endswith("\n") else line + "\n")
         if tool_marker is not None and tool_marker.exists():
             failed = True
             if tool_detected is not None:
@@ -481,7 +472,7 @@ def _stream_sink(
         if on_malformed is not None:
             is_malformed, malformed_msg = _is_malformed_step(event)
             if is_malformed:
-                on_malformed(malformed_msg)
+                on_malformed(malformed_msg, line)
         if _tool_activity(event):
             failed = True
             if tool_detected is not None:
@@ -491,11 +482,7 @@ def _stream_sink(
             return
         if event.get("event") == "result" and isinstance(event.get("result"), dict):
             res = cast("dict[str, Any]", event["result"])
-            if (
-                res.get("status") in {"ERROR", "INVALID"}
-                or res.get("status") not in (None, "SUCCESS")
-                or res.get("is_error") is True
-            ):
+            if not _success_status(res.get("status")) or res.get("is_error") is True:
                 failed = True
                 return
             if on_result is not None:
@@ -559,14 +546,28 @@ def _stream_sink(
 
 def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     compact = json.dumps(schema, separators=(",", ":"), sort_keys=True)
+    # Example shapes only for the relay envelope, and only those its schema permits
+    # (tool_choice "none" sets maxItems 0; "required" or a named choice sets minItems 1).
+    shapes = ""
+    props = schema.get("properties")
+    calls = cast("dict[str, Any]", props).get("tool_calls") if isinstance(props, dict) else None
+    if isinstance(calls, dict) and "content" in cast("dict[str, Any]", props):
+        calls = cast("dict[str, Any]", calls)
+        if calls.get("maxItems") != 0:
+            shapes += (
+                'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
+                '"arguments": {<args>}}]}\n'
+            )
+        if not calls.get("minItems"):
+            shapes += 'Text: {"content": "<assistant_message>", "tool_calls": []}\n'
     return (
-        "\n\nExplicit user instruction: Your response must be exclusively one raw JSON object "
-        "starting with '{' and ending with '}', with no markdown fence, no XML tags or function "
-        "call blocks, and no prose. Use one of these two shapes:\n"
-        'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
-        '"arguments": {<args>}}]}\n'
-        'Text: {"content": "<assistant_message>", "tool_calls": []}\n'
-        f"JSON Schema: {compact}"
+        "\n\nExplicit user instruction: Do NOT call define_subagent, invoke_subagent, "
+        "send_message, view_file, read_file, list_dir, grep_search, find_by_name, run_command, "
+        "search_web, read_url_content or any other runtime tool or subagent; reply directly. "
+        "Your response must be exclusively one raw JSON object starting with '{' and ending "
+        "with '}', with no markdown fence, no XML tags or function call blocks, and no prose."
+        + (f" Use one of these shapes:\n{shapes}" if shapes else "\n")
+        + f"It must conform to this JSON Schema: {compact}"
     )
 
 
@@ -670,13 +671,14 @@ class AgyCompletionAdapter:
         tool_detected = threading.Event()
         stop_watcher = threading.Event()
 
-        idle_expired = threading.Event()
-        result_received = threading.Event()
-        result_at = [0.0]
-        malformed_detected = threading.Event()
-        malformed_at = [0.0]
-        malformed_error: list[str] = []
-        captured_lines: list[str] = []
+        # First result event (arrival time, line) and first malformed-call report (time,
+        # error, line): only these lines are kept, as the full stdout is already captured
+        # by run_process (and lost only when it raises ProcessCancelled).
+        result: list[tuple[float, str]] = []
+        malformed: list[tuple[float, str, str]] = []
+        # Why the relay stopped the tree, set once by the watcher: "cancelled", "result",
+        # "malformed", "idle" or "tool".
+        kill_reason: list[str | None] = [None]
         child_pid: list[int | None] = [None]
         step_log_at = [0.0]  # monotonic time before which the quiet-turn line is not repeated
 
@@ -684,20 +686,23 @@ class AgyCompletionAdapter:
             if phase == "started":
                 child_pid[0] = pid
 
-        def note_malformed(err: str) -> None:
-            if not malformed_detected.is_set():
-                malformed_at[0] = time.monotonic()
-                malformed_error.append(err)
-                malformed_detected.set()
+        def note_malformed(err: str, line: str) -> None:
+            if not malformed:
+                malformed.append((time.monotonic(), err, line))
+
+        def kill(reason: str) -> None:
+            if kill_reason[0] is None:
+                kill_reason[0] = reason
+            process_cancel.set()
 
         def _watch_marker() -> None:
             while not stop_watcher.is_set() and not process_cancel.is_set():
                 if cancel.is_set():
-                    process_cancel.set()
+                    kill("cancelled")
                     return
                 if live:
-                    if result_received.is_set():
-                        grace_elapsed = time.monotonic() - result_at[0]
+                    if result:
+                        grace_elapsed = time.monotonic() - result[0][0]
                         if grace_elapsed >= RESULT_EXIT_GRACE_S:
                             logger.warning(
                                 "agy result received but process still running after %.1fs grace; "
@@ -706,10 +711,10 @@ class AgyCompletionAdapter:
                                 child_pid[0] if child_pid[0] is not None else "-",
                                 activity["events"],
                             )
-                            process_cancel.set()
+                            kill("result")
                             return
-                    elif malformed_detected.is_set():
-                        grace_elapsed = time.monotonic() - malformed_at[0]
+                    elif malformed:
+                        grace_elapsed = time.monotonic() - malformed[0][0]
                         if grace_elapsed >= MALFORMED_FAIL_FAST_GRACE_S:
                             logger.warning(
                                 "agy malformed function call reported; failing fast after %.1fs "
@@ -717,12 +722,11 @@ class AgyCompletionAdapter:
                                 MALFORMED_FAIL_FAST_GRACE_S,
                                 activity["events"],
                             )
-                            process_cancel.set()
+                            kill("malformed")
                             return
                     quiet = time.monotonic() - activity["at"]
                     if quiet > IDLE_TIMEOUT_S:
-                        idle_expired.set()
-                        process_cancel.set()
+                        kill("idle")
                         return
                     now = time.monotonic()
                     if quiet >= STEP_LOG_INTERVAL_S and now >= step_log_at[0]:
@@ -736,7 +740,7 @@ class AgyCompletionAdapter:
                         step_log_at[0] = now + STEP_LOG_INTERVAL_S
                 if tool_marker.exists():
                     tool_detected.set()
-                    process_cancel.set()
+                    kill("tool")
                     return
                 stop_watcher.wait(0.05)
 
@@ -751,10 +755,9 @@ class AgyCompletionAdapter:
             activity["at"] = time.monotonic()
             activity["label"] = label
 
-        def note_result(_res: dict[str, Any], _line: str) -> None:
-            if not result_received.is_set():
-                result_at[0] = time.monotonic()
-                result_received.set()
+        def note_result(_res: dict[str, Any], line: str) -> None:
+            if not result:
+                result.append((time.monotonic(), line))
 
         line_sink = (
             _stream_sink(
@@ -764,18 +767,47 @@ class AgyCompletionAdapter:
                 tool_detected=tool_detected,
                 on_activity=note_activity,
                 on_result=note_result,
-                captured_lines=captured_lines,
                 on_malformed=note_malformed if request.output_schema is not None else None,
             )
             if live
             else discard_output
         )
 
+        # Before the watcher starts: nothing after its start may skip the join below.
+        env = self._environment()
+
+        def recovered() -> CompletionResult:
+            # The relay stopped the tree after its result arrived: the exit status reflects
+            # the kill, not the turn, so parse the result event as a clean exit.
+            return parse_completion(
+                ProcessResult(
+                    0, stdout=result[0][1] + "\n", duration_s=time.monotonic() - started
+                ),
+                structured=request.output_schema is not None,
+                request_model=request.model,
+                secrets=env,
+            )
+
+        def stopped() -> CompletionError:
+            # The relay stopped the tree before any result: the first kill reason decides.
+            if kill_reason[0] == "malformed":
+                _, err, line = malformed[0]
+                return CompletionInvalid(
+                    f"Antigravity CLI completion failed: malformed function call; error: {err}",
+                    raw=line[:4000],
+                )
+            if kill_reason[0] == "idle":
+                return CompletionError(
+                    f"Antigravity produced no output for {IDLE_TIMEOUT_S:.0f}s",
+                    status=504,
+                    code="timeout",
+                )
+            return CompletionError("Completion cancelled", status=503, code="request_cancelled")
+
         watcher_thread = threading.Thread(
             target=contextvars.copy_context().run, args=(_watch_marker,), daemon=True
         )
         watcher_thread.start()
-        env = self._environment()
         try:
             with (
                 cancel_processes_when(process_cancel),
@@ -813,7 +845,13 @@ class AgyCompletionAdapter:
                 raise CompletionError(
                     "Antigravity attempted model-side tools", code="backend_tool_use"
                 )
-            if cancel.is_set():
+            # A kill can also surface as an ordinary (non-zero) exit rather than
+            # ProcessCancelled when the leader exits while the kill is in flight.
+            if kill_reason[0] is not None:
+                if result:
+                    return recovered()
+                raise stopped()
+            if cancel.is_set() and not result:
                 raise CompletionError(
                     "Completion cancelled", status=503, code="request_cancelled"
                 )
@@ -835,35 +873,11 @@ class AgyCompletionAdapter:
                 raise CompletionError(
                     "Antigravity attempted model-side tools", code="backend_tool_use"
                 ) from exc
-            if cancel.is_set():
-                raise CompletionError(
-                    "Completion cancelled", status=503, code="request_cancelled"
-                ) from exc
-            if result_received.is_set() and captured_lines:
-                return parse_completion(
-                    ProcessResult(
-                        0,
-                        stdout="".join(captured_lines),
-                        duration_s=time.monotonic() - started,
-                    ),
-                    structured=request.output_schema is not None,
-                    request_model=request.model,
-                    secrets=env,
-                )
-            if malformed_detected.is_set():
-                raw_output = "".join(captured_lines)
-                detail = f"; error: {malformed_error[0]}" if malformed_error else ""
-                message = f"Antigravity CLI completion failed: malformed function call{detail}"
-                raise CompletionInvalid(message, raw=raw_output[:4000]) from exc
-            if idle_expired.is_set():
-                raise CompletionError(
-                    f"Antigravity produced no output for {IDLE_TIMEOUT_S:.0f}s",
-                    status=504,
-                    code="timeout",
-                ) from exc
-            raise CompletionError(
-                "Completion cancelled", status=503, code="request_cancelled"
-            ) from exc
+            # A result that already arrived wins over any later kill, including a caller
+            # cancel landing during the exit grace.
+            if result:
+                return recovered()
+            raise stopped() from exc
         except OutputLimitExceeded as exc:
             raise CompletionError(
                 "Completion output limit exceeded", code="output_limit_exceeded"
@@ -880,12 +894,12 @@ class AgyCompletionAdapter:
                 now = time.monotonic()
                 logger.log(
                     logging.WARNING if sys.exc_info()[0] is not None else logging.INFO,
-                    "agy turn ended after %.1fs: events=%d last=%s %.1fs before end idle_kill=%s",
+                    "agy turn ended after %.1fs: events=%d last=%s %.1fs before end kill=%s",
                     now - started,
                     activity["events"],
                     activity["label"],
                     now - activity["at"],
-                    idle_expired.is_set(),
+                    kill_reason[0] or "-",
                 )
 
 
@@ -942,9 +956,9 @@ def parse_completion(
         if isinstance(parsed, dict) and _tool_activity(cast("dict[str, Any]", parsed)):
             raise CompletionError("Antigravity reported model-side tools", code="backend_tool_use")
     payload = agy_envelope(proc.stdout)
-    # Only SUCCESS (or no status) is success; CANCELED/INTERRUPTED/WAITING/RUNNING also fail.
+    # Only a success status (or none) is success; CANCELED/INTERRUPTED/WAITING/RUNNING also fail.
     is_error = payload is not None and (
-        payload.get("status") not in (None, "SUCCESS") or payload.get("is_error") is True
+        not _success_status(payload.get("status")) or payload.get("is_error") is True
     )
     if proc.exit_code != 0 or is_error:
         err_msg = envelope_error(payload) if payload else None

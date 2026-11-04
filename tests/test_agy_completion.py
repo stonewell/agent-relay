@@ -409,20 +409,37 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     assert "Explicit user instruction:" in schema_inst
     assert "exclusively one raw JSON object" in schema_inst
     assert "starting with '{' and ending with '}'" in schema_inst
-    assert "tool_calls" in schema_inst
-    assert (
-        'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", "arguments": {<args>}}]}'
-        in schema_inst
-    )
-    assert 'Text: {"content": "<assistant_message>", "tool_calls": []}' in schema_inst
     assert "<call>" not in schema_inst
-    assert "define_subagent" not in schema_inst
-    assert "invoke_subagent" not in schema_inst
-    assert "send_message" not in schema_inst
-    assert "view_file" not in schema_inst
-    assert "run_command" not in schema_inst
-    assert "search_web" not in schema_inst
+    for name in (
+        "define_subagent",
+        "invoke_subagent",
+        "send_message",
+        "view_file",
+        "run_command",
+        "search_web",
+    ):
+        assert name in schema_inst
     assert json.dumps(schema, separators=(",", ":"), sort_keys=True) in schema_inst
+    # A non-envelope schema gets no conflicting envelope shapes.
+    assert "tool_calls" not in schema_inst
+    assert "Tool call:" not in schema_inst and "Text:" not in schema_inst
+
+    tool_shape = (
+        'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
+        '"arguments": {<args>}}]}'
+    )
+    text_shape = 'Text: {"content": "<assistant_message>", "tool_calls": []}'
+
+    def envelope(**limits: int) -> dict[str, Any]:
+        calls: dict[str, Any] = {"type": "array", **limits}
+        return {"type": "object", "properties": {"content": {}, "tool_calls": calls}}
+
+    auto = agy_completion._agy_schema_instructions(envelope())  # pyright: ignore[reportPrivateUsage]
+    assert tool_shape in auto and text_shape in auto
+    none = agy_completion._agy_schema_instructions(envelope(maxItems=0))  # pyright: ignore[reportPrivateUsage]
+    assert tool_shape not in none and text_shape in none
+    required = agy_completion._agy_schema_instructions(envelope(minItems=1))  # pyright: ignore[reportPrivateUsage]
+    assert tool_shape in required and text_shape not in required
 
     # ChatRequest without tools
     req_no_tools = ChatRequest(
@@ -1788,5 +1805,209 @@ def test_agy_malformed_function_call_fail_fast_kills_hung_process(
     assert "malformed function call" in exc_info.value.args[0]
     assert "improperly formatted function call" in exc_info.value.raw
     assert "agy malformed function call reported; failing fast after 0.2s events=1" in caplog.text
+
+
+@pytest.mark.parametrize("status", ["SUCCESS", "success", "OK", "Completed", "done", None])
+def test_agy_stream_sink_accepts_success_status_variants(status: str | None) -> None:
+    results: list[dict[str, Any]] = []
+    sink = agy_completion._stream_sink(None, on_result=lambda res, _line: results.append(res))  # pyright: ignore[reportPrivateUsage]
+    payload: dict[str, Any] = {"response": "x"} if status is None else {"status": status}
+    sink(json.dumps({"event": "result", "result": payload}))
+    assert len(results) == 1
+
+
+@pytest.mark.parametrize("status", ["ERROR", "error", "INVALID", "CANCELED", "RUNNING"])
+def test_agy_stream_sink_rejects_failure_statuses(status: str) -> None:
+    results: list[dict[str, Any]] = []
+    sink = agy_completion._stream_sink(None, on_result=lambda res, _line: results.append(res))  # pyright: ignore[reportPrivateUsage]
+    sink(json.dumps({"event": "result", "result": {"status": status}}))
+    assert results == []
+
+
+def test_agy_parse_completion_accepts_lowercase_success_status() -> None:
+    assert parse_completion(agy_response(status="success"), structured=False).content == (
+        "hello from agy"
+    )
+
+
+def test_agy_malformed_step_checks_only_non_empty_error_fields() -> None:
+    check = agy_completion._is_malformed_step  # pyright: ignore[reportPrivateUsage]
+
+    def step(**fields: Any) -> dict[str, Any]:
+        return {"event": "step_update", "step_update": fields}
+
+    # Null or empty error fields are not errors.
+    assert check(step(step_type="agent_response", error=None, error_message="")) == (False, "")
+    # Model text that mentions a marker is not an error, even beside an unrelated error.
+    assert check(step(step_type="agent_response", text="a malformed function call")) == (
+        False,
+        "",
+    )
+    assert check(
+        step(step_type="agent_response", text_delta="malformed function call", error="busy")
+    ) == (False, "")
+    # The reported message is the error field that matched.
+    assert check(
+        step(step_type="agent_response", error_message="busy", error="Failed to parse function call")
+    ) == (True, "Failed to parse function call")
+    assert check(step(step_type="error_message", message="Empty function call")) == (
+        True,
+        "Empty function call",
+    )
+    nested = {
+        "event": "step_update",
+        "step_update": {"step_type": "planner"},
+        "error": {"message": "malformed function call"},
+    }
+    matched, message = check(nested)
+    assert matched and "malformed function call" in message
+
+
+def test_agy_environment_failure_leaves_no_watcher_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started: list[threading.Thread] = []
+    orig_thread = threading.Thread
+
+    class TrackingThread(orig_thread):
+        def start(self) -> None:
+            started.append(self)
+            super().start()
+
+    def broken_environment() -> Any:
+        raise RuntimeError("environment unavailable")
+
+    monkeypatch.setattr(agy_completion.threading, "Thread", TrackingThread)
+    adapter = AgyCompletionAdapter(Agent(cmd="agy"))
+    monkeypatch.setattr(adapter, "_environment", broken_environment)
+    with pytest.raises(RuntimeError):
+        adapter.complete(
+            CompletionRequest("hi", "default", output_schema={"type": "object"}),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    assert not any(thread.is_alive() for thread in started)
+
+
+_RESULT_LINES = [
+    json.dumps(
+        {"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "OK"}}
+    ),
+    json.dumps(
+        {
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "OK",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+        }
+    ),
+]
+
+
+def fake_killed_run(
+    lines: list[str],
+    *,
+    cancel: threading.Event | None = None,
+    returns: ProcessResult | None = None,
+) -> Any:
+    """A run_process that streams `lines`, optionally sets the caller `cancel`, waits for the
+    adapter to kill it, then raises ProcessCancelled or returns `returns` (an ordinary exit)."""
+    from relay.core.platform.proc import (
+        _CANCELLATION,  # pyright: ignore[reportPrivateUsage]
+        _OUTPUT_SINK,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    def run(_cmd: Any, **_kwargs: Any) -> ProcessResult:
+        entry = _OUTPUT_SINK.get()
+        killed = _CANCELLATION.get()
+        assert entry is not None and killed is not None
+        for line in lines:
+            entry[0](line + "\n")
+        if cancel is not None:
+            cancel.set()
+        assert killed.wait(5.0)
+        if returns is None:
+            raise ProcessCancelled("attempt cancelled")
+        return returns
+
+    return run
+
+
+def fake_agy(*_a: object, **_k: object) -> tuple[str, ...]:
+    return ("agy",)
+
+
+@pytest.mark.parametrize("ordinary_exit", [False, True])
+def test_agy_result_survives_cancel_landing_during_exit_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ordinary_exit: bool
+) -> None:
+    monkeypatch.setattr(agy_completion, "RESULT_EXIT_GRACE_S", 30.0)
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_agy)
+    cancel = threading.Event()
+    returns = ProcessResult(1, "\n".join(_RESULT_LINES), "killed") if ordinary_exit else None
+    monkeypatch.setattr(
+        agy_completion, "run_process", fake_killed_run(_RESULT_LINES, cancel=cancel, returns=returns)
+    )
+    result = AgyCompletionAdapter(Agent(cmd="agy")).complete(
+        CompletionRequest("hi", "default"),
+        cwd=tmp_path,
+        cancel=cancel,
+        timeout_s=30.0,
+        max_output_bytes=10000,
+        on_chunk=lambda _chunk: None,
+    )
+    assert result.content == "OK"
+    assert result.usage == CompletionUsage(10, 2, None, None)
+
+
+def test_agy_grace_kill_reported_as_ordinary_nonzero_exit_recovers_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agy_completion, "RESULT_EXIT_GRACE_S", 0.05)
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_agy)
+    killed_exit = ProcessResult(1, "\n".join(_RESULT_LINES), "killed")
+    monkeypatch.setattr(
+        agy_completion, "run_process", fake_killed_run(_RESULT_LINES, returns=killed_exit)
+    )
+    result = AgyCompletionAdapter(Agent(cmd="agy")).complete(
+        CompletionRequest("hi", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=30.0,
+        max_output_bytes=10000,
+        on_chunk=lambda _chunk: None,
+    )
+    assert result.content == "OK"
+    assert result.usage == CompletionUsage(10, 2, None, None)
+
+
+def test_agy_malformed_kill_reported_as_ordinary_exit_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agy_completion, "MALFORMED_FAIL_FAST_GRACE_S", 0.05)
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_agy)
+    line = json.dumps(
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "error_message", "message": "Malformed function call"},
+        }
+    )
+    monkeypatch.setattr(
+        agy_completion, "run_process", fake_killed_run([line], returns=ProcessResult(1, line))
+    )
+    with pytest.raises(CompletionInvalid) as exc_info:
+        AgyCompletionAdapter(Agent(cmd="agy")).complete(
+            CompletionRequest("hi", "default", output_schema={"type": "object"}),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    assert "malformed function call" in str(exc_info.value)
+    assert exc_info.value.raw == line
 
 
