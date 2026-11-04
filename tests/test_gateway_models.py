@@ -407,7 +407,7 @@ def test_cursor_groups_verified_inventory_and_keeps_legacy_ids_routable(
             "reasoning_effort": "low",
         }
     )
-    assert catalog.candidates(request)[0].model == "gemini-3.8-flash"
+    assert catalog.candidates(request)[0].model == "gemini-3.8-flash-low"
     request.model = "cursor/gemini-3.8-flash-high"
     assert catalog.candidates(request)[0].effort is None
     request.reasoning_effort = "medium"

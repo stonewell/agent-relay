@@ -368,6 +368,12 @@ class ModelCatalog:
             model = self.models.get(request.model)
             if model is None:
                 raise GatewayError(404, "unknown model", "model", "model_not_found")
+            if request.reasoning_effort is not None:
+                family = _model_family(model.model)
+                variant_id = f"{model.agent}/{family}-{request.reasoning_effort}"
+                variant_model = self.models.get(variant_id)
+                if variant_model is not None:
+                    model = replace(variant_model, id=model.id)
             model.check(request, observed.get((model.agent, model.model)))
             return [model]
         if not self.defaults:

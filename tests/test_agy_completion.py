@@ -81,6 +81,20 @@ def test_agy_completion_adapter_arguments() -> None:
     assert "--effort" in args_model
     assert args_model[args_model.index("--effort") + 1] == "high"
 
+    # Tiered models resolve explicit effort into the model name and omit --effort
+    req_override = CompletionRequest("test prompt", "gemini-3.8-flash-high", effort="medium")
+    args_override = AgyCompletionAdapter.arguments(req_override)
+    assert "--model" in args_override
+    assert args_override[args_override.index("--model") + 1] == "gemini-3.8-flash-medium"
+    assert "--effort" not in args_override
+
+    # Tiered models without explicit effort retain their suffix and omit --effort
+    req_tiered = CompletionRequest("test prompt", "gemini-3.8-flash-high")
+    args_tiered = AgyCompletionAdapter.arguments(req_tiered)
+    assert "--model" in args_tiered
+    assert args_tiered[args_tiered.index("--model") + 1] == "gemini-3.8-flash-high"
+    assert "--effort" not in args_tiered
+
     # prompt is piped via stdin so schema instructions are not in args
     req_schema = CompletionRequest("test prompt", "default", output_schema={"type": "object"})
     args_schema = AgyCompletionAdapter.arguments(req_schema)

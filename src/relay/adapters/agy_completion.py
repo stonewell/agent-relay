@@ -575,6 +575,30 @@ def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     )
 
 
+_EFFORT_TIERS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _resolve_model_and_effort(model: str, effort: str | None) -> tuple[str, str | None]:
+    """Resolve (model, effort) into (cli_model, cli_effort) for the Antigravity CLI.
+
+    AGY CLI rejects passing `--effort` when `--model` already carries a baked-in
+    effort tier suffix (e.g. `--model gemini-3.8-flash-high --effort medium` fails).
+    """
+    if model == "default":
+        return model, effort
+
+    base, _, suffix = model.rpartition("-")
+    if base and suffix in _EFFORT_TIERS:
+        if effort is not None and effort in _EFFORT_TIERS:
+            # Explicit effort overrides the suffix tier; omit --effort flag to avoid CLI conflict
+            return f"{base}-{effort}", None
+        # Matching effort or effort=None; omit --effort flag
+        return model, None
+
+    # Models without tier suffix (e.g. gemini-2.5-pro) use standalone --effort
+    return model, effort
+
+
 class AgyCompletionAdapter:
     id = "agy"
     COMPLETION_FLAGS = COMPLETION_FLAGS
@@ -625,10 +649,11 @@ class AgyCompletionAdapter:
     def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
         output_format = "stream-json" if stream else "json"
         args = ["-p", "-", "--output-format", output_format, *COMPLETION_FLAGS]
-        if request.model != "default":
-            args += ["--model", request.model]
-        if request.effort is not None:
-            args += ["--effort", request.effort]
+        model, effort = _resolve_model_and_effort(request.model, request.effort)
+        if model != "default":
+            args += ["--model", model]
+        if effort is not None:
+            args += ["--effort", effort]
         return tuple(args)
 
     def complete(
