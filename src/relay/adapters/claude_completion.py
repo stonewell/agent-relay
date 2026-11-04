@@ -1,6 +1,7 @@
 """Claude tool-free completion backend.
 
-Streaming is buffered until the final JSON response has been validated.
+Every run uses stream-json events (a heartbeat for the no-output watchdog); the final
+`result` event is parsed, and non-streaming content is buffered until it has been validated.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ from relay.adapters.completion import (
     CompletionUsage,
     ObservedModel,
     current_chunk_sink,
+    silence_limits,
+    stalled_error,
 )
 from relay.core.env import CompleteEnv, build_env, redact
 from relay.core.platform.proc import (
@@ -38,6 +41,7 @@ from relay.core.platform.proc import (
     ProcessCancelled,
     ProcessDrainError,
     ProcessResult,
+    ProcessStalled,
     ResolvedCommand,
     cancel_processes_when,
     resolve_command,
@@ -204,7 +208,7 @@ class ClaudeCompletionAdapter:
 
     @staticmethod
     def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
-        if stream and request.output_schema is None:
+        if stream:
             args = [
                 "-p",
                 "--output-format",
@@ -237,6 +241,7 @@ class ClaudeCompletionAdapter:
         chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
         streaming = chunk_sink is not None and request.output_schema is None
         line_sink = _stream_sink(chunk_sink) if streaming and chunk_sink is not None else _capture
+        prompt_bytes = len(request.prompt.encode("utf-8", errors="replace"))
         try:
             with (
                 cancel_processes_when(cancel),
@@ -247,9 +252,12 @@ class ClaudeCompletionAdapter:
                 if remaining <= 0:
                     raise CompletionError("Completion deadline expired", status=504, code="timeout")
                 try:
+                    # Every run is stream-json, so partial-message events are a heartbeat for
+                    # the no-output watchdog; the final `result` event is the same object
+                    # `--output-format json` prints, so parse_completion is unchanged.
                     command = resolve_command(
                         self._agent.cmd,
-                        self.arguments(request, stream=streaming),
+                        self.arguments(request, stream=True),
                         env=env,
                         cwd=cwd,
                     )
@@ -263,10 +271,24 @@ class ClaudeCompletionAdapter:
                         code="context_length_exceeded",
                         param="tools",
                     )
+                first_output_s, idle_s = silence_limits(
+                    prompt_bytes,
+                    remaining,
+                    first_output_s=self._agent.first_output_timeout_s,
+                    idle_s=self._agent.idle_timeout_s,
+                )
                 proc = run_process(
-                    command, cwd=cwd, env=env, stdin=request.prompt, timeout_s=remaining
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=request.prompt,
+                    timeout_s=remaining,
+                    first_output_timeout_s=first_output_s,
+                    idle_timeout_s=idle_s,
                 )
             return parse_completion(proc, structured=request.output_schema is not None, secrets=env)
+        except ProcessStalled as exc:
+            raise stalled_error("Claude", exc.limit, exc.silent_s, prompt_bytes) from exc
         except CommandNotFound as exc:
             message = (
                 f"Claude CLI not found: command {self._agent.cmd!r} (resolved via PATH); "

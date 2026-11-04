@@ -1657,16 +1657,16 @@ def test_agy_parse_completion_malformed_function_call_invalid() -> None:
 
 
 
-def test_agy_idle_watchdog_kills_silent_live_turn(
+def test_agy_watchdog_kills_silent_tool_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 0.3)
-
+    # The shared run_process watchdog replaced agy's own IDLE_TIMEOUT_S check; a child
+    # that never writes is stopped by the first-output limit from the agent config.
     def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
         return (sys.executable, "-c", "import time; time.sleep(30)")
 
     monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
-    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable, first_output_timeout_s=0.3))
     start = time.monotonic()
     with pytest.raises(CompletionError) as exc_info:
         adapter.complete(
@@ -1679,24 +1679,61 @@ def test_agy_idle_watchdog_kills_silent_live_turn(
     assert exc_info.value.code == "timeout"
     assert exc_info.value.status == 504
     assert "no output" in str(exc_info.value)
+    assert "first-output limit" in str(exc_info.value)
     assert time.monotonic() - start < 15
 
 
-def test_agy_idle_watchdog_ignores_non_live_turn(
+def test_agy_non_streaming_turn_uses_stream_json_and_is_watched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 0.1)
+    # Formerly a non-live (json) turn had no idle detection. Every turn now runs stream-json
+    # so the watchdog sees events; silence after an event is an idle kill.
+    seen: list[tuple[str, ...]] = []
     code = (
-        "import time, json; time.sleep(0.6); "
-        "print(json.dumps({'status':'SUCCESS','response':'ok'}))"
+        "import json, time\n"
+        "print(json.dumps({'event':'step_update','step_update':{'step_type':'thinking'}}),"
+        " flush=True)\n"
+        "time.sleep(30)\n"
+    )
+
+    def fake_resolve(_cmd: str, args: tuple[str, ...], **_k: object) -> tuple[str, ...]:
+        seen.append(args)
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable, idle_timeout_s=0.3))
+    start = time.monotonic()
+    with pytest.raises(CompletionError) as exc_info:
+        adapter.complete(
+            CompletionRequest("hi", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    assert seen[0][2:4] == ("--output-format", "stream-json")
+    assert (exc_info.value.status, exc_info.value.code) == (504, "timeout")
+    assert "idle limit" in str(exc_info.value)
+    assert f"prompt {len(b'hi')} bytes" in str(exc_info.value)
+    assert time.monotonic() - start < 15
+
+
+def test_agy_non_streaming_stream_json_result_parses_like_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = (
+        "import json\n"
+        "print(json.dumps({'event':'step_update','step_update':{'step_type':'agent_response',"
+        "'text_delta':'ok'}}))\n"
+        "print(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'ok',"
+        "'usage':{'input_tokens':3,'output_tokens':1}}}))\n"
     )
 
     def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
         return (sys.executable, "-c", code)
 
     monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
-    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
-    result = adapter.complete(
+    result = AgyCompletionAdapter(Agent(cmd=sys.executable)).complete(
         CompletionRequest("hi", "default"),
         cwd=tmp_path,
         cancel=threading.Event(),
@@ -1704,6 +1741,33 @@ def test_agy_idle_watchdog_ignores_non_live_turn(
         max_output_bytes=10000,
     )
     assert result.content == "ok"
+    assert result.usage == CompletionUsage(3, 1, None, None)
+
+
+def test_agy_result_wins_over_idle_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The CLI prints its result and hangs; the idle limit fires before the exit grace.
+    monkeypatch.setattr(agy_completion, "RESULT_EXIT_GRACE_S", 30.0)
+    code = (
+        "import json, time\n"
+        "print(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'OK'}}),"
+        " flush=True)\n"
+        "time.sleep(30)\n"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    start = time.monotonic()
+    result = AgyCompletionAdapter(Agent(cmd=sys.executable, idle_timeout_s=0.3)).complete(
+        CompletionRequest("hi", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=30.0,
+        max_output_bytes=10000,
+    )
+    assert result.content == "OK"
+    assert time.monotonic() - start < 15
 
 
 def test_agy_logs_last_step_while_live_turn_is_quiet(
@@ -1739,7 +1803,6 @@ def test_agy_result_exit_grace_returns_result_and_kills_hung_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(agy_completion, "RESULT_EXIT_GRACE_S", 0.2)
-    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 30.0)
     code = (
         "import json, sys, time\n"
         "print(json.dumps({'event':'step_update','step_update':{'step_type':'agent_response','text_delta':'OK'}}), flush=True)\n"
@@ -1776,7 +1839,6 @@ def test_agy_malformed_function_call_fail_fast_kills_hung_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(agy_completion, "MALFORMED_FAIL_FAST_GRACE_S", 0.2)
-    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 30.0)
     code = (
         "import json, sys, time\n"
         "print(json.dumps({'event':'step_update','step_update':{'step_type':'error_message','message':'Your previous response contained an improperly formatted function call'}}), flush=True)\n"

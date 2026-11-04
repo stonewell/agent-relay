@@ -218,11 +218,17 @@ def test_claude_arguments_streaming() -> None:
     assert "--verbose" not in args_non_stream
     assert "--include-partial-messages" not in args_non_stream
 
+    # Tool (schema) turns also stream events, for the no-output watchdog; complete() buffers
+    # their content and parses the final result event, which carries structured_output.
     req_schema = CompletionRequest("hello", "default", output_schema={"type": "object"})
     args_schema = ClaudeCompletionAdapter.arguments(req_schema, stream=True)
-    assert args_schema[1:3] == ("--output-format", "json")
-    assert "--verbose" not in args_schema
-    assert "--include-partial-messages" not in args_schema
+    assert args_schema[1:5] == (
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+    )
+    assert args_schema[args_schema.index("--json-schema") + 1] == '{"type":"object"}'
 
 
 def test_claude_stream_sink() -> None:

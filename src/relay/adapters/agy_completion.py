@@ -1,6 +1,7 @@
 """Antigravity (`agy`) completion backend.
 
-Translates completion requests into `agy -p "<prompt>" --output-format json` invocations.
+Translates completion requests into `agy -p "<prompt>" --output-format stream-json`
+invocations; the events double as the heartbeat for the shared no-output watchdog.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from relay.adapters.antigravity import agy_envelope, envelope_error
 from relay.adapters.claude_completion import (
     RATE_LIMIT_MARKERS,
     command_line_too_long,
-    discard_output,
     launch_failed,
 )
 from relay.adapters.completion import (
@@ -38,6 +38,8 @@ from relay.adapters.completion import (
     ObservedModel,
     current_chunk_sink,
     model_aliases,
+    silence_limits,
+    stalled_error,
 )
 from relay.core.env import CompleteEnv, build_env, redact
 from relay.core.platform.proc import (
@@ -46,6 +48,7 @@ from relay.core.platform.proc import (
     ProcessCancelled,
     ProcessDrainError,
     ProcessResult,
+    ProcessStalled,
     cancel_processes_when,
     observe_processes,
     resolve_command,
@@ -71,10 +74,9 @@ COMPLETION_FLAGS: tuple[str, ...] = (
 )
 PROMPT_LIMIT_BYTES = 30_000 if sys.platform == "win32" else 120_000
 ENUMERATION_TIMEOUT_S = 15.0
-# A live (stream-json) turn that emits no event for this long is treated as hung. Thinking
-# is silent, so this is generous; agy itself retries a stalled model connection at 5 min.
-IDLE_TIMEOUT_S = 300.0
-STEP_LOG_INTERVAL_S = 30.0  # cadence of the "agy step" line while a live turn is quiet
+# Hung turns are stopped by the shared no-output watchdog in run_process (completion.py
+# `silence_limits`); its default idle limit matches agy's own 5 min stalled-model retry.
+STEP_LOG_INTERVAL_S = 30.0  # cadence of the "agy step" line while a turn is quiet
 RESULT_EXIT_GRACE_S = 5.0
 MALFORMED_FAIL_FAST_GRACE_S = 5.0
 logger = logging.getLogger("uvicorn.error")
@@ -439,9 +441,11 @@ def _stream_sink(
     on_activity: Callable[[str], None] | None = None,
     on_result: Callable[[dict[str, Any], str], None] | None = None,
     on_malformed: Callable[[str, str], None] | None = None,
+    on_error_result: Callable[[str], None] | None = None,
 ) -> Callable[[str], None]:
     """Consume stream-json lines. `sink` is None for buffered (tool) turns: events are
-    then only liveness signals (`on_activity`) and tool-use detection, never content."""
+    then only liveness signals (`on_activity`) and tool-use detection, never content.
+    `on_result` receives a success result event, `on_error_result` a failed one's line."""
     emitted = ""
     failed = False
     emit: CompletionChunkSink = sink if sink is not None else (lambda _: None)
@@ -484,6 +488,8 @@ def _stream_sink(
             res = cast("dict[str, Any]", event["result"])
             if not _success_status(res.get("status")) or res.get("is_error") is True:
                 failed = True
+                if on_error_result is not None:
+                    on_error_result(line)
                 return
             if on_result is not None:
                 on_result(res, line)
@@ -644,7 +650,8 @@ class AgyCompletionAdapter:
         prompt = request.prompt
         if request.output_schema is not None:
             prompt += _agy_schema_instructions(request.output_schema)
-        if len(prompt.encode("utf-8")) > PROMPT_LIMIT_BYTES:
+        prompt_bytes = len(prompt.encode("utf-8"))
+        if prompt_bytes > PROMPT_LIMIT_BYTES:
             raise CompletionError(
                 "Prompt exceeds CLI argument limit",
                 status=400,
@@ -676,8 +683,11 @@ class AgyCompletionAdapter:
         # by run_process (and lost only when it raises ProcessCancelled).
         result: list[tuple[float, str]] = []
         malformed: list[tuple[float, str, str]] = []
+        # First failed result event line: classifies the error if agy then hangs silently.
+        error_result: list[str] = []
         # Why the relay stopped the tree, set once by the watcher: "cancelled", "result",
-        # "malformed", "idle" or "tool".
+        # "malformed" or "tool". A silent (hung) CLI is stopped by run_process itself, which
+        # raises ProcessStalled.
         kill_reason: list[str | None] = [None]
         child_pid: list[int | None] = [None]
         step_log_at = [0.0]  # monotonic time before which the quiet-turn line is not repeated
@@ -700,53 +710,49 @@ class AgyCompletionAdapter:
                 if cancel.is_set():
                     kill("cancelled")
                     return
-                if live:
-                    if result:
-                        grace_elapsed = time.monotonic() - result[0][0]
-                        if grace_elapsed >= RESULT_EXIT_GRACE_S:
-                            logger.warning(
-                                "agy result received but process still running after %.1fs grace; "
-                                "killing pid=%s events=%d",
-                                RESULT_EXIT_GRACE_S,
-                                child_pid[0] if child_pid[0] is not None else "-",
-                                activity["events"],
-                            )
-                            kill("result")
-                            return
-                    elif malformed:
-                        grace_elapsed = time.monotonic() - malformed[0][0]
-                        if grace_elapsed >= MALFORMED_FAIL_FAST_GRACE_S:
-                            logger.warning(
-                                "agy malformed function call reported; failing fast after %.1fs "
-                                "events=%d",
-                                MALFORMED_FAIL_FAST_GRACE_S,
-                                activity["events"],
-                            )
-                            kill("malformed")
-                            return
-                    quiet = time.monotonic() - activity["at"]
-                    if quiet > IDLE_TIMEOUT_S:
-                        kill("idle")
-                        return
-                    now = time.monotonic()
-                    if quiet >= STEP_LOG_INTERVAL_S and now >= step_log_at[0]:
-                        # Names the last step so a long silent turn can be told from a hung one.
-                        logger.info(
-                            "agy step events=%d last=%s since_event_s=%.0f",
+                if result:
+                    grace_elapsed = time.monotonic() - result[0][0]
+                    if grace_elapsed >= RESULT_EXIT_GRACE_S:
+                        logger.warning(
+                            "agy result received but process still running after %.1fs grace; "
+                            "killing pid=%s events=%d",
+                            RESULT_EXIT_GRACE_S,
+                            child_pid[0] if child_pid[0] is not None else "-",
                             activity["events"],
-                            activity["label"],
-                            quiet,
                         )
-                        step_log_at[0] = now + STEP_LOG_INTERVAL_S
+                        kill("result")
+                        return
+                elif malformed:
+                    grace_elapsed = time.monotonic() - malformed[0][0]
+                    if grace_elapsed >= MALFORMED_FAIL_FAST_GRACE_S:
+                        logger.warning(
+                            "agy malformed function call reported; failing fast after %.1fs "
+                            "events=%d",
+                            MALFORMED_FAIL_FAST_GRACE_S,
+                            activity["events"],
+                        )
+                        kill("malformed")
+                        return
+                now = time.monotonic()
+                quiet = now - activity["at"]
+                if quiet >= STEP_LOG_INTERVAL_S and now >= step_log_at[0]:
+                    # Names the last step so a long silent turn can be told from a hung one.
+                    logger.info(
+                        "agy step events=%d last=%s since_event_s=%.0f",
+                        activity["events"],
+                        activity["label"],
+                        quiet,
+                    )
+                    step_log_at[0] = now + STEP_LOG_INTERVAL_S
                 if tool_marker.exists():
                     tool_detected.set()
                     kill("tool")
                     return
                 stop_watcher.wait(0.05)
 
-        # Tool (schema) turns also run stream-json so step events show the CLI is working;
-        # their content stays buffered for envelope validation (sink None).
-        live = streaming or request.output_schema is not None
+        # Every turn runs stream-json so step events show the CLI is working (the heartbeat
+        # the no-output watchdog relies on); only a streaming turn forwards content, others
+        # keep it buffered for parsing and envelope validation (sink None).
         started = time.monotonic()
         activity: dict[str, Any] = {"events": 0, "at": started, "label": "none"}
 
@@ -759,18 +765,19 @@ class AgyCompletionAdapter:
             if not result:
                 result.append((time.monotonic(), line))
 
-        line_sink = (
-            _stream_sink(
-                chunk_sink if streaming else None,
-                tool_marker,
-                cancel_event=process_cancel,
-                tool_detected=tool_detected,
-                on_activity=note_activity,
-                on_result=note_result,
-                on_malformed=note_malformed if request.output_schema is not None else None,
-            )
-            if live
-            else discard_output
+        def note_error_result(line: str) -> None:
+            if not error_result:
+                error_result.append(line)
+
+        line_sink = _stream_sink(
+            chunk_sink if streaming else None,
+            tool_marker,
+            cancel_event=process_cancel,
+            tool_detected=tool_detected,
+            on_activity=note_activity,
+            on_result=note_result,
+            on_malformed=note_malformed if request.output_schema is not None else None,
+            on_error_result=note_error_result,
         )
 
         # Before the watcher starts: nothing after its start may skip the join below.
@@ -796,12 +803,6 @@ class AgyCompletionAdapter:
                     f"Antigravity CLI completion failed: malformed function call; error: {err}",
                     raw=line[:4000],
                 )
-            if kill_reason[0] == "idle":
-                return CompletionError(
-                    f"Antigravity produced no output for {IDLE_TIMEOUT_S:.0f}s",
-                    status=504,
-                    code="timeout",
-                )
             return CompletionError("Completion cancelled", status=503, code="request_cancelled")
 
         watcher_thread = threading.Thread(
@@ -820,7 +821,7 @@ class AgyCompletionAdapter:
                 try:
                     command = resolve_command(
                         self._agent.cmd,
-                        self.arguments(request, stream=live),
+                        self.arguments(request, stream=True),
                         env=env,
                         cwd=cwd,
                     )
@@ -840,7 +841,20 @@ class AgyCompletionAdapter:
                         code="context_length_exceeded",
                         param="messages",
                     )
-                proc = run_process(command, cwd=cwd, env=env, timeout_s=remaining)
+                first_output_s, idle_s = silence_limits(
+                    prompt_bytes,
+                    remaining,
+                    first_output_s=self._agent.first_output_timeout_s,
+                    idle_s=self._agent.idle_timeout_s,
+                )
+                proc = run_process(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    timeout_s=remaining,
+                    first_output_timeout_s=first_output_s,
+                    idle_timeout_s=idle_s,
+                )
             if tool_marker.exists() or tool_detected.is_set():
                 raise CompletionError(
                     "Antigravity attempted model-side tools", code="backend_tool_use"
@@ -878,6 +892,31 @@ class AgyCompletionAdapter:
             if result:
                 return recovered()
             raise stopped() from exc
+        except ProcessStalled as exc:
+            # The shared watchdog stopped a silent CLI. A tool attempt, an arrived result or
+            # an earlier relay kill (e.g. malformed call) still decides the outcome first.
+            if tool_marker.exists() or tool_detected.is_set():
+                raise CompletionError(
+                    "Antigravity attempted model-side tools", code="backend_tool_use"
+                ) from exc
+            if result:
+                return recovered()
+            if kill_reason[0] is not None:
+                raise stopped() from exc
+            if error_result:
+                # agy reported a failed turn, then hung: classify that error (context length,
+                # rate limit, ...) as a normal exit would. No exit code: the watchdog killed it.
+                return parse_completion(
+                    ProcessResult(
+                        None,
+                        stdout=error_result[0] + "\n",
+                        duration_s=time.monotonic() - started,
+                    ),
+                    structured=request.output_schema is not None,
+                    request_model=request.model,
+                    secrets=env,
+                )
+            raise stalled_error("Antigravity", exc.limit, exc.silent_s, prompt_bytes) from exc
         except OutputLimitExceeded as exc:
             raise CompletionError(
                 "Completion output limit exceeded", code="output_limit_exceeded"
@@ -889,18 +928,17 @@ class AgyCompletionAdapter:
         finally:
             stop_watcher.set()
             watcher_thread.join()
-            if live:
-                # Separates "working" (steps seen recently) from "hung" (none) after the fact.
-                now = time.monotonic()
-                logger.log(
-                    logging.WARNING if sys.exc_info()[0] is not None else logging.INFO,
-                    "agy turn ended after %.1fs: events=%d last=%s %.1fs before end kill=%s",
-                    now - started,
-                    activity["events"],
-                    activity["label"],
-                    now - activity["at"],
-                    kill_reason[0] or "-",
-                )
+            # Separates "working" (steps seen recently) from "hung" (none) after the fact.
+            now = time.monotonic()
+            logger.log(
+                logging.WARNING if sys.exc_info()[0] is not None else logging.INFO,
+                "agy turn ended after %.1fs: events=%d last=%s %.1fs before end kill=%s",
+                now - started,
+                activity["events"],
+                activity["label"],
+                now - activity["at"],
+                kill_reason[0] or "-",
+            )
 
 
 def _parse_candidate(raw: str) -> dict[str, Any] | None:

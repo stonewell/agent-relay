@@ -33,6 +33,8 @@ from relay.adapters.completion import (
     CompletionUsage,
     current_chunk_sink,
     model_aliases,
+    silence_limits,
+    stalled_error,
 )
 from relay.adapters.parsing import strict_schema
 from relay.core.env import CompleteEnv, build_env, redact
@@ -42,6 +44,7 @@ from relay.core.platform.proc import (
     ProcessCancelled,
     ProcessDrainError,
     ProcessResult,
+    ProcessStalled,
     cancel_processes_when,
     resolve_command,
     run_process,
@@ -371,10 +374,33 @@ class CodexCompletionAdapter:
                         "JSON-encoded string containing the complete arguments object. "
                         "Relay decodes that string before the client receives the proposal.\n"
                     )
+                prompt_bytes = len(prompt.encode("utf-8", errors="replace"))
+                # `exec --json` emits an event per finished item, too coarse to bound silence
+                # inside one long reasoning item: no idle limit unless the agent sets one.
+                first_output_s, idle_s = silence_limits(
+                    prompt_bytes,
+                    remaining,
+                    first_output_s=self._agent.first_output_timeout_s,
+                    idle_s=self._agent.idle_timeout_s,
+                    idle_default=None,
+                )
                 try:
                     proc = run_process(
-                        command, cwd=cwd, env=env, stdin=prompt, timeout_s=remaining
+                        command,
+                        cwd=cwd,
+                        env=env,
+                        stdin=prompt,
+                        timeout_s=remaining,
+                        first_output_timeout_s=first_output_s,
+                        idle_timeout_s=idle_s,
                     )
+                except ProcessStalled as exc:
+                    # A denied tool can leave the CLI silent: report the tool, not a timeout.
+                    if (cwd / _DENIED).exists():
+                        raise CompletionError(
+                            "Codex attempted a model-side tool", code="backend_tool_activity"
+                        ) from exc
+                    raise stalled_error("Codex", exc.limit, exc.silent_s, prompt_bytes) from exc
                 except CommandNotFound:
                     raise
                 except OSError as exc:

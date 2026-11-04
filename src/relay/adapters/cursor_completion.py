@@ -35,6 +35,8 @@ from relay.adapters.completion import (
     ObservedModel,
     current_chunk_sink,
     model_aliases,
+    silence_limits,
+    stalled_error,
 )
 from relay.adapters.cursor import resolve_cursor_command, schema_instructions
 from relay.core.env import CompleteEnv, build_env, redact
@@ -44,6 +46,7 @@ from relay.core.platform.proc import (
     ProcessCancelled,
     ProcessDrainError,
     ProcessResult,
+    ProcessStalled,
     cancel_processes_when,
     resolve_command,
     run_process,
@@ -293,7 +296,7 @@ class CursorCompletionAdapter:
         if request.output_schema is not None:
             prompt += schema_instructions(request.output_schema)
         try:
-            prompt.encode("utf-8", errors="strict")
+            prompt_bytes = len(prompt.encode("utf-8", errors="strict"))
         except UnicodeEncodeError as exc:
             raise CompletionError("Invalid Unicode prompt", status=400, param="messages") from exc
         try:
@@ -319,10 +322,34 @@ class CursorCompletionAdapter:
                     command = resolve_command(command_name, args, env=env, cwd=cwd)
                 except ValueError as exc:
                     raise launch_failed("Cursor", exc) from exc
-                proc = run_process(command, cwd=cwd, env=env, stdin=prompt, timeout_s=remaining)
+                # Every run is stream-json, but non-streaming runs emit whole messages, too
+                # coarse to bound silence in a long turn: no idle limit unless the agent sets one.
+                first_output_s, idle_s = silence_limits(
+                    prompt_bytes,
+                    remaining,
+                    first_output_s=self._agent.first_output_timeout_s,
+                    idle_s=self._agent.idle_timeout_s,
+                    idle_default=None,
+                )
+                proc = run_process(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=prompt,
+                    timeout_s=remaining,
+                    first_output_timeout_s=first_output_s,
+                    idle_timeout_s=idle_s,
+                )
             if tool_marker.exists():
                 raise CompletionError("Cursor attempted model-side tools", code="backend_tool_use")
             return parse_completion(proc, structured=request.output_schema is not None, secrets=env)
+        except ProcessStalled as exc:
+            # A denied tool can leave the CLI silent: report the tool, not a timeout.
+            if tool_marker.exists():
+                raise CompletionError(
+                    "Cursor attempted model-side tools", code="backend_tool_use"
+                ) from exc
+            raise stalled_error("Cursor", exc.limit, exc.silent_s, prompt_bytes) from exc
         except CommandNotFound as exc:
             raise CompletionError(
                 f"Cursor CLI not found: command {command_name!r}; check agents.cursor.cmd",
