@@ -685,6 +685,14 @@ def create_app(
                 elif not streamed:
                     remainder = content
                 else:
+                    # Streamed text cannot be retracted; the final content diverged
+                    # (e.g. after a repair retry), so the difference is not delivered.
+                    logger.warning(
+                        "streamed content diverged from final; dropping remainder "
+                        "streamed_chars=%d final_chars=%d",
+                        len(streamed),
+                        len(content),
+                    )
                     remainder = ""
                 if remainder:
                     for piece in Slice(
