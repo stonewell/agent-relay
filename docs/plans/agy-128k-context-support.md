@@ -115,9 +115,10 @@ For structured output turns (`request.output_schema is not None`), `agy` require
      ```python
      - PROMPT_LIMIT_BYTES = 30_000 if sys.platform == "win32" else 120_000
      ```
-   - (Optional) If external code references the constant, maintain a backwards-compatibility alias or note in documentation, but remove its enforcement.
+   - Delete the constant outright (no alias; an unenforced constant is misleading) and remove its import from `tests/test_agy_completion.py` (line 19), which otherwise fails at import.
 
 2. **Update `AgyCompletionAdapter.arguments()`**:
+   - Today it merges the schema instructions into the prompt argument (currently `agy_completion.py` lines 623-626). Remove that merge; `arguments()` must not take the prompt at all.
    - Change argument generation to pass `"-"` instead of `prompt`:
      ```python
      @staticmethod
@@ -150,16 +151,19 @@ For structured output turns (`request.output_schema is not None`), `agy` require
          timeout_s=remaining,
      )
      ```
-   - Windows `.cmd` shim newline handling: Windows shims no longer fail on multi-line prompts because prompt text does not pass through `argv`. Remove or retain the `ValueError` guard as fallback.
+   - The prompt is built once in `complete()` and passed as `stdin=prompt` to the single `run_process(...)` call (currently line 843). `self.arguments(request, stream=live)` (line 823) no longer receives or builds the prompt.
+   - Delete the `except ValueError` handler around `resolve_command` (currently lines 827-835). It exists only because a `.cmd` shim cannot forward multi-line prompts in `argv`; with a static `argv` the error cannot occur, and its message would be wrong.
+   - Delete the `command_line_too_long(command)` check (currently lines 836-842) and the `command_line_too_long` import (line 24). `argv` is now a fixed ~150 bytes. `claude_completion.py` keeps its own use of the function.
+   - Windows: `.cmd` shims forward stdin fine, so no change to `agents.agy.cmd` configuration is required.
 
 ### 4.2 `tests/test_agy_completion.py`
 
-1. **Update `test_agy_completion_adapter_arguments()`**:
+1. **Update the existing argument assertions** (find them with `grep -n "arguments(" tests/test_agy_completion.py`; there is no test literally named `test_agy_completion_adapter_arguments`):
    - Assert `args[:4] == ("-p", "-", "--output-format", "json")`.
    - Assert `args_stream[:4] == ("-p", "-", "--output-format", "stream-json")`.
-   - Update `req_schema` checks to verify that `args_schema` has `"-p", "-"` and does not inline the schema into `argv`.
+   - Update schema checks to verify that `argv` contains no schema text, and that the schema instructions reach `stdin` instead.
 
-2. **Refactor `test_agy_completion_prompt_limit` to `test_agy_completion_large_context`**:
+2. **Replace `test_agy_completion_prompt_limit` (line 1127)** — both its oversize and near-limit cases assert the removed 400 — with `test_agy_completion_large_context`:
    - Replace assertions expecting `context_length_exceeded` with assertions verifying that a 128k context prompt (~500 KB) executes successfully:
      ```python
      def test_agy_completion_large_context_piped_via_stdin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -179,8 +183,9 @@ For structured output turns (`request.output_schema is not None`), `agy` require
          assert captured_stdin[0] == large_prompt
      ```
 
-3. **Verify Windows Quoting Tests**:
-   - Update tests around `command_line_too_long` to reflect that prompts do not contribute to argument length.
+3. **Delete or rewrite the Windows quoting test** near line 1449 (`'"' * (PROMPT_LIMIT_BYTES - 100)`): it exists to show quoting pushing a prompt past the CreateProcess limit, which no longer applies.
+
+4. **Add one real-subprocess test** (not a `run_process` mock): a small script that reads all of stdin, then replies, fed a ~500 KB prompt. A mock cannot catch the pipe-buffer deadlock described in §6.1. Also add a cancel-during-stdin-feed test using a real process.
 
 ---
 
@@ -222,22 +227,33 @@ For structured output turns (`request.output_schema is not None`), `agy` require
   - Heartbeat events (`KEEPALIVE_INTERVAL = 5.0`) in `relay/gateway/app.py` prevent client transport disconnection.
 
 ### 6.3 Backwards Compatibility with Installed CLI
-- **Risk**: User has an outdated version of `agy` CLI installed that might not accept `-p -`.
-- **Validation**:
-  - Verified via runtime probe: `agy -p -` is fully supported and operational in current `agy` releases (tested and confirmed via `echo "reply pong" | agy -p -`).
+- **Risk**: The installed `agy` CLI might not read the prompt from stdin for `-p -`. If it treats `-` as literal prompt text, requests would silently send a one-character prompt.
+- **Status: UNVERIFIED.** This plan depends on it and it has not been confirmed end to end.
+  - `agy` 1.5.0 `--help` documents `-p` as an alias for `--print`, and its error text says prompts are "read only from -p/--print, -i/--prompt-interactive, or stdin". That suggests stdin is supported, but does not prove `-p -` reads it.
+  - A probe (`"reply with exactly: pong" | agy -p - --output-format json`) failed before any model turn with `status: ERROR` ("Eligibility check failed: account is not eligible for Antigravity"), so stdin handling was not exercised.
+- **Required before implementation (Step 0)**: on a machine with an eligible account, confirm all three:
+  1. A short prompt on stdin returns the expected reply.
+  2. A ~500 KB prompt on stdin completes.
+  3. `-p -` with empty stdin fails (rather than treating `-` as the prompt).
+  Record the `agy --version` and outputs here.
+- **Fallback if `-p -` does not read stdin**: `agy` also supports `--input-format stream-json` (one NDJSON message per line on stdin, requires `--output-format stream-json`). Its message shape would need to be confirmed and the adapter's non-streaming path would have to parse stream output.
 
 ---
 
 ## 7. Implementation Roadmap & Checklist
 
+- [ ] **Step 0**: Verify `agy -p -` reads stdin (see §6.3); record version and outputs. Do not start Step 1 until this passes, or the stream-json fallback is chosen.
 - [ ] **Step 1**: Edit `src/relay/adapters/agy_completion.py`:
-  - [ ] Switch `arguments()` to `["-p", "-", ...]`
-  - [ ] Remove `PROMPT_LIMIT_BYTES` limit check in `complete()`
+  - [ ] Switch `arguments()` to `["-p", "-", ...]` and drop the schema merge from it
+  - [ ] Delete `PROMPT_LIMIT_BYTES` and its check in `complete()`
+  - [ ] Delete the `.cmd`-shim `ValueError` handler and the `command_line_too_long` check/import
   - [ ] Pass `stdin=prompt` in `run_process(..., stdin=prompt)`
 - [ ] **Step 2**: Edit `tests/test_agy_completion.py`:
+  - [ ] Remove the `PROMPT_LIMIT_BYTES` import; replace `test_agy_completion_prompt_limit`; delete/rewrite the Windows quoting test
   - [ ] Update CLI argument assertions to check `"-p", "-"`
   - [ ] Update mock runs to verify `stdin` piping
-  - [ ] Add 128k payload test case
+  - [ ] Add 128k payload test case and a real-subprocess 500 KB stdin test
+  - [ ] Check that `docs/gateway-qualification.md` does not describe the old limit
 - [ ] **Step 3**: Run pytest suite:
   - [ ] `pytest tests/test_agy_completion.py`
   - [ ] `pytest tests/test_gateway_app.py`
