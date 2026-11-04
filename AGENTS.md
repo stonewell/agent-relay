@@ -63,3 +63,8 @@ is routine; retain `specialist` for difficult implementation.
 
 Routing is instruction-based. User instructions and managed settings can override
 it; this configuration does not implement a deterministic classification engine.
+
+## Plan Management
+
+All future development plans, roadmaps, and task tracking must be maintained strictly in `docs/development_plan.md`. Do not create separate, isolated, or one-off plan, roadmap, or task files. When tasks are completed, move them out of `docs/development_plan.md` into `docs/development_plan_archive.md`.
+
