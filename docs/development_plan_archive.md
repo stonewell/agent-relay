@@ -45,7 +45,7 @@ Claude with `--json-schema` and `--include-partial-messages` (real CLI, envelope
 
 #### Measurement Findings
 
-Analysis of gateway production logs (`~/.config/relay/logs/relay-8765.log`) confirmed that tool-bearing turns dominate traffic and impose massive buffering delays:
+Analysis of gateway production logs (`~/.config/relay/logs/relay-8765.log`, **agy backend traffic**) confirmed that tool-bearing turns dominate traffic and impose massive buffering delays:
 
 - **100% of requests are `stream+tools`** (167 / 167 requests).
 - **100% of tool-bearing turns have narration / assistant reasoning** (mean 4,124 completion tokens).
@@ -54,6 +54,9 @@ Analysis of gateway production logs (`~/.config/relay/logs/relay-8765.log`) conf
 - **Client watchdog aborts observed at ~50.3 s** when buffering exceeded client timeouts.
 
 #### Implemented Solution (Option 1)
+
+> [!NOTE]
+> Implemented for the **claude** adapter only. The agy adapter still buffers schema turns (see open item 2 in `development_plan.md`); the baseline above was measured on agy before this fix.
 
 Option 1 was implemented across the adapter and gateway layers to stream `content` deltas live while holding `tool_calls` until turn completion:
 
