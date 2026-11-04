@@ -14,6 +14,7 @@ import pytest
 import relay.adapters.agy_completion as agy_completion
 from relay.adapters.agy_completion import (
     COMPLETION_FLAGS,
+    MALFORMED_FAIL_FAST_GRACE_S,
     MALFORMED_FUNCTION_CALL_MARKERS,
     PROMPT_LIMIT_BYTES,
     AgyCompletionAdapter,
@@ -406,12 +407,21 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     }
     schema_inst = agy_completion._agy_schema_instructions(schema)  # pyright: ignore[reportPrivateUsage]
     assert "Explicit user instruction:" in schema_inst
-    assert "define_subagent" in schema_inst
-    assert "invoke_subagent" in schema_inst
-    assert "send_message" in schema_inst
-    assert "view_file" in schema_inst
-    assert "run_command" in schema_inst
-    assert "search_web" in schema_inst
+    assert "exclusively one raw JSON object" in schema_inst
+    assert "starting with '{' and ending with '}'" in schema_inst
+    assert "tool_calls" in schema_inst
+    assert (
+        'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", "arguments": {<args>}}]}'
+        in schema_inst
+    )
+    assert 'Text: {"content": "<assistant_message>", "tool_calls": []}' in schema_inst
+    assert "<call>" not in schema_inst
+    assert "define_subagent" not in schema_inst
+    assert "invoke_subagent" not in schema_inst
+    assert "send_message" not in schema_inst
+    assert "view_file" not in schema_inst
+    assert "run_command" not in schema_inst
+    assert "search_web" not in schema_inst
     assert json.dumps(schema, separators=(",", ":"), sort_keys=True) in schema_inst
 
     # ChatRequest without tools
@@ -1556,6 +1566,7 @@ def test_agy_malformed_function_call_markers() -> None:
         "function call is empty",
         "empty function call",
     )
+    assert MALFORMED_FAIL_FAST_GRACE_S == 5.0
 
 
 def test_agy_parse_completion_malformed_function_call_invalid() -> None:
@@ -1742,4 +1753,40 @@ def test_agy_result_exit_grace_returns_result_and_kills_hung_process(
     assert elapsed < 5.0
     assert "agy result received but process still running after 0.2s grace; killing pid=" in caplog.text
     assert "events=2" in caplog.text
+
+
+def test_agy_malformed_function_call_fail_fast_kills_hung_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(agy_completion, "MALFORMED_FAIL_FAST_GRACE_S", 0.2)
+    monkeypatch.setattr(agy_completion, "IDLE_TIMEOUT_S", 30.0)
+    code = (
+        "import json, sys, time\n"
+        "print(json.dumps({'event':'step_update','step_update':{'step_type':'error_message','message':'Your previous response contained an improperly formatted function call'}}), flush=True)\n"
+        "time.sleep(30)\n"
+    )
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return (sys.executable, "-c", code)
+
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+    adapter = AgyCompletionAdapter(Agent(cmd=sys.executable))
+    start = time.monotonic()
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        pytest.raises(CompletionInvalid) as exc_info,
+    ):
+        adapter.complete(
+            CompletionRequest("hi", "default", output_schema={"type": "object"}),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0
+    assert "malformed function call" in exc_info.value.args[0]
+    assert "improperly formatted function call" in exc_info.value.raw
+    assert "agy malformed function call reported; failing fast after 0.2s events=1" in caplog.text
+
 

@@ -76,6 +76,7 @@ ENUMERATION_TIMEOUT_S = 15.0
 IDLE_TIMEOUT_S = 300.0
 STEP_LOG_INTERVAL_S = 30.0  # cadence of the "agy step" line while a live turn is quiet
 RESULT_EXIT_GRACE_S = 5.0
+MALFORMED_FAIL_FAST_GRACE_S = 5.0
 logger = logging.getLogger("uvicorn.error")
 
 MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
@@ -394,6 +395,48 @@ def _activity_label(event: dict[str, Any]) -> str:
     return label
 
 
+def _is_malformed_step(event: dict[str, Any]) -> tuple[bool, str]:
+    if event.get("event") == "step_update" and isinstance(event.get("step_update"), dict):
+        step = cast("dict[str, Any]", event["step_update"])
+        step_type = step.get("step_type")
+        has_error = (
+            step_type == "error_message"
+            or "error_message" in step
+            or "error" in step
+            or "error_message" in event
+            or "error" in event
+        )
+        if has_error:
+            diagnostic = (
+                str(step.get("error_message") or "")
+                + " "
+                + str(step.get("message") or "")
+                + " "
+                + str(step.get("error") or "")
+                + " "
+                + str(step.get("text") or "")
+                + " "
+                + str(event.get("error_message") or "")
+                + " "
+                + str(event.get("error") or "")
+                + " "
+                + json.dumps(step)
+            ).lower()
+            for marker in MALFORMED_FUNCTION_CALL_MARKERS:
+                if marker in diagnostic:
+                    err_msg = str(
+                        step.get("error_message")
+                        or step.get("message")
+                        or step.get("error")
+                        or step.get("text")
+                        or event.get("error_message")
+                        or event.get("error")
+                        or marker
+                    )
+                    return True, err_msg
+    return False, ""
+
+
 def _stream_sink(
     sink: CompletionChunkSink | None,
     tool_marker: Path | None = None,
@@ -402,6 +445,7 @@ def _stream_sink(
     on_activity: Callable[[str], None] | None = None,
     on_result: Callable[[dict[str, Any], str], None] | None = None,
     captured_lines: list[str] | None = None,
+    on_malformed: Callable[[str], None] | None = None,
 ) -> Callable[[str], None]:
     """Consume stream-json lines. `sink` is None for buffered (tool) turns: events are
     then only liveness signals (`on_activity`) and tool-use detection, never content."""
@@ -434,6 +478,10 @@ def _stream_sink(
         event = cast("dict[str, Any]", raw_event)
         if on_activity is not None:
             on_activity(_activity_label(event))
+        if on_malformed is not None:
+            is_malformed, malformed_msg = _is_malformed_step(event)
+            if is_malformed:
+                on_malformed(malformed_msg)
         if _tool_activity(event):
             failed = True
             if tool_detected is not None:
@@ -512,12 +560,13 @@ def _stream_sink(
 def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     compact = json.dumps(schema, separators=(",", ":"), sort_keys=True)
     return (
-        "\n\nExplicit user instruction: Native function calling is disabled; native function "
-        "call blocks or `<call>` tokens are forbidden. Do NOT call any runtime tools or subagents "
-        "(never call define_subagent, invoke_subagent, send_message, view_file, run_command, "
-        "or search_web). Tool proposals must be emitted exclusively as plain JSON text. Reply "
-        "immediately in this turn with only one JSON object (no prose and no code fence) that "
-        f"conforms to this JSON Schema: {compact}"
+        "\n\nExplicit user instruction: Your response must be exclusively one raw JSON object "
+        "starting with '{' and ending with '}', with no markdown fence, no XML tags or function "
+        "call blocks, and no prose. Use one of these two shapes:\n"
+        'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
+        '"arguments": {<args>}}]}\n'
+        'Text: {"content": "<assistant_message>", "tool_calls": []}\n'
+        f"JSON Schema: {compact}"
     )
 
 
@@ -624,6 +673,9 @@ class AgyCompletionAdapter:
         idle_expired = threading.Event()
         result_received = threading.Event()
         result_at = [0.0]
+        malformed_detected = threading.Event()
+        malformed_at = [0.0]
+        malformed_error: list[str] = []
         captured_lines: list[str] = []
         child_pid: list[int | None] = [None]
         step_log_at = [0.0]  # monotonic time before which the quiet-turn line is not repeated
@@ -631,6 +683,12 @@ class AgyCompletionAdapter:
         def _observe_process(phase: str, pid: int | None) -> None:
             if phase == "started":
                 child_pid[0] = pid
+
+        def note_malformed(err: str) -> None:
+            if not malformed_detected.is_set():
+                malformed_at[0] = time.monotonic()
+                malformed_error.append(err)
+                malformed_detected.set()
 
         def _watch_marker() -> None:
             while not stop_watcher.is_set() and not process_cancel.is_set():
@@ -646,6 +704,17 @@ class AgyCompletionAdapter:
                                 "killing pid=%s events=%d",
                                 RESULT_EXIT_GRACE_S,
                                 child_pid[0] if child_pid[0] is not None else "-",
+                                activity["events"],
+                            )
+                            process_cancel.set()
+                            return
+                    elif malformed_detected.is_set():
+                        grace_elapsed = time.monotonic() - malformed_at[0]
+                        if grace_elapsed >= MALFORMED_FAIL_FAST_GRACE_S:
+                            logger.warning(
+                                "agy malformed function call reported; failing fast after %.1fs "
+                                "events=%d",
+                                MALFORMED_FAIL_FAST_GRACE_S,
                                 activity["events"],
                             )
                             process_cancel.set()
@@ -696,6 +765,7 @@ class AgyCompletionAdapter:
                 on_activity=note_activity,
                 on_result=note_result,
                 captured_lines=captured_lines,
+                on_malformed=note_malformed if request.output_schema is not None else None,
             )
             if live
             else discard_output
@@ -780,6 +850,11 @@ class AgyCompletionAdapter:
                     request_model=request.model,
                     secrets=env,
                 )
+            if malformed_detected.is_set():
+                raw_output = "".join(captured_lines)
+                detail = f"; error: {malformed_error[0]}" if malformed_error else ""
+                message = f"Antigravity CLI completion failed: malformed function call{detail}"
+                raise CompletionInvalid(message, raw=raw_output[:4000]) from exc
             if idle_expired.is_set():
                 raise CompletionError(
                     f"Antigravity produced no output for {IDLE_TIMEOUT_S:.0f}s",
