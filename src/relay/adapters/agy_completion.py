@@ -1,7 +1,8 @@
 """Antigravity (`agy`) completion backend.
 
-Translates completion requests into `agy -p "<prompt>" --output-format stream-json`
-invocations; the events double as the heartbeat for the shared no-output watchdog.
+Translates completion requests into `agy -p - --output-format stream-json`
+invocations with prompt delivered via stdin; the events double as the heartbeat
+for the shared no-output watchdog.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ _AGY_SETTINGS = (
     '"allowNonWorkspaceAccess":false,"disableSlashCommands":true,'
     '"permissions":{"allow":[],"ask":[],"deny":['
     '"command(*)","read_file(*)","write_file(*)","read_url(*)","execute_url(*)","mcp(*)"'
-    ']}}'
+    "]}}"
 )
 COMPLETION_FLAGS: tuple[str, ...] = (
     "--agent",
@@ -72,7 +73,6 @@ COMPLETION_FLAGS: tuple[str, ...] = (
     "--settings",
     _AGY_SETTINGS,
 )
-PROMPT_LIMIT_BYTES = 30_000 if sys.platform == "win32" else 120_000
 ENUMERATION_TIMEOUT_S = 15.0
 # Hung turns are stopped by the shared no-output watchdog in run_process (completion.py
 # `silence_limits`); its default idle limit matches agy's own 5 min stalled-model retry.
@@ -261,9 +261,7 @@ def _prepare_policy(cwd: Path) -> Path:
         command_pre_inv = shlex.join((executable, str(script_resolved), "--pre-invocation"))
     hooks = {
         "relay-deny-tools": {
-            "PreInvocation": [
-                {"type": "command", "command": command_pre_inv, "timeout": 10}
-            ],
+            "PreInvocation": [{"type": "command", "command": command_pre_inv, "timeout": 10}],
             "PreToolUse": [
                 {
                     "matcher": "*",
@@ -626,10 +624,7 @@ class AgyCompletionAdapter:
     @staticmethod
     def arguments(request: CompletionRequest, *, stream: bool = False) -> tuple[str, ...]:
         output_format = "stream-json" if stream else "json"
-        prompt = request.prompt
-        if request.output_schema is not None:
-            prompt += _agy_schema_instructions(request.output_schema)
-        args = ["-p", prompt, "--output-format", output_format, *COMPLETION_FLAGS]
+        args = ["-p", "-", "--output-format", output_format, *COMPLETION_FLAGS]
         if request.model != "default":
             args += ["--model", request.model]
         if request.effort is not None:
@@ -651,13 +646,6 @@ class AgyCompletionAdapter:
         if request.output_schema is not None:
             prompt += _agy_schema_instructions(request.output_schema)
         prompt_bytes = len(prompt.encode("utf-8"))
-        if prompt_bytes > PROMPT_LIMIT_BYTES:
-            raise CompletionError(
-                "Prompt exceeds CLI argument limit",
-                status=400,
-                code="context_length_exceeded",
-                param="messages",
-            )
         chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
         streaming = chunk_sink is not None and request.output_schema is None
         try:
@@ -666,13 +654,9 @@ class AgyCompletionAdapter:
             raise CompletionError("Could not prepare Antigravity completion restrictions") from exc
 
         if cancel.is_set():
-            raise CompletionError(
-                "Completion cancelled", status=503, code="request_cancelled"
-            )
+            raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
         if tool_marker.exists():
-            raise CompletionError(
-                "Antigravity attempted model-side tools", code="backend_tool_use"
-            )
+            raise CompletionError("Antigravity attempted model-side tools", code="backend_tool_use")
 
         process_cancel = threading.Event()
         tool_detected = threading.Event()
@@ -787,9 +771,7 @@ class AgyCompletionAdapter:
             # The relay stopped the tree after its result arrived: the exit status reflects
             # the kill, not the turn, so parse the result event as a clean exit.
             return parse_completion(
-                ProcessResult(
-                    0, stdout=result[0][1] + "\n", duration_s=time.monotonic() - started
-                ),
+                ProcessResult(0, stdout=result[0][1] + "\n", duration_s=time.monotonic() - started),
                 structured=request.output_schema is not None,
                 request_model=request.model,
                 secrets=env,
@@ -835,8 +817,9 @@ class AgyCompletionAdapter:
                         code="unavailable",
                     ) from exc
                 if command_line_too_long(command):
+                    # The prompt is on stdin; only CLI flags/configuration can cause this limit.
                     raise CompletionError(
-                        "Prompt exceeds CLI argument limit",
+                        "Command line exceeds the Windows limit",
                         status=400,
                         code="context_length_exceeded",
                         param="messages",
@@ -851,6 +834,7 @@ class AgyCompletionAdapter:
                     command,
                     cwd=cwd,
                     env=env,
+                    stdin=prompt,
                     timeout_s=remaining,
                     first_output_timeout_s=first_output_s,
                     idle_timeout_s=idle_s,
@@ -866,9 +850,7 @@ class AgyCompletionAdapter:
                     return recovered()
                 raise stopped()
             if cancel.is_set() and not result:
-                raise CompletionError(
-                    "Completion cancelled", status=503, code="request_cancelled"
-                )
+                raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
             return parse_completion(
                 proc,
                 structured=request.output_schema is not None,

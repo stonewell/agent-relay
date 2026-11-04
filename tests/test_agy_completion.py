@@ -16,7 +16,6 @@ from relay.adapters.agy_completion import (
     COMPLETION_FLAGS,
     MALFORMED_FAIL_FAST_GRACE_S,
     MALFORMED_FUNCTION_CALL_MARKERS,
-    PROMPT_LIMIT_BYTES,
     AgyCompletionAdapter,
     _observed,  # pyright: ignore[reportPrivateUsage]
     parse_completion,
@@ -52,7 +51,7 @@ def agy_response(**values: Any) -> ProcessResult:
 def test_agy_completion_adapter_arguments() -> None:
     req = CompletionRequest("test prompt", "default")
     args = AgyCompletionAdapter.arguments(req)
-    assert args[:4] == ("-p", "test prompt", "--output-format", "json")
+    assert args[:4] == ("-p", "-", "--output-format", "json")
     assert COMPLETION_FLAGS == (
         "--agent",
         "relay-completion",
@@ -71,7 +70,7 @@ def test_agy_completion_adapter_arguments() -> None:
 
     # stream=True with output_schema is None uses stream-json
     args_stream = AgyCompletionAdapter.arguments(req, stream=True)
-    assert args_stream[:4] == ("-p", "test prompt", "--output-format", "stream-json")
+    assert args_stream[:4] == ("-p", "-", "--output-format", "stream-json")
     for flag in COMPLETION_FLAGS:
         assert flag in args_stream
 
@@ -82,22 +81,18 @@ def test_agy_completion_adapter_arguments() -> None:
     assert "--effort" in args_model
     assert args_model[args_model.index("--effort") + 1] == "high"
 
-    # stream=True with output_schema uses json format and inlines schema instructions in prompt
+    # prompt is piped via stdin so schema instructions are not in args
     req_schema = CompletionRequest("test prompt", "default", output_schema={"type": "object"})
     args_schema = AgyCompletionAdapter.arguments(req_schema)
-    assert args_schema[0] == "-p"
-    assert "test prompt" in args_schema[1]
-    assert '{"type":"object"}' in args_schema[1]
-    assert args_schema[2:4] == ("--output-format", "json")
+    assert args_schema[:4] == ("-p", "-", "--output-format", "json")
     assert "--json-schema" not in args_schema
+    assert "test prompt" not in args_schema
 
     args_schema_stream = AgyCompletionAdapter.arguments(req_schema, stream=True)
-    assert args_schema_stream[0] == "-p"
-    assert "test prompt" in args_schema_stream[1]
-    assert '{"type":"object"}' in args_schema_stream[1]
     # Tool turns stream events for liveness; content stays buffered by the caller.
-    assert args_schema_stream[2:4] == ("--output-format", "stream-json")
+    assert args_schema_stream[:4] == ("-p", "-", "--output-format", "stream-json")
     assert "--json-schema" not in args_schema_stream
+    assert "test prompt" not in args_schema_stream
 
 
 def test_agy_buffered_sink_reports_activity_without_content() -> None:
@@ -799,11 +794,7 @@ def test_agy_watcher_cancels_process_when_deny_tools_used_created(
     marker = tmp_path / ".agents" / "deny_tools.used"
 
     # Child process touches deny_tools.used and then sleeps
-    code = (
-        "import pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).touch()\n"
-        "time.sleep(10)\n"
-    )
+    code = "import pathlib, sys, time\npathlib.Path(sys.argv[1]).touch()\ntime.sleep(10)\n"
 
     def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
         return (sys.executable, "-c", code, str(marker))
@@ -1042,11 +1033,7 @@ def test_agy_watcher_thread_cleanly_terminates_without_leaking(
     # 2. Cancelled via tool marker
     captured_threads.clear()
     marker = tmp_path / ".agents" / "deny_tools.used"
-    code_marker = (
-        "import pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).touch()\n"
-        "time.sleep(10)\n"
-    )
+    code_marker = "import pathlib, sys, time\npathlib.Path(sys.argv[1]).touch()\ntime.sleep(10)\n"
 
     def fake_resolve_marker(*_a: object, **_k: object) -> tuple[str, ...]:
         return (sys.executable, "-c", code_marker, str(marker))
@@ -1124,40 +1111,68 @@ def test_agy_watcher_thread_cleanly_terminates_without_leaking(
     assert not watcher_stream[0].is_alive()
 
 
-def test_agy_completion_prompt_limit(tmp_path: Path) -> None:
-    agent = Agent(cmd="agy")
-    adapter = AgyCompletionAdapter(agent)
+def test_agy_completion_large_prompt_piped_via_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_stdin: list[str | None] = []
+    captured_command: list[Any] = []
+
+    def mock_run_process(cmd: Any, **kwargs: Any) -> ProcessResult:
+        captured_command.append(cmd)
+        captured_stdin.append(kwargs.get("stdin"))
+        return ProcessResult(0, json.dumps({"status": "SUCCESS", "response": "large prompt ok"}))
+
+    def fake_resolve(cmd: str, args: tuple[str, ...], **_k: object) -> ResolvedCommand:
+        return ResolvedCommand(argv=(cmd, *args))
+
+    monkeypatch.setattr(agy_completion, "run_process", mock_run_process)
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_resolve)
+
+    adapter = AgyCompletionAdapter(Agent(cmd="agy"))
     assert isinstance(adapter, CompletionCapable)
 
-    # Prompt exceeds PROMPT_LIMIT_BYTES
-    huge_prompt = "a" * (PROMPT_LIMIT_BYTES + 1)
-    req_huge = CompletionRequest(huge_prompt)
-    with pytest.raises(CompletionError) as exc_info:
-        adapter.complete(
-            req_huge,
-            cwd=tmp_path,
-            cancel=threading.Event(),
-            timeout_s=10,
-            max_output_bytes=1024,
-        )
-    assert exc_info.value.status == 400
-    assert exc_info.value.code == "context_length_exceeded"
-
-    # Prompt + schema_instructions exceeds PROMPT_LIMIT_BYTES
-    near_limit_prompt = "a" * (PROMPT_LIMIT_BYTES - 10)
-    req_near_limit = CompletionRequest(
-        near_limit_prompt, output_schema={"type": "object", "properties": {"x": {"type": "string"}}}
+    # 500 KB prompt (> 128k context) succeeds and is piped via stdin
+    large_prompt = "a" * (500 * 1024)
+    req_large = CompletionRequest(large_prompt)
+    res = adapter.complete(
+        req_large,
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=10,
+        max_output_bytes=1024,
     )
-    with pytest.raises(CompletionError) as exc_info_schema:
-        adapter.complete(
-            req_near_limit,
-            cwd=tmp_path,
-            cancel=threading.Event(),
-            timeout_s=10,
-            max_output_bytes=1024,
-        )
-    assert exc_info_schema.value.status == 400
-    assert exc_info_schema.value.code == "context_length_exceeded"
+    assert res.content == "large prompt ok"
+    assert len(captured_stdin) == 1
+    assert captured_stdin[0] == large_prompt
+    assert len(captured_command) == 1
+    cmd_args = captured_command[0].argv
+    assert large_prompt not in cmd_args
+    assert cmd_args[:3] == ("agy", "-p", "-")
+
+    # Prompt + schema_instructions also piped via stdin
+    captured_stdin.clear()
+    req_schema = CompletionRequest(
+        large_prompt, output_schema={"type": "object", "properties": {"x": {"type": "string"}}}
+    )
+
+    def mock_run_schema(cmd: Any, **kwargs: Any) -> ProcessResult:
+        captured_stdin.append(kwargs.get("stdin"))
+        payload: dict[str, Any] = {"content": "ok", "tool_calls": []}
+        return ProcessResult(0, json.dumps({"status": "SUCCESS", "response": json.dumps(payload)}))
+
+    monkeypatch.setattr(agy_completion, "run_process", mock_run_schema)
+    res_schema = adapter.complete(
+        req_schema,
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=10,
+        max_output_bytes=1024,
+    )
+    assert res_schema.envelope == {"content": "ok", "tool_calls": []}
+    assert len(captured_stdin) == 1
+    assert captured_stdin[0] is not None
+    assert captured_stdin[0].startswith(large_prompt)
+    assert '"type":"object"' in captured_stdin[0]
 
 
 def test_agy_parse_completion_plain_and_usage() -> None:
@@ -1250,9 +1265,7 @@ def test_agy_parse_completion_exit_code_zero_error() -> None:
     )
     with pytest.raises(CompletionError) as exc_info:
         parse_completion(proc_dict_msg, structured=False)
-    expected_dict_msg = (
-        "Antigravity CLI completion failed: exit code 0; error: Invalid auth token"
-    )
+    expected_dict_msg = "Antigravity CLI completion failed: exit code 0; error: Invalid auth token"
     assert str(exc_info.value) == expected_dict_msg
     assert "; stderr:" not in str(exc_info.value)
 
@@ -1446,8 +1459,7 @@ def test_agy_final_command_line_length_is_context_length_exceeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def resolve(_cmd: str, args: tuple[str, ...], **_k: object) -> ResolvedCommand:
-        # Quoting can push a prompt under PROMPT_LIMIT_BYTES past the CreateProcess limit.
-        return ResolvedCommand(argv=("agy.exe", *args))
+        return ResolvedCommand(argv=("agy.exe", *args, "x" * 33_000))
 
     def run(*_a: object, **_k: object) -> ProcessResult:
         raise AssertionError("must not spawn")
@@ -1455,11 +1467,9 @@ def test_agy_final_command_line_length_is_context_length_exceeded(
     monkeypatch.setattr(agy_completion, "resolve_command", resolve)
     monkeypatch.setattr(agy_completion, "run_process", run)
     monkeypatch.setattr(sys, "platform", "win32")
-    prompt = '"' * (PROMPT_LIMIT_BYTES - 100)
-    assert len(subprocess.list2cmdline(["agy.exe", "-p", prompt])) >= 32_767
     with pytest.raises(CompletionError) as caught:
         AgyCompletionAdapter(Agent(cmd="agy")).complete(
-            CompletionRequest(prompt),
+            CompletionRequest("test"),
             cwd=tmp_path,
             cancel=threading.Event(),
             timeout_s=5,
@@ -1612,12 +1622,14 @@ def test_agy_parse_completion_malformed_function_call_invalid() -> None:
     usage_data = {"input_tokens": 100, "output_tokens": 20}
     proc_invalid_payload = ProcessResult(
         0,
-        json.dumps({
-            "status": "INVALID",
-            "error": "Failed to parse function call",
-            "usage": usage_data,
-            "response": '{"broken": json',
-        }),
+        json.dumps(
+            {
+                "status": "INVALID",
+                "error": "Failed to parse function call",
+                "usage": usage_data,
+                "response": '{"broken": json',
+            }
+        ),
     )
     with pytest.raises(CompletionInvalid) as exc_info2:
         parse_completion(proc_invalid_payload, structured=True)
@@ -1654,7 +1666,6 @@ def test_agy_parse_completion_malformed_function_call_invalid() -> None:
     assert not isinstance(exc_ctx.value, CompletionInvalid)
     assert exc_ctx.value.status == 400
     assert exc_ctx.value.code == "context_length_exceeded"
-
 
 
 def test_agy_watchdog_kills_silent_tool_turn(
@@ -1831,7 +1842,10 @@ def test_agy_result_exit_grace_returns_result_and_kills_hung_process(
     assert result.usage == CompletionUsage(10, 2, None, None)
     assert chunks == ["OK"]
     assert elapsed < 5.0
-    assert "agy result received but process still running after 0.2s grace; killing pid=" in caplog.text
+    assert (
+        "agy result received but process still running after 0.2s grace; killing pid="
+        in caplog.text
+    )
     assert "events=2" in caplog.text
 
 
@@ -1910,7 +1924,9 @@ def test_agy_malformed_step_checks_only_non_empty_error_fields() -> None:
     ) == (False, "")
     # The reported message is the error field that matched.
     assert check(
-        step(step_type="agent_response", error_message="busy", error="Failed to parse function call")
+        step(
+            step_type="agent_response", error_message="busy", error="Failed to parse function call"
+        )
     ) == (True, "Failed to parse function call")
     assert check(step(step_type="error_message", message="Empty function call")) == (
         True,
@@ -2012,7 +2028,9 @@ def test_agy_result_survives_cancel_landing_during_exit_grace(
     cancel = threading.Event()
     returns = ProcessResult(1, "\n".join(_RESULT_LINES), "killed") if ordinary_exit else None
     monkeypatch.setattr(
-        agy_completion, "run_process", fake_killed_run(_RESULT_LINES, cancel=cancel, returns=returns)
+        agy_completion,
+        "run_process",
+        fake_killed_run(_RESULT_LINES, cancel=cancel, returns=returns),
     )
     result = AgyCompletionAdapter(Agent(cmd="agy")).complete(
         CompletionRequest("hi", "default"),
@@ -2071,5 +2089,3 @@ def test_agy_malformed_kill_reported_as_ordinary_exit_is_invalid(
         )
     assert "malformed function call" in str(exc_info.value)
     assert exc_info.value.raw == line
-
-
