@@ -87,6 +87,7 @@ def test_server_uses_global_config_and_fixed_process_options(
     log_level: str,
 ) -> None:
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
 
     fake_app = ModuleType("relay.gateway.app")
     calls: dict[str, object] = {}
@@ -129,7 +130,7 @@ def test_server_uses_global_config_and_fixed_process_options(
         "reload": False,
         "access_log": False,
         "log_level": log_level,
-        "log_config": serve.log_config(uvicorn.config.LOGGING_CONFIG, log_file),
+        "log_config": serve.log_config(LOGGING_CONFIG, log_file),
         "timeout_graceful_shutdown": 2,
     }
     assert log_file.parent.is_dir() and not log_file.exists()

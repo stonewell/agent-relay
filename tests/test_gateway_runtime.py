@@ -41,8 +41,8 @@ class Backend:
         self.hang = False
         self.delay = 0.0
 
-    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport | None:
-        return None
+    def inspect(self, *, timeout_s: float = 10) -> CompletionSupport:
+        raise NotImplementedError("runtime tests never inspect the backend")
 
     def complete(
         self,

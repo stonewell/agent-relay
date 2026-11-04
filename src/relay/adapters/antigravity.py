@@ -71,7 +71,7 @@ def _extract_dict_error(err_dict: dict[str, Any]) -> str | None:
         if isinstance(val, str) and val.strip():
             return val.strip()
         if isinstance(val, dict):
-            nested = _extract_dict_error(val)
+            nested = _extract_dict_error(cast("dict[str, Any]", val))
             if nested is not None:
                 return nested
     return None
@@ -83,14 +83,15 @@ def _error_text(payload: dict[str, Any]) -> str | None:
     if isinstance(error, str) and error.strip():
         return error.strip()
     if isinstance(error, dict):
-        text = _extract_dict_error(error)
+        error_dict = cast("dict[str, Any]", error)
+        text = _extract_dict_error(error_dict)
         if text is not None:
             return text
-        if error:
+        if error_dict:
             try:
-                return json.dumps(error)
+                return json.dumps(error_dict)
             except (TypeError, ValueError):
-                return str(error)
+                return str(error_dict)
     elif error is not None:
         text = str(error).strip()
         if text:

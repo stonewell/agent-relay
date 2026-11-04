@@ -154,6 +154,7 @@ def test_unknown_parameters_are_ignored(field: str, value: object) -> None:
 
 
 def test_unknown_nested_fields_are_ignored() -> None:
+    annotations: list[object] = []
     request = parse_request(
         tool_request(
             stream=True,
@@ -162,9 +163,9 @@ def test_unknown_nested_fields_are_ignored() -> None:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "hello", "annotations": []},
+                        {"type": "text", "text": "hello", "annotations": annotations},
                     ],
-                    "annotations": [],
+                    "annotations": annotations,
                     "refusal": None,
                     "audio": {"id": "a"},
                 }
