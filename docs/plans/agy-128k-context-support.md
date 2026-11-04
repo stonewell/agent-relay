@@ -1,6 +1,6 @@
 # Development Plan: 128k Context Support for `agy` CLI in `relay serve`
 
-**Status:** Proposed / Ready for Implementation  
+**Status:** Proposed (blocked on Step 0: `agy -p -` stdin is unverified). See also [`long-context-128k-agent-cli.md`](long-context-128k-agent-cli.md) for the other layers (liveness, per-backend verification).  
 **Area:** `src/relay/adapters/agy_completion.py`, `tests/test_agy_completion.py`, `src/relay/gateway/`  
 **Target:** Enable `relay serve` to reliably process long-context completions (up to 128k tokens, ~300 KB – 500+ KB payloads) with the Antigravity (`agy`) backend CLI across Linux and Windows platforms.
 
@@ -222,7 +222,7 @@ For structured output turns (`request.output_schema is not None`), `agy` require
 ### 6.2 Turn Execution Timeouts
 - **Risk**: 128k token context requests have significantly longer time-to-first-token (TTFT) and processing duration (e.g. 30s to 120s depending on model load).
 - **Mitigation**:
-  - `IDLE_TIMEOUT_S = 300.0` in `agy_completion.py` allows generous silent periods.
+  - The shared no-output watchdog (`run_process` idle limit, default 300 s, plus a first-output limit that scales with prompt size) allows generous silent periods; `agy_completion.py` no longer has its own `IDLE_TIMEOUT_S`. See `long-context-128k-agent-cli.md`.
   - When `stream=True`, `agy` emits step and stream events that keep the connection active.
   - Heartbeat events (`KEEPALIVE_INTERVAL = 5.0`) in `relay/gateway/app.py` prevent client transport disconnection.
 
