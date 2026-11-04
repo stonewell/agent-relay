@@ -223,6 +223,8 @@ class GatewayRuntime:
         deadline: float,
         validate: Callable[[CompletionResult], CompletionResult] | None,
         max_output_bytes: int,
+        *,
+        stream_chunks: bool = True,
     ) -> CompletionResult:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -249,7 +251,7 @@ class GatewayRuntime:
             loop.call_soon_threadsafe(handle.chunks.put_nowait, text)
 
         def invoke_and_validate() -> CompletionResult:
-            sink = on_chunk if request.output_schema is None else None
+            sink = on_chunk if stream_chunks else None
             with stream_completion_chunks(sink):
                 result = backend.complete(
                     request,
@@ -312,7 +314,8 @@ class GatewayRuntime:
             if expired:
                 raise CompletionError("Completion deadline expired", status=504, code="timeout")
             raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
-        handle.streamed_content = "".join(streamed)
+        if stream_chunks:
+            handle.streamed_content = "".join(streamed)
         return worker.result()
 
     async def _execute(
@@ -341,6 +344,7 @@ class GatewayRuntime:
                         deadline,
                         validate,
                         limits.max_output_bytes,
+                        stream_chunks=(attempt == 0),
                     )
                     if first_invalid is not None:
                         result = replace(

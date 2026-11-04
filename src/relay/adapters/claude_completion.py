@@ -34,6 +34,7 @@ from relay.adapters.completion import (
     silence_limits,
     stalled_error,
 )
+from relay.adapters.json_stream import IncrementalJsonContentDecoder
 from relay.core.env import CompleteEnv, build_env, redact
 from relay.core.platform.proc import (
     CommandNotFound,
@@ -95,9 +96,10 @@ def _capture(_: str) -> None:
 discard_output = _capture
 
 
-def _stream_sink(sink: CompletionChunkSink) -> Callable[[str], None]:
+def _stream_sink(sink: CompletionChunkSink, *, structured: bool = False) -> Callable[[str], None]:
     emitted = ""
     failed = False
+    decoder = IncrementalJsonContentDecoder() if structured else None
 
     def on_line(line: str) -> None:
         nonlocal emitted, failed
@@ -125,17 +127,29 @@ def _stream_sink(sink: CompletionChunkSink) -> Callable[[str], None]:
             ):
                 inner_dict = cast("dict[str, Any]", inner)
                 delta = inner_dict.get("delta")
-                if (
-                    isinstance(delta, dict)
-                    and cast("dict[str, Any]", delta).get("type") == "text_delta"
-                ):
+                if isinstance(delta, dict):
                     delta_dict = cast("dict[str, Any]", delta)
-                    text = delta_dict.get("text")
-                    if isinstance(text, str) and text:
-                        emitted += text
-                        sink(text)
+                    if structured and decoder is not None:
+                        delta_type = delta_dict.get("type")
+                        raw_chunk = None
+                        if delta_type == "input_json_delta":
+                            raw_chunk = delta_dict.get("partial_json")
+                        elif delta_type == "text_delta":
+                            raw_chunk = delta_dict.get("text")
+                        if isinstance(raw_chunk, str) and raw_chunk:
+                            text = decoder.feed(raw_chunk)
+                            if text:
+                                emitted += text
+                                sink(text)
+                    elif delta_dict.get("type") == "text_delta":
+                        text = delta_dict.get("text")
+                        if isinstance(text, str) and text:
+                            emitted += text
+                            sink(text)
             return
         if event.get("type") == "assistant":
+            if structured:
+                return
             message = event.get("message")
             if isinstance(message, dict):
                 message_dict = cast("dict[str, Any]", message)
@@ -239,8 +253,13 @@ class ClaudeCompletionAdapter:
     ) -> CompletionResult:
         deadline = time.monotonic() + timeout_s
         chunk_sink = on_chunk if on_chunk is not None else current_chunk_sink()
-        streaming = chunk_sink is not None and request.output_schema is None
-        line_sink = _stream_sink(chunk_sink) if streaming and chunk_sink is not None else _capture
+        streaming = chunk_sink is not None
+        structured = request.output_schema is not None
+        line_sink = (
+            _stream_sink(chunk_sink, structured=structured)
+            if streaming and chunk_sink is not None
+            else _capture
+        )
         prompt_bytes = len(request.prompt.encode("utf-8", errors="replace"))
         try:
             with (

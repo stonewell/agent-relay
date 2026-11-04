@@ -44,6 +44,7 @@ from .sse import (
     chunk_event,
     completion_response,
     event,
+    format_tool_calls,
     heartbeat_event,
     response_events,
     usage_event,
@@ -551,27 +552,22 @@ def create_app(
         # Keep failures before the first keepalive or live chunk as ordinary HTTP errors.
         buffered: dict[str, Any] | None = None
         first_chunk: str | None = None
-        chunk_task: asyncio.Task[str | None] | None = (
-            asyncio.create_task(handle.chunks.get()) if schema is None else None
-        )
+        chunk_task: asyncio.Task[str | None] | None = asyncio.create_task(handle.chunks.get())
         try:
-            wait_set: set[asyncio.Task[Any]] = {handle.result}
-            if chunk_task is not None:
-                wait_set.add(chunk_task)
             done, _pending = await asyncio.wait(
-                wait_set,
+                {handle.result, chunk_task},
                 timeout=KEEPALIVE_INTERVAL,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if handle.result in done:
-                if chunk_task is not None and not chunk_task.done():
+                if not chunk_task.done():
                     chunk_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await chunk_task
                 chunk_task = None
                 result = handle.result.result()
                 buffered = final(result)
-            elif chunk_task is not None and chunk_task in done:
+            elif chunk_task in done:
                 first_chunk = chunk_task.result()
                 chunk_task = None
                 if first_chunk is None:
@@ -630,19 +626,6 @@ def create_app(
                 if buffered is not None:
                     delivering(live=False)
                     for data in response_events(buffered, include_usage):
-                        for piece in Slice(data):
-                            yield piece
-                    return
-
-                if schema is not None:
-                    while not handle.result.done():
-                        yield heartbeat_event(completion_id, created, parsed.model)
-                        heartbeats += 1
-                        waiting()
-                        await asyncio.wait({handle.result}, timeout=KEEPALIVE_INTERVAL)
-                    response = final(handle.result.result())
-                    delivering(live=False)
-                    for data in response_events(response, include_usage):
                         for piece in Slice(data):
                             yield piece
                     return
@@ -708,9 +691,21 @@ def create_app(
                         chunk_event(completion_id, created, parsed.model, {"content": remainder})
                     ):
                         yield piece
-                for piece in Slice(
-                    chunk_event(completion_id, created, parsed.model, {}, result.finish_reason)
-                ):
+                calls: list[dict[str, Any]] = (
+                    result.envelope["tool_calls"] if result.envelope else []
+                )
+                for index, call in enumerate(format_tool_calls(completion_id, calls)):
+                    for piece in Slice(
+                        chunk_event(
+                            completion_id,
+                            created,
+                            parsed.model,
+                            {"tool_calls": [{"index": index, **call}]},
+                        )
+                    ):
+                        yield piece
+                finish = "tool_calls" if calls else result.finish_reason
+                for piece in Slice(chunk_event(completion_id, created, parsed.model, {}, finish)):
                     yield piece
                 if include_usage and result.usage is not None:
                     for piece in Slice(

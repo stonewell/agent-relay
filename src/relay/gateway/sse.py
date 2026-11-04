@@ -8,6 +8,17 @@ from typing import Any
 from .render import canonical
 
 
+def format_tool_calls(completion_id: str, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"call_{completion_id.removeprefix('chatcmpl-')}_{index}",
+            "type": "function",
+            "function": {"name": call["name"], "arguments": canonical(call["arguments"])},
+        }
+        for index, call in enumerate(calls)
+    ]
+
+
 def completion_response(
     completion_id: str,
     created: int,
@@ -19,14 +30,7 @@ def completion_response(
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if calls:
-        message["tool_calls"] = [
-            {
-                "id": f"call_{completion_id.removeprefix('chatcmpl-')}_{index}",
-                "type": "function",
-                "function": {"name": call["name"], "arguments": canonical(call["arguments"])},
-            }
-            for index, call in enumerate(calls)
-        ]
+        message["tool_calls"] = format_tool_calls(completion_id, calls)
     return {
         "id": completion_id,
         "object": "chat.completion",
