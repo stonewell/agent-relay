@@ -565,6 +565,8 @@ def _agy_schema_instructions(schema: dict[str, Any]) -> str:
             shapes += (
                 'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
                 '"arguments": {<args>}}]}\n'
+                'Or OpenAI tool call: {"content": null, "tool_calls": [{"type": "function", '
+                '"function": {"name": "<function_name>", "arguments": {<args>}}}]}\n'
             )
         if not calls_dict.get("minItems"):
             shapes += 'Text: {"content": "<assistant_message>", "tool_calls": []}\n'

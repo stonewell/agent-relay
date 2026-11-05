@@ -419,6 +419,158 @@ def test_local_refs_and_optional_semantics() -> None:
     assert content is None and calls[0]["arguments"] == {}
 
 
+def test_openai_and_flat_tool_call_formats_accepted_and_normalized() -> None:
+    request = parse_request(tool_request())
+    schema = prepare_envelope(request)
+    assert schema is not None
+
+    # 1. OpenAI standard tool call with dict arguments
+    raw_openai = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "edit", "arguments": {"text": "hello"}},
+                }
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_openai, request, schema)
+    assert content is None
+    assert calls == [
+        {"name": "edit", "arguments": {"text": "hello"}, "id": "call_1", "type": "function"}
+    ]
+
+    # 2. OpenAI standard tool call with stringified JSON arguments
+    raw_openai_str = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "arguments": json.dumps({"text": "stringified"}),
+                    },
+                }
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_openai_str, request, schema)
+    assert content is None
+    assert calls == [
+        {
+            "name": "edit",
+            "arguments": {"text": "stringified"},
+            "id": "call_2",
+            "type": "function",
+        }
+    ]
+
+    # 3. Flat tool call with optional id and type
+    raw_flat_with_id = json.dumps(
+        {
+            "content": "narrating",
+            "tool_calls": [
+                {
+                    "id": "call_3",
+                    "type": "function",
+                    "name": "edit",
+                    "arguments": {"text": "flat"},
+                }
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_flat_with_id, request, schema)
+    assert content == "narrating"
+    assert calls == [
+        {"name": "edit", "arguments": {"text": "flat"}, "id": "call_3", "type": "function"}
+    ]
+
+    # 4. Flat tool call with stringified JSON arguments
+    raw_flat_str = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "name": "edit",
+                    "arguments": json.dumps({"text": "flat_str"}),
+                }
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_flat_str, request, schema)
+    assert content is None
+    assert calls == [{"name": "edit", "arguments": {"text": "flat_str"}}]
+
+    # 5. Mixed list of flat and nested tool calls in the same turn (parallel tool calls)
+    parallel_req = parse_request(tool_request(parallel_tool_calls=True))
+    parallel_schema = prepare_envelope(parallel_req)
+    assert parallel_schema is not None
+    raw_mixed = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "name": "edit",
+                    "arguments": {"text": "first_flat"},
+                },
+                {
+                    "id": "call_mixed",
+                    "type": "function",
+                    "function": {"name": "edit", "arguments": '{"text": "second_nested"}'},
+                },
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_mixed, parallel_req, parallel_schema)
+    assert content is None
+    assert calls == [
+        {"name": "edit", "arguments": {"text": "first_flat"}},
+        {
+            "name": "edit",
+            "arguments": {"text": "second_nested"},
+            "id": "call_mixed",
+            "type": "function",
+        },
+    ]
+
+    # 6. Invalid JSON string arguments properly raises EnvelopeError
+    raw_bad_json = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "name": "edit",
+                    "arguments": "{unclosed_json",
+                }
+            ],
+        }
+    )
+    with pytest.raises(EnvelopeError) as exc_info:
+        validate_envelope(raw_bad_json, request, schema)
+    assert "invalid JSON in arguments for edit" in str(exc_info.value)
+
+    # 7. JSON string argument that parses to non-dict (e.g. array or int) raises EnvelopeError
+    raw_non_dict_json = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "name": "edit",
+                    "arguments": "[1, 2, 3]",
+                }
+            ],
+        }
+    )
+    with pytest.raises(EnvelopeError) as exc_info:
+        validate_envelope(raw_non_dict_json, request, schema)
+    assert "must be an object" in str(exc_info.value)
+
+
 ENVELOPE_CASES: list[tuple[str, bool, list[dict[str, Any]]]] = [
     ("none", False, [{"name": "edit", "arguments": {"text": "x"}}]),
     ("none", True, [{"name": "edit", "arguments": {"text": "x"}}]),

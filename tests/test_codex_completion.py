@@ -273,14 +273,20 @@ def test_output_schema_encodes_only_dynamic_arguments_and_remains_strict(
     stored = json.loads(
         Path(arguments[arguments.index("--output-schema") + 1]).read_text(encoding="utf-8")
     )
-    assert stored["properties"]["tool_calls"]["items"]["properties"]["arguments"] == {
-        "type": "string"
-    }
-    assert schema["properties"]["tool_calls"]["items"]["properties"]["arguments"] == {
-        "type": "object"
-    }
+    stored_flat = stored["properties"]["tool_calls"]["items"]["anyOf"][0]
+    stored_nested = stored["properties"]["tool_calls"]["items"]["anyOf"][1]
+    assert stored_flat["properties"]["arguments"] == {"type": "string"}
+    assert stored_nested["properties"]["function"]["properties"]["arguments"] == {"type": "string"}
+    raw_flat = schema["properties"]["tool_calls"]["items"]["anyOf"][0]
+    assert raw_flat["properties"]["arguments"] == {"type": ["object", "string"]}
     assert stored["additionalProperties"] is False
-    assert stored["properties"]["tool_calls"]["items"]["properties"]["name"] == {
+    assert stored_flat["additionalProperties"] is False
+    assert stored_nested["additionalProperties"] is False
+    assert stored_flat["properties"]["name"] == {
+        "type": "string",
+        "enum": ["edit"],
+    }
+    assert stored_nested["properties"]["function"]["properties"]["name"] == {
         "type": "string",
         "enum": ["edit"],
     }

@@ -441,6 +441,10 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
         'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
         '"arguments": {<args>}}]}'
     )
+    openai_tool_shape = (
+        'Or OpenAI tool call: {"content": null, "tool_calls": [{"type": "function", '
+        '"function": {"name": "<function_name>", "arguments": {<args>}}}]}'
+    )
     text_shape = 'Text: {"content": "<assistant_message>", "tool_calls": []}'
 
     def envelope(**limits: int) -> dict[str, Any]:
@@ -448,16 +452,16 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
         return {"type": "object", "properties": {"content": {}, "tool_calls": calls}}
 
     auto = agy_completion._agy_schema_instructions(envelope())  # pyright: ignore[reportPrivateUsage]
-    assert tool_shape in auto and text_shape in auto
+    assert tool_shape in auto and openai_tool_shape in auto and text_shape in auto
     assert (
         "propose client tool calls in the envelope rather than repeating past conversation text"
         in auto
     )
     none = agy_completion._agy_schema_instructions(envelope(maxItems=0))  # pyright: ignore[reportPrivateUsage]
-    assert tool_shape not in none and text_shape in none
+    assert tool_shape not in none and openai_tool_shape not in none and text_shape in none
     assert "propose client tool calls in the envelope" not in none
     required = agy_completion._agy_schema_instructions(envelope(minItems=1))  # pyright: ignore[reportPrivateUsage]
-    assert tool_shape in required and text_shape not in required
+    assert tool_shape in required and openai_tool_shape in required and text_shape not in required
 
     # ChatRequest without tools
     req_no_tools = ChatRequest(
@@ -515,6 +519,7 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
         in transcript_with_tools
     )
     assert "Propose only supplied functions; the client executes them." in transcript_with_tools
+    assert "Standard OpenAI tool call items with" in transcript_with_tools
     assert "[Target Turn]:" in transcript_with_tools
     assert "Latest user instruction: What is the weather in Seattle?" in transcript_with_tools
     assert (

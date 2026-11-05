@@ -140,11 +140,22 @@ def _transport_schema(schema: dict[str, Any]) -> dict[str, Any]:
     # that one transport field as JSON text, then restore it before gateway validation.
     properties = value.get("properties", {})
     if "tool_calls" in properties:
-        call_properties = properties["tool_calls"]["items"]["properties"]
-        call_properties["arguments"] = {"type": "string"}
-        name = call_properties.get("name", {})
-        if "const" in name:
-            call_properties["name"] = {"type": "string", "enum": [name["const"]]}
+        items = properties["tool_calls"].get("items", {})
+        item_schemas = items.get("anyOf") if "anyOf" in items else [items]
+        for item in item_schemas:
+            call_properties = item.get("properties", {})
+            if "arguments" in call_properties:
+                call_properties["arguments"] = {"type": "string"}
+            name = call_properties.get("name", {})
+            if "const" in name:
+                call_properties["name"] = {"type": "string", "enum": [name["const"]]}
+            if "function" in call_properties:
+                fn_properties = call_properties["function"].get("properties", {})
+                if "arguments" in fn_properties:
+                    fn_properties["arguments"] = {"type": "string"}
+                fn_name = fn_properties.get("name", {})
+                if "const" in fn_name:
+                    fn_properties["name"] = {"type": "string", "enum": [fn_name["const"]]}
     return strict_schema(value)
 
 
@@ -582,9 +593,13 @@ def parse_completion(
                 if not isinstance(call, dict):
                     continue
                 call = cast("dict[str, Any]", call)
-                if isinstance(call.get("arguments"), str):
+                fn = call.get("function")
+                target: dict[str, Any] = (
+                    cast("dict[str, Any]", fn) if isinstance(fn, dict) else call
+                )
+                if isinstance(target.get("arguments"), str):
                     try:
-                        call["arguments"] = json.loads(call["arguments"])
+                        target["arguments"] = json.loads(target["arguments"])
                     except (ValueError, RecursionError) as exc:
                         raise CompletionInvalid(
                             "Codex returned invalid tool arguments", raw=content[:4000], usage=usage

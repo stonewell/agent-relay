@@ -207,17 +207,44 @@ def prepare_envelope(request: ChatRequest) -> dict[str, Any] | None:
     # Keep each function's schema in its own root for independent local $ref resolution.
     # The native schema requests the transport shape; original argument constraints are
     # checked below and are never weakened or converted to provider-required fields.
+    name_schema: dict[str, Any]
+    if isinstance(request.tool_choice, NamedChoice):
+        name_schema = {"const": request.tool_choice.function.name}
+    else:
+        name_schema = {"type": "string", "enum": [t.function.name for t in request.tools]}
+
+    flat_item: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "arguments"],
+        "properties": {
+            "name": name_schema,
+            "arguments": {"type": ["object", "string"]},
+            "id": {"type": "string"},
+            "type": {"type": "string"},
+        },
+    }
+    nested_item: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["function"],
+        "properties": {
+            "function": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "arguments"],
+                "properties": {
+                    "name": name_schema,
+                    "arguments": {"type": ["object", "string"]},
+                },
+            },
+            "id": {"type": "string"},
+            "type": {"type": "string"},
+        },
+    }
     calls: dict[str, Any] = {
         "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["name", "arguments"],
-            "properties": {
-                "name": {"type": "string", "enum": [t.function.name for t in request.tools]},
-                "arguments": {"type": "object"},
-            },
-        },
+        "items": {"anyOf": [flat_item, nested_item]},
     }
     if request.tool_choice == "none":
         calls["maxItems"] = 0
@@ -229,7 +256,6 @@ def prepare_envelope(request: ChatRequest) -> dict[str, Any] | None:
         calls["maxItems"] = 1
     if isinstance(request.tool_choice, NamedChoice):
         calls["minItems"] = 1
-        calls["items"]["properties"]["name"] = {"const": request.tool_choice.function.name}
     return {
         "type": "object",
         "additionalProperties": False,
@@ -262,8 +288,29 @@ def validate_envelope(
         if error:
             raise EnvelopeError(error.message[:2048])
         envelope = cast("dict[str, Any]", value)
+        raw_calls = cast("list[dict[str, Any]]", envelope["tool_calls"])
+        calls: list[dict[str, Any]] = []
+        for raw_call in raw_calls:
+            target = raw_call.get("function", raw_call)
+            name = target["name"]
+            arguments = target["arguments"]
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments, parse_constant=reject_constant)
+                    check_json_values(arguments)
+                except (ValueError, TypeError, RecursionError) as exc:
+                    raise EnvelopeError(f"invalid JSON in arguments for {name}: {exc}") from exc
+            if not isinstance(arguments, dict):
+                raise EnvelopeError(f"arguments for {name} must be an object")
+            normalized_call: dict[str, Any] = {"name": name, "arguments": arguments}
+            if "id" in raw_call:
+                normalized_call["id"] = raw_call["id"]
+            if "type" in raw_call:
+                normalized_call["type"] = raw_call["type"]
+            calls.append(normalized_call)
+        envelope["tool_calls"] = calls
+
         definitions = {tool.function.name: tool.function.parameters for tool in request.tools or []}
-        calls = cast("list[dict[str, Any]]", envelope["tool_calls"])
         costs = {name: validate_schema(definition) for name, definition in definitions.items()}
         for call in calls:
             work += costs[call["name"]] * _value_weight(call["arguments"])

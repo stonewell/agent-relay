@@ -69,10 +69,11 @@ def render_transcript(request: ChatRequest, model: str, effort: str | None = Non
     if request.tools:
         instructions += (
             ' Return exactly one JSON envelope {"content":string|null,"tool_calls":'
-            '[{"name":string,"arguments":object}]}. Propose only supplied functions; '
-            "the client executes them. Obey tool_choice and parallel_tool_calls. "
-            "When action is required, propose client tool calls in the envelope rather than "
-            "repeating past conversation text."
+            '[{"name":string,"arguments":object}]}. Standard OpenAI tool call items with '
+            '{"type":"function","function":{"name":string,"arguments":object|string}} '
+            "are also accepted. Propose only supplied functions; the client executes them. "
+            "Obey tool_choice and parallel_tool_calls. When action is required, propose client "
+            "tool calls in the envelope rather than repeating past conversation text."
         )
     else:
         instructions += " Return only the assistant's text."
