@@ -90,6 +90,12 @@ def test_agy_completion_adapter_arguments() -> None:
     assert args_override[args_override.index("--model") + 1] == "gemini-3.8-flash-medium"
     assert "--effort" not in args_override
 
+    # A non-tier effort cannot combine with a baked-in tier: the suffix wins, --effort omitted
+    req_xhigh = CompletionRequest("test prompt", "gemini-3.8-flash-high", effort="xhigh")
+    args_xhigh = AgyCompletionAdapter.arguments(req_xhigh)
+    assert args_xhigh[args_xhigh.index("--model") + 1] == "gemini-3.8-flash-high"
+    assert "--effort" not in args_xhigh
+
     # Tiered models without explicit effort retain their suffix and omit --effort
     req_tiered = CompletionRequest("test prompt", "gemini-3.8-flash-high")
     args_tiered = AgyCompletionAdapter.arguments(req_tiered)
@@ -484,7 +490,7 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     assert "read_url_content" in transcript_no_tools
     assert "Return only the assistant's text." in transcript_no_tools
     assert "[Target Turn]:" in transcript_no_tools
-    assert "Latest user instruction: Tell me a joke." in transcript_no_tools
+    assert "The latest user instruction is the last record above" in transcript_no_tools
     assert (
         "Answer the latest instruction directly with the assistant's text." in transcript_no_tools
     )
@@ -521,7 +527,7 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     assert "Propose only supplied functions; the client executes them." in transcript_with_tools
     assert "Standard OpenAI tool call items with" in transcript_with_tools
     assert "[Target Turn]:" in transcript_with_tools
-    assert "Latest user instruction: What is the weather in Seattle?" in transcript_with_tools
+    assert "The latest user instruction is the last record above" in transcript_with_tools
     assert (
         "Propose client tool calls in the JSON envelope if action is needed."
         in transcript_with_tools

@@ -213,6 +213,10 @@ def prepare_envelope(request: ChatRequest) -> dict[str, Any] | None:
     else:
         name_schema = {"type": "string", "enum": [t.function.name for t in request.tools]}
 
+    # Optional OpenAI-style `id`/`type` are accepted and discarded (format_tool_calls assigns
+    # both). They accept null: strict transports (Codex) turn optional properties into
+    # required nullable ones and then emit explicit nulls.
+    ignored: dict[str, Any] = {"type": ["string", "null"]}
     flat_item: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
@@ -220,8 +224,8 @@ def prepare_envelope(request: ChatRequest) -> dict[str, Any] | None:
         "properties": {
             "name": name_schema,
             "arguments": {"type": ["object", "string"]},
-            "id": {"type": "string"},
-            "type": {"type": "string"},
+            "id": ignored,
+            "type": ignored,
         },
     }
     nested_item: dict[str, Any] = {
@@ -238,8 +242,8 @@ def prepare_envelope(request: ChatRequest) -> dict[str, Any] | None:
                     "arguments": {"type": ["object", "string"]},
                 },
             },
-            "id": {"type": "string"},
-            "type": {"type": "string"},
+            "id": ignored,
+            "type": ignored,
         },
     }
     calls: dict[str, Any] = {
@@ -302,12 +306,7 @@ def validate_envelope(
                     raise EnvelopeError(f"invalid JSON in arguments for {name}: {exc}") from exc
             if not isinstance(arguments, dict):
                 raise EnvelopeError(f"arguments for {name} must be an object")
-            normalized_call: dict[str, Any] = {"name": name, "arguments": arguments}
-            if "id" in raw_call:
-                normalized_call["id"] = raw_call["id"]
-            if "type" in raw_call:
-                normalized_call["type"] = raw_call["type"]
-            calls.append(normalized_call)
+            calls.append({"name": name, "arguments": arguments})
         envelope["tool_calls"] = calls
 
         definitions = {tool.function.name: tool.function.parameters for tool in request.tools or []}

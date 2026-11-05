@@ -45,6 +45,9 @@ DEFAULT_MODEL_ALIASES: tuple[str, ...] = ("default", "sonnet", "opus", "fable")
 from the CLI's own report when an alias is probed (``relay.gateway.discovery``).
 """
 
+REASONING_EFFORT_TIERS = frozenset({"minimal", "low", "medium", "high"})
+"""Effort names a model ID may carry as a ``-<tier>`` suffix (e.g. ``gemini-3.8-flash-high``)."""
+
 # Starts alphanumeric so an alias can never be read as another CLI flag.
 _MODEL_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,127}")
 

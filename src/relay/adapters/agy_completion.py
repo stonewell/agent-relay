@@ -27,6 +27,7 @@ from relay.adapters.claude_completion import (
     launch_failed,
 )
 from relay.adapters.completion import (
+    REASONING_EFFORT_TIERS,
     CompletionChunkSink,
     CompletionError,
     CompletionInvalid,
@@ -589,9 +590,6 @@ def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     )
 
 
-_EFFORT_TIERS = frozenset({"minimal", "low", "medium", "high"})
-
-
 def _resolve_model_and_effort(model: str, effort: str | None) -> tuple[str, str | None]:
     """Resolve (model, effort) into (cli_model, cli_effort) for the Antigravity CLI.
 
@@ -602,11 +600,17 @@ def _resolve_model_and_effort(model: str, effort: str | None) -> tuple[str, str 
         return model, effort
 
     base, _, suffix = model.rpartition("-")
-    if base and suffix in _EFFORT_TIERS:
-        if effort is not None and effort in _EFFORT_TIERS:
+    if base and suffix in REASONING_EFFORT_TIERS:
+        if effort is not None and effort in REASONING_EFFORT_TIERS:
             # Explicit effort overrides the suffix tier; omit --effort flag to avoid CLI conflict
             return f"{base}-{effort}", None
-        # Matching effort or effort=None; omit --effort flag
+        if effort is not None:
+            # A non-tier effort cannot be expressed as a suffix and cannot be combined with
+            # one: the baked-in tier wins and the requested effort is dropped.
+            logger.warning(
+                "agy: ignoring reasoning effort %r for tier-suffixed model %r", effort, model
+            )
+        # No effort (or a dropped non-tier effort); omit --effort flag
         return model, None
 
     # Models without tier suffix (e.g. gemini-2.5-pro) use standalone --effort

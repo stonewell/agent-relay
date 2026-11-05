@@ -493,6 +493,37 @@ def test_explicit_cursor_filter_uses_inventory_without_publishing_unselected_ali
         assert not previous.models["cursor/gemini-3.8-flash-low"].listed
 
 
+def test_auto_routing_selects_effort_variant_like_explicit_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay.adapters import cursor_completion
+
+    config = configuration()
+    config.agents["cursor"] = config.agents.pop("fake")
+
+    def models(*_: object) -> tuple[str, ...]:
+        return ("gemini-3.8-flash-low", "gemini-3.8-flash-high")
+
+    monkeypatch.setattr(cursor_completion, "_enumerated_models", models)
+    cursor = cursor_completion.CursorCompletionAdapter(config.agents["cursor"], parent_env={})
+    catalog = ModelCatalog(
+        config, {"cursor": cursor}, models=["gemini-3.8-flash-low", "gemini-3.8-flash-high"]
+    )
+    request = parse_request(
+        {
+            "model": "relay/auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }
+    )
+    (selected,) = catalog.candidates(request)
+    assert (selected.id, selected.model) == ("cursor", "gemini-3.8-flash-high")
+    request.model = "cursor/gemini-3.8-flash-low"
+    (explicit,) = catalog.candidates(request)
+    assert explicit.id == "cursor/gemini-3.8-flash-low"
+    assert explicit.model == "gemini-3.8-flash-high"
+
+
 def test_cursor_verified_capabilities_do_not_register_unselected_models_or_leak_inventory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

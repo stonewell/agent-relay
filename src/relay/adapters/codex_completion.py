@@ -594,6 +594,10 @@ def parse_completion(
                     continue
                 call = cast("dict[str, Any]", call)
                 fn = call.get("function")
+                if "function" in call and not isinstance(fn, dict):
+                    raise CompletionInvalid(
+                        "Codex returned invalid tool arguments", raw=content[:4000], usage=usage
+                    )
                 target: dict[str, Any] = (
                     cast("dict[str, Any]", fn) if isinstance(fn, dict) else call
                 )

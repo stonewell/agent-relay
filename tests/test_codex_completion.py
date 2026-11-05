@@ -290,6 +290,28 @@ def test_output_schema_encodes_only_dynamic_arguments_and_remains_strict(
         "type": "string",
         "enum": ["edit"],
     }
+    # Strict mode requires every property; optional id/type must already accept the nulls
+    # Codex then emits, without an anyOf wrapper the gateway schema would not match.
+    for item in (stored_flat, stored_nested):
+        assert {"id", "type"} <= set(item["required"])
+        assert item["properties"]["id"] == {"type": ["string", "null"]}
+        assert item["properties"]["type"] == {"type": ["string", "null"]}
+
+
+def test_nested_tool_arguments_decode_and_non_object_function_is_invalid() -> None:
+    nested = {
+        "content": None,
+        "tool_calls": [
+            {"function": {"name": "edit", "arguments": '{"x": 1}'}, "id": None, "type": None}
+        ],
+    }
+    completion = parse_completion(result(json.dumps(nested)), structured=True)
+    assert completion.envelope is not None
+    assert completion.envelope["tool_calls"][0]["function"]["arguments"] == {"x": 1}
+    bad = {"content": None, "tool_calls": [{"function": "edit", "arguments": "{}"}]}
+    with pytest.raises(CompletionInvalid) as caught:
+        parse_completion(result(json.dumps(bad)), structured=True)
+    assert "invalid tool arguments" in str(caught.value)
 
 
 @pytest.mark.parametrize(

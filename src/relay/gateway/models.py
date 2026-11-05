@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from relay.adapters.completion import (
+    REASONING_EFFORT_TIERS,
     CompletionCapable,
     CompletionError,
     CompletionRequest,
@@ -45,7 +46,7 @@ ModelState = Literal["observed", "undiscovered", "failed"]
 
 def _model_family(model: str) -> str:
     base, _, variant = model.rpartition("-")
-    return base if base and variant in {"minimal", "low", "medium", "high"} else model
+    return base if base and variant in REASONING_EFFORT_TIERS else model
 
 
 @dataclass(frozen=True)
@@ -360,6 +361,25 @@ class ModelCatalog:
                 entry["relay"]["resolved_model"] = _model_family(entry["relay"]["resolved_model"])
         return {"object": "list", "data": [entry for entry in entries if entry is not None]}
 
+    def _resolve(
+        self,
+        model: GatewayModel,
+        request: ChatRequest,
+        observed: Mapping[tuple[str, str], ObservedModel],
+    ) -> GatewayModel:
+        """Check the requested effort against ``model``, then select its native effort variant.
+
+        The variant keeps the requested public id; its own observed limits apply.
+        """
+        resolved = model
+        if request.reasoning_effort is not None:
+            family = _model_family(model.model)
+            variant = self.models.get(f"{model.agent}/{family}-{request.reasoning_effort}")
+            if variant is not None:
+                resolved = replace(variant, id=model.id)
+        model.check(request, observed.get((resolved.agent, resolved.model)))
+        return resolved
+
     def candidates(self, request: ChatRequest) -> list[GatewayModel]:
         observed = self._observed
         if request.model != "relay/auto":
@@ -368,14 +388,7 @@ class ModelCatalog:
             model = self.models.get(request.model)
             if model is None:
                 raise GatewayError(404, "unknown model", "model", "model_not_found")
-            if request.reasoning_effort is not None:
-                family = _model_family(model.model)
-                variant_id = f"{model.agent}/{family}-{request.reasoning_effort}"
-                variant_model = self.models.get(variant_id)
-                if variant_model is not None:
-                    model = replace(variant_model, id=model.id)
-            model.check(request, observed.get((model.agent, model.model)))
-            return [model]
+            return [self._resolve(model, request, observed)]
         if not self.defaults:
             raise GatewayError(
                 503, "no enabled completion backend available", "model", "model_unavailable"
@@ -384,8 +397,7 @@ class ModelCatalog:
         error: GatewayError | None = None
         for model in self.defaults:
             try:
-                model.check(request, observed.get((model.agent, model.model)))
-                candidates.append(model)
+                candidates.append(self._resolve(model, request, observed))
             except GatewayError as exc:
                 error = exc
         if not candidates:

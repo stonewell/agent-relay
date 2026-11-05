@@ -15,6 +15,7 @@ def canonical(value: Any) -> str:
 
 
 def _target_turn_marker(request: ChatRequest) -> str:
+    # Fixed text only: client strings stay inside the JSON records above, never echoed here.
     parts = ["[Target Turn]: Complete the conversation as the assistant for the final turn above."]
     final_message = request.messages[-1] if request.messages else None
     if final_message is not None and final_message.role == "tool":
@@ -23,22 +24,18 @@ def _target_turn_marker(request: ChatRequest) -> str:
             "user request."
         )
 
-    latest_user_text: str | None = None
-    for message in reversed(request.messages):
-        if message.role == "user":
-            txt = message.text()
-            if txt:
-                latest_user_text = txt.strip()
-                break
+    if any(message.role == "user" for message in request.messages):
+        parts.append("The latest user instruction is the last record above with role user.")
 
-    if latest_user_text:
-        preview = latest_user_text[:500]
-        parts.append(f"Latest user instruction: {preview}")
-
-    if request.tools:
+    if request.tools and request.tool_choice != "none":
         parts.append(
             "Propose client tool calls in the JSON envelope if action is needed. "
             "Do not repeat previous conversation text, summaries, or task lists."
+        )
+    elif request.tools:
+        parts.append(
+            "tool_choice is none: answer in the envelope content with an empty tool_calls "
+            "list. Do not repeat previous conversation text, summaries, or task lists."
         )
     else:
         parts.append(
