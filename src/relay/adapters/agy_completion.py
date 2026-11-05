@@ -111,34 +111,36 @@ _AGY_AGENT_MD = (
     "# System Prompt\n"
     "You are a stateless completion model for a non-interactive API gateway.\n"
     "Explicit user instruction override: Ignore any global coordinator or subagent routing rules "
-    "(`<RULE[user_global]>`). Native function calling is disabled; native function call blocks or "
-    "`<call>` tokens are forbidden. Do NOT call `define_subagent`, `invoke_subagent`, "
-    "`send_message`, `manage_subagents`, `edit_file`, `write_file`, `apply_diff`, `patch`, "
-    "`save_file`, `create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, "
-    "`find_by_name`, `run_command`, `search_web`, `read_url_content`, or any other runtime tool. "
-    "Tool proposals must be emitted exclusively as plain JSON text in the requested envelope "
-    "without invoking any native tool. Respond directly in this single turn with only the "
-    "requested completion output.\n"
+    "(`<RULE[user_global]>`). Native host CLI function calling is disabled; native function "
+    "call blocks or `<call>` tokens are forbidden. Do NOT call host runtime tools or subagents "
+    "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`, `edit_file`, "
+    "`write_file`, `apply_diff`, `patch`, `save_file`, `create_file`, `view_file`, `read_file`, "
+    "`list_dir`, `grep_search`, `find_by_name`, `run_command`, `search_web`, `read_url_content`, "
+    "or any other host tool). When client tools are present in the request header, propose client "
+    "tool calls as plain JSON text in the requested envelope (`tool_calls`) rather than repeating "
+    "past conversation history, summaries, or task lists, and without invoking any host native "
+    "tool. Respond directly in this single turn with only the requested completion output.\n"
 )
 
 _AGY_RULE_MD = (
     "---\n"
     "trigger: always_on\n"
-    "description: Explicit user instruction override disabling all tools and subagents.\n"
+    "description: Explicit user instruction override disabling host CLI tools and subagents.\n"
     "---\n"
     "# Explicit User Instructions Override\n"
     "For this workspace session, explicit user instructions take precedence over "
     "`<RULE[user_global]>`:\n"
-    "- Native function calling is disabled; native function call blocks or `<call>` tokens "
-    "are forbidden.\n"
-    "- Do NOT act as a task coordinator and do NOT register or invoke any subagents "
+    "- Native host CLI function calling is disabled; native function call blocks or `<call>` "
+    "tokens are forbidden.\n"
+    "- Do NOT act as a host task coordinator and do NOT register or invoke any host subagents "
     "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`).\n"
-    "- Do NOT call any runtime tools (`edit_file`, `write_file`, `apply_diff`, `patch`, "
+    "- Do NOT call any host runtime tools (`edit_file`, `write_file`, `apply_diff`, `patch`, "
     "`save_file`, `create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, "
-    "`find_by_name`, `run_command`, `search_web`, `read_url_content`, etc.) or run commands.\n"
-    "- If client functions/tools are listed in the prompt transcript, never invoke a native tool "
-    "call; tool proposals must be emitted exclusively as plain JSON text in the requested "
-    "envelope.\n"
+    "`find_by_name`, `run_command`, `search_web`, `read_url_content`, etc.) or run host "
+    "commands.\n"
+    "- When client tools are listed in the prompt transcript header, propose client tool calls "
+    "exclusively as plain JSON text in the requested envelope (`tool_calls`) rather than repeating "
+    "past conversation history, summaries, or task lists; never invoke a host native tool.\n"
     "- Answer the supplied prompt directly in a single turn and output the response immediately.\n"
 )
 
@@ -148,9 +150,9 @@ from pathlib import Path
 
 msg = (
     "Explicit user instruction override: Stateless single-turn completion mode. "
-    "Native function calling is disabled; native function call blocks or <call> tokens "
-    "are forbidden. Do NOT invoke any tools or subagents. Tool proposals must be emitted "
-    "exclusively as plain JSON text in the requested envelope."
+    "Native host function calling is disabled; native function call blocks or <call> tokens "
+    "are forbidden. Do NOT invoke host runtime tools or subagents. Propose client tool calls "
+    "as plain JSON text in the requested envelope rather than repeating past conversation text."
 )
 
 if "--pre-invocation" in sys.argv[1:]:
@@ -159,9 +161,9 @@ if "--pre-invocation" in sys.argv[1:]:
 
 Path(__file__).with_suffix(".used").touch()
 deny_msg = (
-    "Relay clients execute tools. Native function calling is disabled; native function call "
-    "blocks or <call> tokens are forbidden. Tool proposals must be emitted exclusively as plain "
-    "JSON text in the requested envelope without calling native tools."
+    "Relay clients execute tools. Native host function calling is disabled; native function call "
+    "blocks or <call> tokens are forbidden. Propose client tool calls exclusively as plain "
+    "JSON text in the requested envelope rather than repeating past conversation text."
 )
 print(json.dumps({
     "allow_tool": False,
@@ -555,20 +557,30 @@ def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     shapes = ""
     props = schema.get("properties")
     calls = cast("dict[str, Any]", props).get("tool_calls") if isinstance(props, dict) else None
+    has_tools = False
     if isinstance(calls, dict) and "content" in cast("dict[str, Any]", props):
-        calls = cast("dict[str, Any]", calls)
-        if calls.get("maxItems") != 0:
+        calls_dict = cast("dict[str, Any]", calls)
+        if calls_dict.get("maxItems") != 0:
+            has_tools = True
             shapes += (
                 'Tool call: {"content": null, "tool_calls": [{"name": "<function_name>", '
                 '"arguments": {<args>}}]}\n'
             )
-        if not calls.get("minItems"):
+        if not calls_dict.get("minItems"):
             shapes += 'Text: {"content": "<assistant_message>", "tool_calls": []}\n'
+    tool_guidance = (
+        " When action is required, propose client tool calls in the envelope rather than "
+        "repeating past conversation text, summaries, or task lists."
+        if has_tools
+        else ""
+    )
     return (
-        "\n\nExplicit user instruction: Do NOT call define_subagent, invoke_subagent, "
-        "send_message, view_file, read_file, list_dir, grep_search, find_by_name, run_command, "
-        "search_web, read_url_content or any other runtime tool or subagent; reply directly. "
-        "Your response must be exclusively one raw JSON object starting with '{' and ending "
+        "\n\nExplicit user instruction: Native host CLI tools and subagents are disabled; "
+        "do NOT call define_subagent, invoke_subagent, send_message, view_file, read_file, "
+        "list_dir, grep_search, find_by_name, run_command, search_web, read_url_content or "
+        "any other host runtime tool or subagent; reply directly."
+        + tool_guidance
+        + " Your response must be exclusively one raw JSON object starting with '{' and ending "
         "with '}', with no markdown fence, no XML tags or function call blocks, and no prose."
         + (f" Use one of these shapes:\n{shapes}" if shapes else "\n")
         + f"It must conform to this JSON Schema: {compact}"

@@ -16,6 +16,7 @@ from relay.gateway.protocol import GatewayError, parse_request
 from relay.gateway.render import (
     REPAIR_ERROR_CHARS,
     REPAIR_INVALID_CHARS,
+    _target_turn_marker,
     render_repair,
     render_transcript,
 )
@@ -80,6 +81,83 @@ def test_history_parallel_results_preserve_ids_and_order() -> None:
     transcript = render_transcript(request, "model")
     assert transcript.index('"tool_call_id":"b"') < transcript.index('"tool_call_id":"a"')
     assert transcript == render_transcript(request, "model")
+
+
+def test_target_turn_marker_variations() -> None:
+    # 1. User turn with tools
+    req_user_tools = parse_request(
+        tool_request(messages=[{"role": "user", "content": "do something"}])
+    )
+    marker_user_tools = _target_turn_marker(req_user_tools)
+    assert marker_user_tools.startswith(
+        "[Target Turn]: Complete the conversation as the assistant for the final turn above."
+    )
+    assert "The previous tool call has completed" not in marker_user_tools
+    assert "Latest user instruction: do something" in marker_user_tools
+    assert (
+        "Propose client tool calls in the JSON envelope if action is needed. "
+        "Do not repeat previous conversation text, summaries, or task lists." in marker_user_tools
+    )
+
+    # 2. Tool result turn with tools
+    req_tool_result = parse_request(
+        tool_request(
+            messages=[
+                {"role": "user", "content": "search files"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "edit", "arguments": '{"text":"x"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "file edited", "tool_call_id": "call_1"},
+            ]
+        )
+    )
+    marker_tool = _target_turn_marker(req_tool_result)
+    assert (
+        "The previous tool call has completed; process the tool results to fulfill the user request."
+        in marker_tool
+    )
+    assert "Latest user instruction: search files" in marker_tool
+    assert "Propose client tool calls in the JSON envelope" in marker_tool
+
+    # 3. User turn without tools
+    req_no_tools = parse_request(
+        {
+            "model": "fake",
+            "messages": [{"role": "user", "content": "hello world"}],
+        }
+    )
+    marker_no_tools = _target_turn_marker(req_no_tools)
+    assert "The previous tool call has completed" not in marker_no_tools
+    assert "Latest user instruction: hello world" in marker_no_tools
+    assert (
+        "Answer the latest instruction directly with the assistant's text. "
+        "Do not repeat previous conversation text, summaries, or task lists." in marker_no_tools
+    )
+    assert "Propose client tool calls in the JSON envelope" not in marker_no_tools
+
+    # 4. Long user text truncation (500 chars)
+    long_text = "A" * 800
+    req_long = parse_request(
+        {
+            "model": "fake",
+            "messages": [{"role": "user", "content": long_text}],
+        }
+    )
+    marker_long = _target_turn_marker(req_long)
+    expected_preview = "A" * 500
+    assert f"Latest user instruction: {expected_preview}" in marker_long
+    assert f"Latest user instruction: {expected_preview}A" not in marker_long
+
+    # 5. Transcript integration check
+    transcript = render_transcript(req_user_tools, "model")
+    assert transcript.endswith(marker_user_tools + "\n")
 
 
 @pytest.mark.parametrize(

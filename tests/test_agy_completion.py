@@ -349,9 +349,9 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
     assert deny_data.get("decision") == "deny"
     assert deny_data.get("allow_tool") is False
     expected_deny = (
-        "Relay clients execute tools. Native function calling is disabled; native function call "
-        "blocks or <call> tokens are forbidden. Tool proposals must be emitted exclusively as plain "
-        "JSON text in the requested envelope without calling native tools."
+        "Relay clients execute tools. Native host function calling is disabled; native function call "
+        "blocks or <call> tokens are forbidden. Propose client tool calls exclusively as plain "
+        "JSON text in the requested envelope rather than repeating past conversation text."
     )
     assert deny_data.get("reason") == expected_deny
     assert deny_data.get("deny_reason") == expected_deny
@@ -449,8 +449,13 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
 
     auto = agy_completion._agy_schema_instructions(envelope())  # pyright: ignore[reportPrivateUsage]
     assert tool_shape in auto and text_shape in auto
+    assert (
+        "propose client tool calls in the envelope rather than repeating past conversation text"
+        in auto
+    )
     none = agy_completion._agy_schema_instructions(envelope(maxItems=0))  # pyright: ignore[reportPrivateUsage]
     assert tool_shape not in none and text_shape in none
+    assert "propose client tool calls in the envelope" not in none
     required = agy_completion._agy_schema_instructions(envelope(minItems=1))  # pyright: ignore[reportPrivateUsage]
     assert tool_shape in required and text_shape not in required
 
@@ -461,6 +466,7 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     )
     transcript_no_tools = render_transcript(req_no_tools, model="gemini-2.5-pro")
     assert "<RULE[user_global]>" in transcript_no_tools
+    assert "Native host CLI tool calling is disabled" in transcript_no_tools
     assert "define_subagent" in transcript_no_tools
     assert "invoke_subagent" in transcript_no_tools
     assert "send_message" in transcript_no_tools
@@ -473,6 +479,11 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     assert "search_web" in transcript_no_tools
     assert "read_url_content" in transcript_no_tools
     assert "Return only the assistant's text." in transcript_no_tools
+    assert "[Target Turn]:" in transcript_no_tools
+    assert "Latest user instruction: Tell me a joke." in transcript_no_tools
+    assert (
+        "Answer the latest instruction directly with the assistant's text." in transcript_no_tools
+    )
 
     # ChatRequest with tools
     tool = Tool(
@@ -490,6 +501,7 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     )
     transcript_with_tools = render_transcript(req_with_tools, model="gemini-2.5-pro")
     assert "<RULE[user_global]>" in transcript_with_tools
+    assert "Native host CLI tool calling is disabled" in transcript_with_tools
     assert "define_subagent" in transcript_with_tools
     assert "invoke_subagent" in transcript_with_tools
     assert "send_message" in transcript_with_tools
@@ -503,6 +515,12 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
         in transcript_with_tools
     )
     assert "Propose only supplied functions; the client executes them." in transcript_with_tools
+    assert "[Target Turn]:" in transcript_with_tools
+    assert "Latest user instruction: What is the weather in Seattle?" in transcript_with_tools
+    assert (
+        "Propose client tool calls in the JSON envelope if action is needed."
+        in transcript_with_tools
+    )
 
 
 def test_agy_stream_json_ndjson_envelope_and_parse() -> None:
