@@ -272,6 +272,18 @@ class EnvelopeError(ValueError):
     """An invalid completed envelope; the only repairable failure."""
 
 
+def _normalize_keys(obj: Any) -> Any:
+    """Recursively strip leading and trailing whitespace from string keys."""
+    if isinstance(obj, dict):
+        return {
+            (k.strip() if isinstance(k, str) else k): _normalize_keys(v)
+            for k, v in cast("dict[Any, Any]", obj).items()
+        }
+    if isinstance(obj, list):
+        return [_normalize_keys(item) for item in cast("list[Any]", obj)]
+    return obj
+
+
 def validate_envelope(
     raw: str, request: ChatRequest, schema: dict[str, Any]
 ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -297,6 +309,8 @@ def validate_envelope(
         for raw_call in raw_calls:
             target = raw_call.get("function", raw_call)
             name = target["name"]
+            if isinstance(name, str):
+                name = name.strip()
             arguments = target["arguments"]
             if isinstance(arguments, str):
                 try:
@@ -306,6 +320,7 @@ def validate_envelope(
                     raise EnvelopeError(f"invalid JSON in arguments for {name}: {exc}") from exc
             if not isinstance(arguments, dict):
                 raise EnvelopeError(f"arguments for {name} must be an object")
+            arguments = _normalize_keys(arguments)
             calls.append({"name": name, "arguments": arguments})
         envelope["tool_calls"] = calls
 

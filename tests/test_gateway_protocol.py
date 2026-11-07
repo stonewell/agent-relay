@@ -596,6 +596,96 @@ def test_strict_transport_null_id_and_type_are_accepted() -> None:
         )
 
 
+def test_validate_envelope_key_whitespace_normalization() -> None:
+    request = parse_request(
+        tool_request(
+            parallel_tool_calls=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "create_item",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "config": {
+                                    "type": "object",
+                                    "properties": {"name": {"type": "string"}},
+                                    "required": ["name"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "required": ["name"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+        )
+    )
+    schema = prepare_envelope(request)
+    assert schema is not None
+
+    # 1. Dict arguments with leading/trailing whitespace in keys (flat tool call)
+    raw_dict = json.dumps(
+        {
+            "content": None,
+            "tool_calls": [
+                {
+                    "name": "create_item",
+                    "arguments": {
+                        " name": "foo",
+                        " config ": {" name ": "bar"},
+                    },
+                }
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_dict, request, schema)
+    assert content is None
+    assert calls == [
+        {
+            "name": "create_item",
+            "arguments": {
+                "name": "foo",
+                "config": {"name": "bar"},
+            },
+        }
+    ]
+
+    # 2. Stringified JSON arguments with leading/trailing whitespace in keys (nested tool call)
+    raw_str = json.dumps(
+        {
+            "content": "done",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "create_item",
+                        "arguments": json.dumps(
+                            {
+                                "  name  ": "foo",
+                                "\tconfig\n": {"\tname\t": "bar"},
+                            }
+                        ),
+                    }
+                }
+            ],
+        }
+    )
+    content, calls = validate_envelope(raw_str, request, schema)
+    assert content == "done"
+    assert calls == [
+        {
+            "name": "create_item",
+            "arguments": {
+                "name": "foo",
+                "config": {"name": "bar"},
+            },
+        }
+    ]
+
+
 ENVELOPE_CASES: list[tuple[str, bool, list[dict[str, Any]]]] = [
     ("none", False, [{"name": "edit", "arguments": {"text": "x"}}]),
     ("none", True, [{"name": "edit", "arguments": {"text": "x"}}]),
