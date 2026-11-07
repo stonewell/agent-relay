@@ -674,6 +674,7 @@ def test_gateway_streaming_tool_bearing_with_usage_included() -> None:
             "prompt_tokens": 42,
             "completion_tokens": 15,
             "total_tokens": 57,
+            "prompt_tokens_details": {"cached_tokens": 0},
         }
 
 

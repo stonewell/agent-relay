@@ -55,6 +55,34 @@ def test_usage_records_disjoint_buckets_and_never_invents_missing_counters() -> 
     ) == CompletionUsage(5, 7, 3, 0)
 
 
+def test_completion_usage_as_openai() -> None:
+    # 1. When cached_tokens is None, prompt_tokens_details defaults cached_tokens to 0
+    usage_no_cache = CompletionUsage(prompt_tokens=10, completion_tokens=5, cached_tokens=None)
+    res_no_cache = usage_no_cache.as_openai()
+    assert res_no_cache["prompt_tokens"] == 10
+    assert res_no_cache["completion_tokens"] == 5
+    assert res_no_cache["total_tokens"] == 15
+    assert res_no_cache["prompt_tokens_details"] == {"cached_tokens": 0}
+    assert "relay" not in res_no_cache
+
+    # 2. When cached_tokens is a positive integer
+    usage_cached = CompletionUsage(prompt_tokens=10, completion_tokens=5, cached_tokens=42)
+    res_cached = usage_cached.as_openai()
+    assert res_cached["prompt_tokens_details"] == {"cached_tokens": 42}
+    assert "relay" not in res_cached
+
+    # 3. When cache_write_tokens is None vs present
+    usage_write = CompletionUsage(
+        prompt_tokens=10,
+        completion_tokens=5,
+        cached_tokens=42,
+        cache_write_tokens=100,
+    )
+    res_write = usage_write.as_openai()
+    assert res_write["relay"] == {"cache_write_tokens": 100}
+    assert res_write["prompt_tokens_details"] == {"cached_tokens": 42}
+
+
 def test_envelope_native_field_preferred_and_failure_cannot_be_repaired_as_success() -> None:
     envelope = {"content": None, "tool_calls": [{"name": "edit", "arguments": {"value": "x"}}]}
     result = parse_completion(response(structured_output=envelope, result="bogus"), structured=True)

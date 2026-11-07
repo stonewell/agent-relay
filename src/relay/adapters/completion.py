@@ -105,9 +105,10 @@ class CompletionUsage:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": self.cached_tokens if self.cached_tokens is not None else 0
+            },
         }
-        if self.cached_tokens is not None:
-            value["prompt_tokens_details"] = {"cached_tokens": self.cached_tokens}
         if self.cache_write_tokens is not None:
             value["relay"] = {"cache_write_tokens": self.cache_write_tokens}
         return value
