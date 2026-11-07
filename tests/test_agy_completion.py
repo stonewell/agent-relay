@@ -141,11 +141,31 @@ def test_agy_settings_and_completion_flags() -> None:
     assert "agentMode" not in settings_raw
     expected_deny = [
         "command(*)",
+        "run_command(*)",
         "read_file(*)",
         "write_file(*)",
+        "edit_file(*)",
+        "view_file(*)",
+        "list_dir(*)",
+        "grep_search(*)",
+        "find_by_name(*)",
         "read_url(*)",
+        "read_url_content(*)",
         "execute_url(*)",
+        "search_web(*)",
+        "web_search(*)",
+        "send_message(*)",
+        "define_subagent(*)",
+        "invoke_subagent(*)",
+        "manage_subagents(*)",
+        "manage_task(*)",
+        "schedule(*)",
+        "ask_question(*)",
+        "generate_image(*)",
+        "image_generate(*)",
         "mcp(*)",
+        "*(*)",
+        "*",
     ]
     assert f'"deny":{json.dumps(expected_deny, separators=(",", ":"))}' in settings_raw
 
@@ -184,7 +204,9 @@ def test_agy_prepare_policy(tmp_path: Path) -> None:
     agents_dir = tmp_path / ".agents"
     custom_agents = agents_dir / "agents"
     rules_dir = agents_dir / "rules"
-    for directory in (agents_dir, custom_agents, rules_dir):
+    gemini_home = tmp_path / ".gemini-home"
+    gemini_dir = gemini_home / ".gemini"
+    for directory in (agents_dir, custom_agents, rules_dir, gemini_home, gemini_dir):
         assert directory.is_dir()
         if sys.platform != "win32":
             assert (directory.stat().st_mode & 0o777) == 0o700
@@ -193,6 +215,7 @@ def test_agy_prepare_policy(tmp_path: Path) -> None:
         custom_agents / "relay-completion.md",
         rules_dir / "relay-completion.md",
         tmp_path / "GEMINI.md",
+        gemini_dir / "GEMINI.md",
         agents_dir / "rules.json",
         agents_dir / "agents.json",
         agents_dir / "skills.json",
@@ -224,18 +247,24 @@ def test_agy_prepare_policy(tmp_path: Path) -> None:
     # 2. GEMINI.md and rules/relay-completion.md with trigger: always_on
     rule_text = (rules_dir / "relay-completion.md").read_text(encoding="utf-8")
     gemini_text = (tmp_path / "GEMINI.md").read_text(encoding="utf-8")
+    gemini_home_text = (gemini_dir / "GEMINI.md").read_text(encoding="utf-8")
     assert "trigger: always_on" in rule_text
     assert "trigger: always_on" in gemini_text
+    assert "trigger: always_on" in gemini_home_text
     assert "Explicit User Instructions Override" in rule_text
     assert "Explicit User Instructions Override" in gemini_text
+    assert "Explicit User Instructions Override" in gemini_home_text
     assert "<RULE[user_global]>" in rule_text
     assert "<RULE[user_global]>" in gemini_text
+    assert "<RULE[user_global]>" in gemini_home_text
     assert "define_subagent" in rule_text
     assert "invoke_subagent" in rule_text
     assert "edit_file" in rule_text
     assert "write_file" in rule_text
     assert "edit_file" in gemini_text
     assert "write_file" in gemini_text
+    assert "edit_file" in gemini_home_text
+    assert "write_file" in gemini_home_text
 
     # 3. rules.json, agents.json, skills.json, plugins.json with 0o600 and valid JSON {"exclude": [...]}
     rules_data: dict[str, Any] = json.loads((agents_dir / "rules.json").read_text(encoding="utf-8"))
@@ -356,7 +385,9 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
     assert deny_data.get("allow_tool") is False
     expected_deny = (
         "Relay clients execute tools. Native host function calling is disabled; native function call "
-        "blocks or <call> tokens are forbidden. Propose client tool calls exclusively as plain "
+        "blocks or <call> tokens are forbidden. Do NOT invoke host runtime tools or subagents "
+        "(define_subagent, invoke_subagent, send_message, manage_subagents, manage_task, schedule, "
+        "ask_question). Propose client tool calls exclusively as plain "
         "JSON text in the requested envelope rather than repeating past conversation text."
     )
     assert deny_data.get("reason") == expected_deny
@@ -369,7 +400,10 @@ def test_agy_deny_tools_execution(tmp_path: Path) -> None:
         (Path(".agents"), True),
         (Path(".agents") / "agents", True),
         (Path(".agents") / "rules", True),
+        (Path(".gemini-home"), True),
+        (Path(".gemini-home") / ".gemini", True),
         (Path("GEMINI.md"), False),
+        (Path(".gemini-home") / ".gemini" / "GEMINI.md", False),
         (Path(".agents") / "rules.json", False),
         (Path(".agents") / "agents.json", False),
         (Path(".agents") / "skills.json", False),
@@ -433,6 +467,10 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
         "define_subagent",
         "invoke_subagent",
         "send_message",
+        "manage_subagents",
+        "manage_task",
+        "schedule",
+        "ask_question",
         "view_file",
         "run_command",
         "search_web",
@@ -480,6 +518,10 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     assert "define_subagent" in transcript_no_tools
     assert "invoke_subagent" in transcript_no_tools
     assert "send_message" in transcript_no_tools
+    assert "manage_subagents" in transcript_no_tools
+    assert "manage_task" in transcript_no_tools
+    assert "schedule" in transcript_no_tools
+    assert "ask_question" in transcript_no_tools
     assert "view_file" in transcript_no_tools
     assert "read_file" in transcript_no_tools
     assert "list_dir" in transcript_no_tools
@@ -515,6 +557,10 @@ def test_agy_prompt_framing_and_schema_overrides() -> None:
     assert "define_subagent" in transcript_with_tools
     assert "invoke_subagent" in transcript_with_tools
     assert "send_message" in transcript_with_tools
+    assert "manage_subagents" in transcript_with_tools
+    assert "manage_task" in transcript_with_tools
+    assert "schedule" in transcript_with_tools
+    assert "ask_question" in transcript_with_tools
     assert "view_file" in transcript_with_tools
     assert "read_file" in transcript_with_tools
     assert "run_command" in transcript_with_tools
@@ -1988,6 +2034,20 @@ def test_agy_malformed_step_checks_only_non_empty_error_fields() -> None:
     }
     matched, message = check(nested)
     assert matched and "malformed function call" in message
+
+
+def test_agy_environment_isolates_gemini_cli_home_and_dir(tmp_path: Path) -> None:
+    agent = Agent(cmd="agy")
+    adapter = AgyCompletionAdapter(agent, parent_env={"PATH": "/bin"})
+    env_no_cwd = adapter._environment()  # pyright: ignore[reportPrivateUsage]
+    assert "GEMINI_CLI_HOME" not in env_no_cwd
+    assert "GEMINI_DIR" not in env_no_cwd
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    env_with_cwd = adapter._environment(work_dir)  # pyright: ignore[reportPrivateUsage]
+    assert env_with_cwd["GEMINI_CLI_HOME"] == str((work_dir / ".gemini-home").resolve())
+    assert env_with_cwd["GEMINI_DIR"] == str((work_dir / ".gemini-home" / ".gemini").resolve())
 
 
 def test_agy_environment_failure_leaves_no_watcher_running(

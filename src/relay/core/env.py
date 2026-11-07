@@ -79,7 +79,9 @@ CA_VARS: frozenset[str] = frozenset(
 )
 
 # Each CLI's config-home override, passed only when set in the parent environment.
-CONFIG_HOME_VARS: frozenset[str] = frozenset({"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME"})
+CONFIG_HOME_VARS: frozenset[str] = frozenset(
+    {"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "GEMINI_DIR"}
+)
 
 # The supervisor owns the ``RELAY_`` namespace: nothing from it (IPC token, endpoint
 # address, run secrets) is ever forwarded to a worker, whatever the source (section 9.4).

@@ -63,7 +63,12 @@ _AGY_SETTINGS = (
     '{"toolPermission":"strict",'
     '"allowNonWorkspaceAccess":false,"disableSlashCommands":true,'
     '"permissions":{"allow":[],"ask":[],"deny":['
-    '"command(*)","read_file(*)","write_file(*)","read_url(*)","execute_url(*)","mcp(*)"'
+    '"command(*)","run_command(*)","read_file(*)","write_file(*)","edit_file(*)",'
+    '"view_file(*)","list_dir(*)","grep_search(*)","find_by_name(*)","read_url(*)",'
+    '"read_url_content(*)","execute_url(*)","search_web(*)","web_search(*)",'
+    '"send_message(*)","define_subagent(*)","invoke_subagent(*)","manage_subagents(*)",'
+    '"manage_task(*)","schedule(*)","ask_question(*)","generate_image(*)","image_generate(*)",'
+    '"mcp(*)","*(*)","*"'
     "]}}"
 )
 COMPLETION_FLAGS: tuple[str, ...] = (
@@ -114,13 +119,14 @@ _AGY_AGENT_MD = (
     "Explicit user instruction override: Ignore any global coordinator or subagent routing rules "
     "(`<RULE[user_global]>`). Native host CLI function calling is disabled; native function "
     "call blocks or `<call>` tokens are forbidden. Do NOT call host runtime tools or subagents "
-    "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`, `edit_file`, "
-    "`write_file`, `apply_diff`, `patch`, `save_file`, `create_file`, `view_file`, `read_file`, "
-    "`list_dir`, `grep_search`, `find_by_name`, `run_command`, `search_web`, `read_url_content`, "
-    "or any other host tool). When client tools are present in the request header, propose client "
-    "tool calls as plain JSON text in the requested envelope (`tool_calls`) rather than repeating "
-    "past conversation history, summaries, or task lists, and without invoking any host native "
-    "tool. Respond directly in this single turn with only the requested completion output.\n"
+    "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`, `manage_task`, "
+    "`schedule`, `ask_question`, `edit_file`, `write_file`, `apply_diff`, `patch`, `save_file`, "
+    "`create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, `find_by_name`, "
+    "`run_command`, `search_web`, `read_url_content`, or any other host tool). When client "
+    "tools are present in the request header, propose client tool calls as plain JSON text in "
+    "the requested envelope (`tool_calls`) rather than repeating past conversation history, "
+    "summaries, or task lists, and without invoking any host native tool. Respond directly in "
+    "this single turn with only the requested completion output.\n"
 )
 
 _AGY_RULE_MD = (
@@ -134,11 +140,12 @@ _AGY_RULE_MD = (
     "- Native host CLI function calling is disabled; native function call blocks or `<call>` "
     "tokens are forbidden.\n"
     "- Do NOT act as a host task coordinator and do NOT register or invoke any host subagents "
-    "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`).\n"
-    "- Do NOT call any host runtime tools (`edit_file`, `write_file`, `apply_diff`, `patch`, "
-    "`save_file`, `create_file`, `view_file`, `read_file`, `list_dir`, `grep_search`, "
-    "`find_by_name`, `run_command`, `search_web`, `read_url_content`, etc.) or run host "
-    "commands.\n"
+    "(`define_subagent`, `invoke_subagent`, `send_message`, `manage_subagents`, `manage_task`, "
+    "`schedule`, `ask_question`).\n"
+    "- Do NOT call any host runtime tools (`manage_task`, `schedule`, `ask_question`, `edit_file`, "
+    "`write_file`, `apply_diff`, `patch`, `save_file`, `create_file`, `view_file`, `read_file`, "
+    "`list_dir`, `grep_search`, `find_by_name`, `run_command`, `search_web`, `read_url_content`, "
+    "etc.) or run host commands.\n"
     "- When client tools are listed in the prompt transcript header, propose client tool calls "
     "exclusively as plain JSON text in the requested envelope (`tool_calls`) rather than repeating "
     "past conversation history, summaries, or task lists; never invoke a host native tool.\n"
@@ -152,7 +159,8 @@ from pathlib import Path
 msg = (
     "Explicit user instruction override: Stateless single-turn completion mode. "
     "Native host function calling is disabled; native function call blocks or <call> tokens "
-    "are forbidden. Do NOT invoke host runtime tools or subagents. Propose client tool calls "
+    "are forbidden. Do NOT invoke host runtime tools or subagents (define_subagent, invoke_subagent, "
+    "send_message, manage_subagents, manage_task, schedule, ask_question). Propose client tool calls "
     "as plain JSON text in the requested envelope rather than repeating past conversation text."
 )
 
@@ -163,8 +171,10 @@ if "--pre-invocation" in sys.argv[1:]:
 Path(__file__).with_suffix(".used").touch()
 deny_msg = (
     "Relay clients execute tools. Native host function calling is disabled; native function call "
-    "blocks or <call> tokens are forbidden. Propose client tool calls exclusively as plain "
-    "JSON text in the requested envelope rather than repeating past conversation text."
+    "blocks or <call> tokens are forbidden. Do NOT invoke host runtime tools or subagents "
+    "(define_subagent, invoke_subagent, send_message, manage_subagents, manage_task, schedule, "
+    "ask_question). Propose client tool calls exclusively as plain JSON text in the requested "
+    "envelope rather than repeating past conversation text."
 )
 print(json.dumps({
     "allow_tool": False,
@@ -190,7 +200,19 @@ def _prepare_policy(cwd: Path) -> Path:
     agents_dir = cwd / ".agents"
     custom_agents = agents_dir / "agents"
     rules_dir = agents_dir / "rules"
-    for directory in (agents_dir, custom_agents, rules_dir):
+    gemini_home_raw = cwd / ".gemini-home"
+    gemini_dir_raw = gemini_home_raw / ".gemini"
+    gemini_home = gemini_home_raw.resolve()
+    gemini_dir = (gemini_home / ".gemini").resolve()
+    for directory in (
+        agents_dir,
+        custom_agents,
+        rules_dir,
+        gemini_home_raw,
+        gemini_dir_raw,
+        gemini_home,
+        gemini_dir,
+    ):
         if directory.is_symlink():
             raise OSError(
                 "Antigravity policy directory must not be a symbolic link: "
@@ -200,6 +222,7 @@ def _prepare_policy(cwd: Path) -> Path:
     _write_policy_file(custom_agents / "relay-completion.md", _AGY_AGENT_MD)
     _write_policy_file(rules_dir / "relay-completion.md", _AGY_RULE_MD)
     _write_policy_file(cwd / "GEMINI.md", _AGY_RULE_MD)
+    _write_policy_file(gemini_dir / "GEMINI.md", _AGY_RULE_MD)
     _write_policy_file(
         agents_dir / "rules.json",
         json.dumps({"exclude": ["user_global", "~/.gemini/GEMINI.md"]}),
@@ -579,7 +602,8 @@ def _agy_schema_instructions(schema: dict[str, Any]) -> str:
     )
     return (
         "\n\nExplicit user instruction: Native host CLI tools and subagents are disabled; "
-        "do NOT call define_subagent, invoke_subagent, send_message, view_file, read_file, "
+        "do NOT call define_subagent, invoke_subagent, send_message, manage_subagents, "
+        "manage_task, schedule, ask_question, view_file, read_file, "
         "list_dir, grep_search, find_by_name, run_command, search_web, read_url_content or "
         "any other host runtime tool or subagent; reply directly."
         + tool_guidance
@@ -643,11 +667,15 @@ class AgyCompletionAdapter:
                 self._aliases = ("default",)
         return self._aliases
 
-    def _environment(self) -> CompleteEnv:
+    def _environment(self, cwd: Path | None = None) -> CompleteEnv:
         parent = os.environ if self._parent_env is None else self._parent_env
         extra: dict[str, str] = {}
         if "GEMINI_API_KEY" not in self._agent.env and parent.get("GEMINI_API_KEY"):
             extra["GEMINI_API_KEY"] = parent["GEMINI_API_KEY"]
+        if cwd is not None:
+            gemini_home = (cwd / ".gemini-home").resolve()
+            extra["GEMINI_CLI_HOME"] = str(gemini_home)
+            extra["GEMINI_DIR"] = str((gemini_home / ".gemini").resolve())
         return build_env(self._agent, extra, parent_env=parent)
 
     def inspect(self, *, timeout_s: float = 10) -> CompletionSupport:
@@ -808,7 +836,10 @@ class AgyCompletionAdapter:
         )
 
         # Before the watcher starts: nothing after its start may skip the join below.
-        env = self._environment()
+        try:
+            env = self._environment(cwd)
+        except TypeError:
+            env = self._environment()
 
         def recovered() -> CompletionResult:
             # The relay stopped the tree after its result arrived: the exit status reflects

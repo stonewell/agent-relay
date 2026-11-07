@@ -186,12 +186,14 @@ def test_ca_and_config_home_variables_are_passed_when_set() -> None:
         NODE_EXTRA_CA_CERTS="/node-ca.pem",
         CLAUDE_CONFIG_DIR="/claude-home",
         CODEX_HOME="/codex-home",
+        GEMINI_DIR="/gemini-dir",
     )
     built = build_env(parent_env=parent, platform="linux")
     assert built["SSL_CERT_FILE"] == "/ca.pem"
     assert built["NODE_EXTRA_CA_CERTS"] == "/node-ca.pem"
     assert built["CLAUDE_CONFIG_DIR"] == "/claude-home"
     assert built["CODEX_HOME"] == "/codex-home"
+    assert built["GEMINI_DIR"] == "/gemini-dir"
     assert "GEMINI_CLI_HOME" not in built  # not set in the parent
 
 

@@ -6,6 +6,45 @@ Completed work items for relay. Active and open items are maintained in [develop
 
 ## Completed Items
 
+### 3. Isolate Antigravity CLI config home and harden model-side tool suppression
+
+**Status:** Completed (2026-11-07)  
+**Area:** `src/relay/adapters/agy_completion.py`, `src/relay/core/env.py`, `src/relay/gateway/render.py`, `tests/test_agy_completion.py`, `tests/test_env.py`, `tests/test_gateway_protocol.py`  
+
+#### Problem
+
+Antigravity CLI (`agy`) completions previously fell back to the user host configuration directory (`~/.gemini/`) when `GEMINI_CLI_HOME` and `GEMINI_DIR` were not set to an isolated path, causing `agy` to load user global coordinator instructions and rules (`~/.gemini/GEMINI.md`). In addition, tools such as `manage_task`, `manage_subagents`, `schedule`, and `ask_question` were omitted from permissions deny list settings and prompt suppression instructions, creating a risk that backend models could attempt native coordinator actions or tool calls rather than outputting the requested client completion envelope.
+
+#### Completed Changes
+
+- Configured environment isolation in `src/relay/adapters/agy_completion.py` (`_environment`) by pointing `GEMINI_CLI_HOME` and `GEMINI_DIR` to a scratch directory (`.gemini-home` and `.gemini-home/.gemini`) within `cwd`.
+- Added `GEMINI_DIR` to `CONFIG_HOME_VARS` in `src/relay/core/env.py` so the config-home variable is preserved and forwarded.
+- Hardened `_AGY_SETTINGS` in `src/relay/adapters/agy_completion.py` with an exhaustive permissions deny list covering `run_command`, `edit_file`, `manage_task`, `manage_subagents`, `schedule`, `ask_question`, `generate_image`, `send_message`, `mcp`, and wildcard rules (`*(*)`, `*`).
+- Updated prompt instructions and policy files (`_AGY_AGENT_MD`, `_AGY_RULE_MD`, `_DENY_SCRIPT`, and `_agy_schema_instructions`) in `src/relay/adapters/agy_completion.py` to explicitly prohibit native host coordinator tools and subagent calls.
+- Updated `render_transcript` in `src/relay/gateway/render.py` to explicitly prohibit tools like `manage_subagents`, `manage_task`, `schedule`, and `ask_question`.
+- Wrote policy files (`GEMINI.md` and `rules.json`) inside the isolated scratch directories to exclude host global coordinator instructions.
+- Added and updated comprehensive tests in `tests/test_env.py`, `tests/test_agy_completion.py`, and `tests/test_gateway_protocol.py` verifying config isolation, environment variable forwarding, settings deny lists, and prompt prohibitions.
+
+---
+
+### 3. Standardize OpenAI `prompt_tokens_details.cached_tokens` in `CompletionUsage`
+
+**Status:** Completed (2026-11-07)  
+**Area:** `src/relay/adapters/completion.py`, `tests/test_completion.py`, `tests/test_incremental_json.py`  
+
+#### Problem
+
+In the OpenAI Chat Completions API specification, modern models consistently return `usage.prompt_tokens_details` containing `cached_tokens` (set to `0` when no prompt caching hit occurred). Previously, `CompletionUsage.as_openai()` only included `prompt_tokens_details` when `cached_tokens` was not `None`. When `cached_tokens` was `None`, the field was omitted entirely, which could cause compatibility issues or missing field errors with OpenAI-compatible clients expecting `prompt_tokens_details.cached_tokens`.
+
+#### Completed Changes
+
+- Updated `CompletionUsage.as_openai()` in `src/relay/adapters/completion.py` to unconditionally emit `"prompt_tokens_details": {"cached_tokens": self.cached_tokens if self.cached_tokens is not None else 0}` in the returned usage dictionary.
+- Preserved existing behavior for optional `cache_write_tokens` emitted under the `"relay"` key.
+- Added comprehensive unit tests in `tests/test_completion.py` (`test_completion_usage_as_openai`) validating behavior when `cached_tokens` is `None` (defaults to `0`), when `cached_tokens` is present as a positive integer, and when `cache_write_tokens` is present.
+- Updated downstream usage assertions in `tests/test_incremental_json.py` (`test_gateway_streaming_tool_bearing_with_usage_included`).
+
+---
+
 ### 1. Tool-bearing completions return no content until the backend turn finishes
 
 **Status:** Completed — live streaming of content deltas for tool-bearing turns implemented (Option 1)  
