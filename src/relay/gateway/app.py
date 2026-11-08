@@ -457,8 +457,10 @@ def create_app(
             effort = (
                 parsed.reasoning_effort if parsed.reasoning_effort is not None else model.effort
             )
+            observed = catalog.observed(model)
+            context_limit = observed.context_length if observed is not None else None
             invocation = CompletionRequest(
-                render_transcript(parsed, model.model, effort),
+                render_transcript(parsed, model.model, effort, context_limit=context_limit),
                 model.model,
                 effort,
                 schema,

@@ -304,6 +304,9 @@ class ModelCatalog:
             return "observed"
         return "failed" if key in self._failed else "undiscovered"
 
+    def observed(self, model: GatewayModel) -> ObservedModel | None:
+        return self._observed.get((model.agent, model.model))
+
     # Listing and routing --------------------------------------------------------------------
 
     def _public(
