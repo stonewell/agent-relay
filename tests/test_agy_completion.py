@@ -2198,3 +2198,20 @@ def test_agy_malformed_kill_reported_as_ordinary_exit_is_invalid(
         )
     assert "malformed function call" in str(exc_info.value)
     assert exc_info.value.raw == line
+
+
+def test_agy_parse_completion_detects_malformed_in_stdout_stream() -> None:
+    line = json.dumps(
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "error_message",
+                "message": "Your previous response contained an improperly formatted function call",
+            },
+        }
+    )
+    proc = ProcessResult(1, line, stderr="")
+    with pytest.raises(CompletionInvalid) as exc_info:
+        parse_completion(proc, structured=True)
+    assert "; malformed function call" in exc_info.value.args[0]
+

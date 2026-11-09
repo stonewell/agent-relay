@@ -29,6 +29,7 @@ from relay.gateway.protocol import (
 from relay.gateway.render import (
     _group_turns,  # pyright: ignore[reportPrivateUsage]
     _target_turn_marker,  # pyright: ignore[reportPrivateUsage]
+    render_repair,
     render_transcript,
 )
 
@@ -427,3 +428,36 @@ def test_model_catalog_observed() -> None:
     obs = ObservedModel("m", 32768, 4096)
     catalog._observed[("fake", "m")] = obs  # pyright: ignore[reportPrivateUsage]
     assert catalog.observed(model) == obs
+
+
+def test_render_repair_sanitizes_malformed_function_call() -> None:
+    raw_error = (
+        "Antigravity CLI completion failed: exit code 0; error: Your previous response "
+        "contained an improperly formatted function call\n"
+        "Please retry with a properly formatted function call\n"
+        "Retries remaining: 3"
+    )
+    prompt = render_repair("transcript\n", "invalid payload", raw_error)
+    assert "Please retry with a properly formatted function call" not in prompt
+    assert '"invalid_response":""' in prompt or '"invalid_response": ""' in prompt
+    lines = prompt.splitlines()
+    preamble = lines[1]
+    record = json.loads(lines[-1])["repair"]
+    assert record["invalid_response"] == ""
+    assert "native host CLI function calling is disabled".lower() in preamble.lower()
+    assert "native host function calling is disabled" in record["validation_error"]
+
+
+def test_render_repair_preserves_standard_schema_errors() -> None:
+    invalid = '{"result": 123}'
+    error = 'ValidationError: missing required field "name"'
+    prompt = render_repair("transcript\n", invalid, error)
+    lines = prompt.splitlines()
+    preamble = lines[1]
+    record = json.loads(lines[-1])["repair"]
+    assert record["invalid_response"] == invalid
+    assert record["validation_error"] == error
+    assert "The previous response failed output validation." in preamble
+    assert "malformed function call" not in prompt
+    assert "Native host CLI function calling is disabled" not in prompt
+

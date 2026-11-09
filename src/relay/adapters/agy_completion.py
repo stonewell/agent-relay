@@ -435,6 +435,40 @@ def _is_malformed_step(event: dict[str, Any]) -> tuple[bool, str]:
     Only non-empty error fields are inspected; `message`/`text` count as error fields only
     on an `error_message` step, so model text that merely mentions a marker never matches.
     """
+    if event.get("event") == "result":
+        res = event.get("result")
+        res_dict = res if isinstance(res, dict) else {}
+        is_err = (
+            not _success_status(res_dict.get("status"))
+            or res_dict.get("is_error") is True
+            or not _success_status(event.get("status"))
+            or event.get("is_error") is True
+        )
+        result_fields: list[tuple[dict[str, Any], str, bool]] = [
+            (res_dict, "error_message", True),
+            (res_dict, "error", True),
+            (res_dict, "message", True),
+            (res_dict, "text", True),
+            (res_dict, "status", True),
+            (res_dict, "response", is_err),
+            (event, "error_message", True),
+            (event, "error", True),
+            (event, "status", True),
+            (event, "response", is_err),
+        ]
+        for source, key, is_error_field in result_fields:
+            val = source.get(key)
+            if not is_error_field or not val:
+                continue
+            text = val if isinstance(val, str) else json.dumps(val)
+            if any(marker in text.lower() for marker in MALFORMED_FUNCTION_CALL_MARKERS):
+                return True, text
+        if isinstance(res, str) and any(
+            marker in res.lower() for marker in MALFORMED_FUNCTION_CALL_MARKERS
+        ):
+            return True, res
+        return False, ""
+
     if event.get("event") != "step_update" or not isinstance(event.get("step_update"), dict):
         return False, ""
     step = cast("dict[str, Any]", event["step_update"])
@@ -595,14 +629,16 @@ def _agy_schema_instructions(schema: dict[str, Any]) -> str:
         if not calls_dict.get("minItems"):
             shapes += 'Text: {"content": "<assistant_message>", "tool_calls": []}\n'
     tool_guidance = (
+        " Propose client tool calls exclusively as plain JSON text in the requested envelope."
         " When action is required, propose client tool calls in the envelope rather than "
         "repeating past conversation text, summaries, or task lists."
         if has_tools
         else ""
     )
     return (
-        "\n\nExplicit user instruction: Native host CLI tools and subagents are disabled; "
-        "do NOT call define_subagent, invoke_subagent, send_message, manage_subagents, "
+        "\n\nExplicit user instruction: Native host CLI tools and function calling are disabled; "
+        "native function call blocks or tokens are forbidden. "
+        "Do NOT call define_subagent, invoke_subagent, send_message, manage_subagents, "
         "manage_task, schedule, ask_question, view_file, read_file, "
         "list_dir, grep_search, find_by_name, run_command, search_web, read_url_content or "
         "any other host runtime tool or subagent; reply directly."
@@ -854,9 +890,9 @@ class AgyCompletionAdapter:
         def stopped() -> CompletionError:
             # The relay stopped the tree before any result: the first kill reason decides.
             if kill_reason[0] == "malformed":
-                _, err, line = malformed[0]
+                line = malformed[0][2] if malformed else ""
                 return CompletionInvalid(
-                    f"Antigravity CLI completion failed: malformed function call; error: {err}",
+                    "Antigravity CLI completion failed: malformed function call",
                     raw=line[:4000],
                 )
             return CompletionError("Completion cancelled", status=503, code="request_cancelled")
@@ -1039,6 +1075,8 @@ def parse_completion(
 ) -> CompletionResult:
     if proc.timed_out:
         raise CompletionError("Completion deadline expired", status=504, code="timeout")
+    stdout_malformed = False
+    malformed_line = ""
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1047,12 +1085,20 @@ def parse_completion(
             parsed: Any = json.loads(line)
         except (ValueError, RecursionError):
             continue
-        if isinstance(parsed, dict) and _tool_activity(cast("dict[str, Any]", parsed)):
-            raise CompletionError("Antigravity reported model-side tools", code="backend_tool_use")
+        if isinstance(parsed, dict):
+            parsed_dict = cast("dict[str, Any]", parsed)
+            if _tool_activity(parsed_dict):
+                raise CompletionError("Antigravity reported model-side tools", code="backend_tool_use")
+            if not stdout_malformed:
+                is_m, _ = _is_malformed_step(parsed_dict)
+                if is_m:
+                    stdout_malformed = True
+                    malformed_line = line
     payload = agy_envelope(proc.stdout)
     # Only a success status (or none) is success; CANCELED/INTERRUPTED/WAITING/RUNNING also fail.
-    is_error = payload is not None and (
-        not _success_status(payload.get("status")) or payload.get("is_error") is True
+    is_error = stdout_malformed or (
+        payload is not None
+        and (not _success_status(payload.get("status")) or payload.get("is_error") is True)
     )
     if proc.exit_code != 0 or is_error:
         err_msg = envelope_error(payload) if payload else None
@@ -1069,7 +1115,12 @@ def parse_completion(
                 code="context_length_exceeded",
                 param="messages",
             )
-        if err_msg:
+        malformed = stdout_malformed or any(
+            marker in diagnostic for marker in MALFORMED_FUNCTION_CALL_MARKERS
+        )
+        if malformed:
+            err_part = "; malformed function call"
+        elif err_msg:
             err_part = f"; error: {redact(err_msg, secrets=secrets)}"
         elif is_error:
             status_desc = ""
@@ -1080,10 +1131,6 @@ def parse_completion(
             err_part = f"; status: {status_desc}" if status_desc else "; error: unknown"
         else:
             err_part = ""
-        malformed = any(marker in diagnostic for marker in MALFORMED_FUNCTION_CALL_MARKERS)
-        if malformed and not err_msg:
-            # Fixed text so a repair prompt still names the failure without raw stderr.
-            err_part += "; malformed function call"
         message = f"Antigravity CLI completion failed: exit code {proc.exit_code}{err_part}"
         # Raw stderr is a private diagnostic: log it redacted, never return it to the client.
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
@@ -1092,11 +1139,13 @@ def parse_completion(
         if structured and (
             (payload is not None and payload.get("status") == "INVALID") or malformed
         ):
-            raw_content = (
+            candidate_raw = (
                 str(payload.get("response") or payload.get("result") or "")
                 if payload is not None
                 else ""
-            ) or proc.stdout
+            )
+            raw_line = candidate_raw or malformed_line
+            raw_content = raw_line[:4000] if raw_line else proc.stdout
             raise CompletionInvalid(
                 message,
                 raw=raw_content[:4000],

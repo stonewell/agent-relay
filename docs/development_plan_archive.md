@@ -6,6 +6,29 @@ Completed work items for relay. Active and open items are maintained in [develop
 
 ## Completed Items
 
+### 4. Suppress Gemini malformed function call prompt contamination during repair retries
+
+**Status:** Completed (2026-11-09)  
+**Area:** `src/relay/gateway/render.py`, `src/relay/adapters/agy_completion.py`, `src/relay/gateway/runtime.py`  
+
+#### Problem
+
+When using the Antigravity CLI (`agy`) with Gemini models, the client could encounter the error `"Your previous response contained an improperly formatted function call. Please retry with a properly formatted function call"`. When the gateway runtime initiated a repair retry, `render_repair` echoed the un-sanitized error and invalid response back into the prompt transcript. The Gemini backend model saw `"Please retry with a properly formatted function call"` and repeatedly attempted native function calling, causing recurring malformed function calls and repair loop failures.
+
+#### Completed Changes
+
+- **Malformed call detection & sanitized repair preamble (`src/relay/gateway/render.py`):**
+  - Defined `MALFORMED_CALL_MARKERS` for detection of malformed/empty function call errors.
+  - In `render_repair`, detected malformed call markers in `error` or `invalid` and injected an explicit override preamble forbidding native host function calls and directing client tool proposals exclusively as plain JSON in the envelope.
+  - Sanitized `clean_error` to a static, non-contaminating string and cleared `clean_invalid` to `""`.
+- **Backend adapter hardening (`src/relay/adapters/agy_completion.py`):**
+  - Updated `_is_malformed_step(event)` to detect malformed function calls in `event == "result"` payloads and status fields.
+  - In `stopped()`, raised `CompletionInvalid("Antigravity CLI completion failed: malformed function call", raw=line[:4000])` on malformed termination with clean diagnostic message while preserving raw line on `exc.raw` for caller inspection.
+  - In `parse_completion()`, inspected `proc.stdout` JSON lines using `_is_malformed_step()`, set static `err_part = "; malformed function call"` regardless of raw `err_msg`, and preserved diagnostic raw content on `exc.raw`.
+  - In `_agy_schema_instructions()`, ensured schema instructions explicitly forbid native function call blocks, tokens, or tags, and instruct proposing client tool calls exclusively as plain JSON in the requested envelope.
+- **Usage preservation during repair retries (`src/relay/gateway/runtime.py`):**
+  - Aggregated usage via `aggregate_usage(first_invalid.usage, result.usage)` when repair retries succeed, deliberately returning `None` when one attempt has unknown usage to prevent reporting partial counts.
+
 ### 3. Isolate Antigravity CLI config home and harden model-side tool suppression
 
 **Status:** Completed (2026-11-07)  
