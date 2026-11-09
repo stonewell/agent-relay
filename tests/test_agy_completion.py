@@ -1686,7 +1686,9 @@ def test_agy_malformed_function_call_markers() -> None:
         "failed to parse function call",
         "function call is empty",
         "empty function call",
+        "retry with a properly formatted function call",
     )
+    assert all(marker == marker.lower() for marker in MALFORMED_FUNCTION_CALL_MARKERS)
     assert MALFORMED_FAIL_FAST_GRACE_S == 5.0
 
 
@@ -2036,6 +2038,37 @@ def test_agy_malformed_step_checks_only_non_empty_error_fields() -> None:
     assert matched and "malformed function call" in message
 
 
+def test_agy_successful_result_mentioning_marker_is_not_malformed() -> None:
+    check = agy_completion._is_malformed_step  # pyright: ignore[reportPrivateUsage]
+    answer = "A malformed function call happens when the model emits broken JSON."
+    for result in (
+        {"status": "SUCCESS", "response": answer},
+        {"status": "SUCCESS", "message": answer, "text": answer},
+        {"response": answer},
+        answer,
+    ):
+        assert check({"event": "result", "result": result}) == (False, "")
+    # A failed result still matches on its error field.
+    failed = {"event": "result", "result": {"status": "ERROR", "error": "Malformed function call"}}
+    assert check(failed) == (True, "Malformed function call")
+
+    ndjson = json.dumps(
+        {
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": answer, "message": answer, "text": answer},
+        }
+    )
+    assert parse_completion(ProcessResult(0, ndjson), structured=False).content == answer
+    envelope = {"content": answer}
+    ndjson_struct = json.dumps(
+        {
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": json.dumps(envelope), "message": answer},
+        }
+    )
+    assert parse_completion(ProcessResult(0, ndjson_struct), structured=True).envelope == envelope
+
+
 def test_agy_environment_isolates_gemini_cli_home_and_dir(tmp_path: Path) -> None:
     agent = Agent(cmd="agy")
     adapter = AgyCompletionAdapter(agent, parent_env={"PATH": "/bin"})
@@ -2061,7 +2094,7 @@ def test_agy_environment_failure_leaves_no_watcher_running(
             started.append(self)
             super().start()
 
-    def broken_environment() -> Any:
+    def broken_environment(_cwd: Path | None = None) -> Any:
         raise RuntimeError("environment unavailable")
 
     monkeypatch.setattr(agy_completion.threading, "Thread", TrackingThread)

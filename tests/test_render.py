@@ -153,6 +153,50 @@ def test_group_turns_orphaned_and_unfinished() -> None:
     assert len(turns[2]) == 1 and turns[2][0].role == "user"
 
 
+def test_group_turns_unmatched_results_do_not_inflate_turn() -> None:
+    msgs = [
+        _msg(role="assistant", content=None, tool_calls=[_tool_call("call_a")]),
+        _msg(role="tool", content="res a", tool_call_id="call_a"),
+        # Duplicate and unknown ids after the call is satisfied stay out of its turn.
+        _msg(role="tool", content="dup a", tool_call_id="call_a"),
+        _msg(role="tool", content="stray", tool_call_id="call_q"),
+        _msg(role="assistant", content=None, tool_calls=[_tool_call("call_b")]),
+        # Mismatched id closes the pending turn instead of being absorbed.
+        _msg(role="tool", content="wrong", tool_call_id="call_c"),
+        _msg(role="tool", content="late", tool_call_id="call_d"),
+        _msg(role="user", content="next"),
+    ]
+    turns = _group_turns(msgs)
+    assert [[m.content for m in turn] for turn in turns] == [
+        [None, "res a"],
+        ["dup a"],
+        ["stray"],
+        [None],
+        ["wrong"],
+        ["late"],
+        ["next"],
+    ]
+
+
+def test_group_turns_pending_call_closed_by_non_tool_message() -> None:
+    msgs = [
+        _msg(
+            role="assistant",
+            content=None,
+            tool_calls=[_tool_call("call_a"), _tool_call("call_b")],
+        ),
+        _msg(role="tool", content="res a", tool_call_id="call_a"),
+        _msg(role="assistant", content="interjection"),
+        _msg(role="tool", content="res b", tool_call_id="call_b"),
+    ]
+    turns = _group_turns(msgs)
+    assert [[m.content for m in turn] for turn in turns] == [
+        [None, "res a"],
+        ["interjection"],
+        ["res b"],
+    ]
+
+
 def test_untruncated_transcript_under_budget() -> None:
     req = make_request(
         [
@@ -341,6 +385,49 @@ def test_guarantee_latest_turn_always_retained() -> None:
     assert "[Earlier conversation history truncated: 1 messages omitted" in transcript_tool
 
 
+def test_oversized_pinned_system_drops_all_droppable_history() -> None:
+    req = make_request(
+        [
+            {"role": "system", "content": "PINNED " + "s" * 5000},
+            {"role": "user", "content": "U0 old"},
+            {"role": "assistant", "content": "A0 old"},
+            {"role": "user", "content": "U1 latest"},
+        ]
+    )
+    transcript = render_transcript(req, "test-model", max_chars=2000)
+    # Unavoidable content exceeds the budget: it is kept whole, everything else is dropped.
+    assert len(transcript) > 2000
+    assert "PINNED " + "s" * 5000 in transcript
+    assert "U1 latest" in transcript
+    assert "U0 old" not in transcript
+    assert "A0 old" not in transcript
+    assert "[Earlier conversation history truncated: 2 messages omitted" in transcript
+
+
+def test_oversized_final_tool_turn_drops_all_earlier_history() -> None:
+    req = make_request(
+        [
+            {"role": "user", "content": "Old question"},
+            {"role": "user", "content": "Call the tool"},
+            {"role": "assistant", "content": None, "tool_calls": [_tool_call("call_big")]},
+            {"role": "tool", "content": "R" * 5000, "tool_call_id": "call_big"},
+        ]
+    )
+    transcript = render_transcript(req, "test-model", max_chars=2000)
+    assert "R" * 5000 in transcript
+    assert "call_big" in transcript
+    assert "Old question" not in transcript
+    assert "Call the tool" not in transcript
+    assert "[Earlier conversation history truncated: 2 messages omitted" in transcript
+
+
+def test_single_oversized_turn_has_no_truncation_notice() -> None:
+    req = make_request([{"role": "user", "content": "Q" * 5000}])
+    transcript = render_transcript(req, "test-model", max_chars=100)
+    assert "Q" * 5000 in transcript
+    assert "[Earlier conversation history truncated" not in transcript
+
+
 def test_token_budget_computation_with_context_limit_and_output_tokens() -> None:
     req = make_request(
         [{"role": "user", "content": "Query " + "q" * 50}],
@@ -372,15 +459,17 @@ def test_token_budget_computation_fallback_defaults() -> None:
     t = render_transcript(req, "test-model")
     assert "[Earlier conversation history truncated" not in t
 
-    # Floor at 1000 tokens when limit_tokens < output_reserve
-    # limit = 2000, output = 4000 -> limit - output = -2000 -> floor = 1000 -> budget = 4000
+    # No floor when limit_tokens < output_reserve: the exhausted budget truncates maximally
+    # limit = 2000, output = 4000 -> limit - output = -2000 -> budget = 0
     req_small = make_request(
         [{"role": "user", "content": f"msg {i} " + "v" * 150} for i in range(20)],
         max_tokens=4000,
     )
     t_floor = render_transcript(req_small, "test-model", context_limit=2000)
-    assert len(t_floor) <= 4000
-    assert "[Earlier conversation history truncated:" in t_floor
+    assert "[Earlier conversation history truncated: 19 messages omitted" in t_floor
+    assert "msg 19 " in t_floor
+    assert "msg 18 " not in t_floor
+    assert t_floor == render_transcript(req_small, "test-model", max_chars=0)
 
 
 def test_model_catalog_observed() -> None:
@@ -460,4 +549,25 @@ def test_render_repair_preserves_standard_schema_errors() -> None:
     assert "The previous response failed output validation." in preamble
     assert "malformed function call" not in prompt
     assert "Native host CLI function calling is disabled" not in prompt
+
+
+def test_render_repair_marker_in_invalid_response_only_is_schema_failure() -> None:
+    invalid = '{"content": "the docs mention a malformed function call", "extra": 1}'
+    error = "envelope has unexpected key 'extra'"
+    prompt = render_repair("transcript\n", invalid, error)
+    lines = prompt.splitlines()
+    record = json.loads(lines[-1])["repair"]
+    assert "The previous response failed output validation." in lines[1]
+    assert record["invalid_response"] == invalid
+    assert record["validation_error"] == error
+
+
+def test_render_repair_uses_adapter_marker_list() -> None:
+    import relay.adapters.agy_completion as agy_completion
+    import relay.gateway.render as render
+
+    assert render.MALFORMED_FUNCTION_CALL_MARKERS is agy_completion.MALFORMED_FUNCTION_CALL_MARKERS
+    for marker in agy_completion.MALFORMED_FUNCTION_CALL_MARKERS:
+        prompt = render_repair("transcript\n", "payload", "Error: " + marker.upper())
+        assert json.loads(prompt.splitlines()[-1])["repair"]["invalid_response"] == ""
 

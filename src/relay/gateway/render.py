@@ -6,6 +6,8 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from relay.adapters.agy_completion import MALFORMED_FUNCTION_CALL_MARKERS
+
 from .protocol import ChatRequest, Message
 
 DEFAULT_CONTEXT_LIMIT_TOKENS = 128_000
@@ -20,33 +22,36 @@ def canonical(value: Any) -> str:
 
 
 def _group_turns(messages: Sequence[Message]) -> list[list[Message]]:
-    """Group messages into atomic turns so tool calls and results are never split."""
+    """Group messages into atomic turns so tool calls and matching results are never split.
+
+    An assistant tool-call turn absorbs only directly following tool results whose
+    tool_call_id matches a still-pending call; any other message closes the turn, and
+    unmatched or duplicate tool results become their own single-message turns.
+    """
     turns: list[list[Message]] = []
     current: list[Message] = []
     pending_ids: set[str] = set()
 
     for msg in messages:
-        if current:
-            if msg.role == "tool":
-                current.append(msg)
-                if msg.tool_call_id:
-                    pending_ids.discard(msg.tool_call_id)
-                if not pending_ids:
-                    turns.append(current)
-                    current = []
-                    pending_ids = set()
-                continue
-            else:
-                turns.append(current)
-                current = []
-                pending_ids = set()
-
-        if msg.role == "assistant" and msg.tool_calls:
-            current = [msg]
-            pending_ids = {call.id for call in msg.tool_calls if call.id}
+        call_id = msg.tool_call_id if msg.role == "tool" else None
+        if current and call_id is not None and call_id in pending_ids:
+            current.append(msg)
+            pending_ids.discard(call_id)
             if not pending_ids:
                 turns.append(current)
                 current = []
+            continue
+        if current:
+            turns.append(current)
+            current = []
+            pending_ids = set()
+
+        if msg.role == "assistant" and msg.tool_calls:
+            pending_ids = {call.id for call in msg.tool_calls if call.id}
+            if pending_ids:
+                current = [msg]
+            else:
+                turns.append([msg])
         else:
             turns.append([msg])
 
@@ -115,7 +120,8 @@ def render_transcript(
             context_limit if context_limit is not None else DEFAULT_CONTEXT_LIMIT_TOKENS
         )
         output_reserve = request.output_tokens or DEFAULT_OUTPUT_TOKENS_RESERVE
-        prompt_tokens = max(1000, limit_tokens - output_reserve)
+        # No floor: an exhausted budget must truncate maximally, not be masked by a minimum.
+        prompt_tokens = max(0, limit_tokens - output_reserve)
         char_budget = prompt_tokens * CHARS_PER_TOKEN
 
     header = {
@@ -181,9 +187,10 @@ def render_transcript(
         lines.append(marker)
         return "\n".join(lines) + "\n"
 
-    # Truncate history turns working backwards from newest to oldest.
-    # Pinned system instructions are always preserved.
-    # If there are no history turns, render system turns and marker.
+    # Truncate history turns working backwards from newest to oldest. Pinned system turns and
+    # the newest turn are never dropped or cut inside a message, so when they alone exceed the
+    # budget every other turn is omitted (and counted in the notice) and the prompt stays over
+    # budget rather than silently losing required content.
     if not history_turns:
         lines = [instructions, canonical(header)]
         lines.extend(system_lines)
@@ -220,23 +227,14 @@ def render_transcript(
 REPAIR_INVALID_CHARS = 16384
 REPAIR_ERROR_CHARS = 2048
 
-MALFORMED_CALL_MARKERS: tuple[str, ...] = (
-    "improperly formatted function call",
-    "malformed function call",
-    "failed to parse function call",
-    "function call is empty",
-    "empty function call",
-    "retry with a properly formatted function call",
-)
-
 
 def render_repair(transcript: str, invalid: str, error: str) -> str:
     """Append the single repair request; the failed output and error stay JSON data."""
     if not transcript.endswith("\n"):
         transcript += "\n"
+    # Only the error decides: response text quoting a marker is still a normal schema failure.
     lower_err = error.lower()
-    lower_invalid = invalid.lower()
-    if any(marker in lower_err or marker in lower_invalid for marker in MALFORMED_CALL_MARKERS):
+    if any(marker in lower_err for marker in MALFORMED_FUNCTION_CALL_MARKERS):
         preamble = (
             "The previous response attempted a native function call or emitted a malformed tool call token. "
             "Native host CLI function calling is disabled; native function call blocks or tags are forbidden. "

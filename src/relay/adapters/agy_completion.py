@@ -71,6 +71,8 @@ _AGY_SETTINGS = (
     '"mcp(*)","*(*)","*"'
     "]}}"
 )
+# The named deny entries are deliberate defense in depth: the CLI's honoring of the "*(*)"/"*"
+# catch-alls is unverified, so the known host tools stay denied even if wildcards are ignored.
 COMPLETION_FLAGS: tuple[str, ...] = (
     "--agent",
     "relay-completion",
@@ -87,12 +89,14 @@ RESULT_EXIT_GRACE_S = 5.0
 MALFORMED_FAIL_FAST_GRACE_S = 5.0
 logger = logging.getLogger("uvicorn.error")
 
+# Canonical lowercase markers (also used by gateway rendering); match a lowercased haystack.
 MALFORMED_FUNCTION_CALL_MARKERS: tuple[str, ...] = (
     "improperly formatted function call",
     "malformed function call",
     "failed to parse function call",
     "function call is empty",
     "empty function call",
+    "retry with a properly formatted function call",
 )
 
 _AGY_AGENT_MD = (
@@ -202,17 +206,9 @@ def _prepare_policy(cwd: Path) -> Path:
     rules_dir = agents_dir / "rules"
     gemini_home_raw = cwd / ".gemini-home"
     gemini_dir_raw = gemini_home_raw / ".gemini"
-    gemini_home = gemini_home_raw.resolve()
-    gemini_dir = (gemini_home / ".gemini").resolve()
-    for directory in (
-        agents_dir,
-        custom_agents,
-        rules_dir,
-        gemini_home_raw,
-        gemini_dir_raw,
-        gemini_home,
-        gemini_dir,
-    ):
+    gemini_dir = (gemini_home_raw.resolve() / ".gemini").resolve()
+    # Resolved paths cannot be symlinks; the raw paths are the ones checked.
+    for directory in (agents_dir, custom_agents, rules_dir, gemini_home_raw, gemini_dir_raw):
         if directory.is_symlink():
             raise OSError(
                 "Antigravity policy directory must not be a symbolic link: "
@@ -434,39 +430,33 @@ def _is_malformed_step(event: dict[str, Any]) -> tuple[bool, str]:
 
     Only non-empty error fields are inspected; `message`/`text` count as error fields only
     on an `error_message` step, so model text that merely mentions a marker never matches.
+    A `result` event matches only when it failed, and only on its error/status fields.
     """
     if event.get("event") == "result":
         res = event.get("result")
-        res_dict = res if isinstance(res, dict) else {}
+        res_dict = cast("dict[str, Any]", res) if isinstance(res, dict) else {}
         is_err = (
             not _success_status(res_dict.get("status"))
             or res_dict.get("is_error") is True
             or not _success_status(event.get("status"))
             or event.get("is_error") is True
         )
-        result_fields: list[tuple[dict[str, Any], str, bool]] = [
-            (res_dict, "error_message", True),
-            (res_dict, "error", True),
-            (res_dict, "message", True),
-            (res_dict, "text", True),
-            (res_dict, "status", True),
-            (res_dict, "response", is_err),
-            (event, "error_message", True),
-            (event, "error", True),
-            (event, "status", True),
-            (event, "response", is_err),
-        ]
-        for source, key, is_error_field in result_fields:
+        if not is_err:
+            return False, ""
+        for source, key in (
+            (res_dict, "error_message"),
+            (res_dict, "error"),
+            (res_dict, "status"),
+            (event, "error_message"),
+            (event, "error"),
+            (event, "status"),
+        ):
             val = source.get(key)
-            if not is_error_field or not val:
+            if not val:
                 continue
             text = val if isinstance(val, str) else json.dumps(val)
             if any(marker in text.lower() for marker in MALFORMED_FUNCTION_CALL_MARKERS):
                 return True, text
-        if isinstance(res, str) and any(
-            marker in res.lower() for marker in MALFORMED_FUNCTION_CALL_MARKERS
-        ):
-            return True, res
         return False, ""
 
     if event.get("event") != "step_update" or not isinstance(event.get("step_update"), dict):
@@ -872,10 +862,7 @@ class AgyCompletionAdapter:
         )
 
         # Before the watcher starts: nothing after its start may skip the join below.
-        try:
-            env = self._environment(cwd)
-        except TypeError:
-            env = self._environment()
+        env = self._environment(cwd)
 
         def recovered() -> CompletionResult:
             # The relay stopped the tree after its result arrived: the exit status reflects
