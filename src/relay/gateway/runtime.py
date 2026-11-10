@@ -353,9 +353,21 @@ class GatewayRuntime:
                     return result
                 except CompletionInvalid as exc:
                     if request.output_schema is None or attempt:
+                        if first_invalid is not None:
+                            logger.warning(
+                                "completion invalid after repair retry first_reason=%s "
+                                "second_reason=%s",
+                                first_invalid.reason,
+                                exc.reason,
+                            )
                         raise
-                    # Class name only: the message and raw output can carry completion content.
-                    logger.debug("completion repair retry error=%s", type(exc).__name__)
+                    # Class name and fixed reason only: the message and raw output can carry
+                    # completion content.
+                    logger.debug(
+                        "completion repair retry error=%s reason=%s",
+                        type(exc).__name__,
+                        exc.reason,
+                    )
                     first_invalid = exc
                     current = replace(
                         request, prompt=render_repair(request.prompt, exc.raw, str(exc))

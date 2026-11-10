@@ -580,11 +580,17 @@ def parse_completion(
             envelope = json.loads(content)
         except (ValueError, RecursionError) as exc:
             raise CompletionInvalid(
-                "Codex returned no tool envelope", raw=content[:4000], usage=usage
+                "Codex returned no tool envelope",
+                raw=content[:4000],
+                usage=usage,
+                reason="not_json",
             ) from exc
         if not isinstance(envelope, dict):
             raise CompletionInvalid(
-                "Codex returned no tool envelope", raw=content[:4000], usage=usage
+                "Codex returned no tool envelope",
+                raw=content[:4000],
+                usage=usage,
+                reason="no_envelope",
             )
         envelope = cast("dict[str, Any]", envelope)
         calls = envelope.get("tool_calls")
@@ -596,7 +602,10 @@ def parse_completion(
                 fn = call.get("function")
                 if "function" in call and not isinstance(fn, dict):
                     raise CompletionInvalid(
-                        "Codex returned invalid tool arguments", raw=content[:4000], usage=usage
+                        "Codex returned invalid tool arguments",
+                        raw=content[:4000],
+                        usage=usage,
+                        reason="invalid_tool_arguments",
                     )
                 target: dict[str, Any] = (
                     cast("dict[str, Any]", fn) if isinstance(fn, dict) else call
@@ -606,7 +615,10 @@ def parse_completion(
                         target["arguments"] = json.loads(target["arguments"])
                     except (ValueError, RecursionError) as exc:
                         raise CompletionInvalid(
-                            "Codex returned invalid tool arguments", raw=content[:4000], usage=usage
+                            "Codex returned invalid tool arguments",
+                            raw=content[:4000],
+                            usage=usage,
+                            reason="invalid_tool_arguments",
                         ) from exc
         return CompletionResult(envelope=envelope, usage=usage, raw=json.dumps(envelope))
     try:

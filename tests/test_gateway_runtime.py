@@ -453,6 +453,37 @@ def test_repair_retry_logs_exception_class_only(
     monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
     monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
     asyncio.run(scenario())
-    assert "completion repair retry error=CompletionInvalid" in caplog.messages
+    assert "completion repair retry error=CompletionInvalid reason=unknown" in caplog.messages
     for secret in ("private-repair-detail", "private-raw", "private-prompt"):
+        assert secret not in caplog.text
+
+
+def test_repair_failure_logs_reasons_without_content(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        backend = Backend(
+            [
+                CompletionInvalid("private-one", raw="private-raw-1", reason="malformed_call"),
+                CompletionInvalid("private-two", raw="private-raw-2", reason="not_json"),
+            ]
+        )
+        runtime = GatewayRuntime(GatewayLimits(), {})
+        handle = runtime.start(backend, CompletionRequest("private-prompt", output_schema={}))
+        with pytest.raises(CompletionInvalid):
+            await handle.result
+        await handle.drain()
+        await runtime.shutdown()
+
+    caplog.set_level(logging.DEBUG, logger="uvicorn.error")
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    asyncio.run(scenario())
+    assert (
+        "completion repair retry error=CompletionInvalid reason=malformed_call" in caplog.messages
+    )
+    assert (
+        "completion invalid after repair retry first_reason=malformed_call second_reason=not_json"
+    ) in caplog.messages
+    for secret in ("private-one", "private-two", "private-raw", "private-prompt"):
         assert secret not in caplog.text

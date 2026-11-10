@@ -2003,6 +2003,63 @@ def test_agy_parse_completion_accepts_lowercase_success_status() -> None:
     )
 
 
+_MALFORMED_STEP = json.dumps(
+    {
+        "event": "step_update",
+        "step_update": {
+            "step_type": "error_message",
+            "message": "Your previous response contained an improperly formatted function call",
+        },
+    }
+)
+
+
+def _result_event(status: str, response: str, **extra: Any) -> str:
+    return json.dumps(
+        {"event": "result", "result": {"status": status, "response": response, **extra}}
+    )
+
+
+def test_agy_malformed_step_followed_by_successful_result_is_recovered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    envelope = {"content": "private-answer", "tool_calls": []}
+    stdout = "\n".join([_MALFORMED_STEP, _result_event("SUCCESS", json.dumps(envelope))])
+    with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+        result = parse_completion(ProcessResult(0, stdout), structured=True)
+    assert result.envelope == envelope
+    assert (
+        "agy malformed step: last_result_status=SUCCESS is_error=False payload=true "
+        "exit_code=0 events=2 decision=ignored_successful_result"
+    ) in caplog.messages
+    assert "private-answer" not in caplog.text
+    assert "improperly formatted" not in caplog.text
+
+
+def test_agy_malformed_step_without_successful_result_still_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+        with pytest.raises(CompletionInvalid) as no_result:
+            parse_completion(ProcessResult(0, _MALFORMED_STEP), structured=True)
+        failed = "\n".join([_MALFORMED_STEP, _result_event("ERROR", "private-failure")])
+        with pytest.raises(CompletionInvalid):
+            parse_completion(ProcessResult(0, failed), structured=True)
+        ok = _result_event("SUCCESS", json.dumps({"content": "x", "tool_calls": []}))
+        with pytest.raises(CompletionInvalid):
+            parse_completion(ProcessResult(1, "\n".join([_MALFORMED_STEP, ok])), structured=True)
+    assert no_result.value.reason == "malformed_call"
+    assert (
+        "agy malformed step: last_result_status=none is_error=none payload=false "
+        "exit_code=0 events=1 decision=failed"
+    ) in caplog.messages
+    assert (
+        "agy malformed step: last_result_status=ERROR is_error=False payload=true "
+        "exit_code=0 events=2 decision=failed"
+    ) in caplog.messages
+    assert "private-failure" not in caplog.text
+
+
 def test_agy_malformed_step_checks_only_non_empty_error_fields() -> None:
     check = agy_completion._is_malformed_step  # pyright: ignore[reportPrivateUsage]
 

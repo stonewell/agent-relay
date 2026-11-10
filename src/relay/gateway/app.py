@@ -445,7 +445,9 @@ def create_app(
             try:
                 content, calls = validate_envelope(raw, parsed, schema)
             except EnvelopeError as exc:
-                raise CompletionInvalid(str(exc), raw=raw, usage=result.usage) from exc
+                raise CompletionInvalid(
+                    str(exc), raw=raw, usage=result.usage, reason="schema_violation"
+                ) from exc
             return replace(
                 result, content=content, envelope={"content": content, "tool_calls": calls}
             )

@@ -408,7 +408,7 @@ def parse_completion(
     if payload is None:
         message = f"Claude CLI returned no completion object: exit code {proc.exit_code}"
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
-        raise CompletionInvalid(message, raw=proc.stdout[:4000])
+        raise CompletionInvalid(message, raw=proc.stdout[:4000], reason="no_envelope")
     usage = _usage(payload)
     observed = _observed(payload)
     length = payload.get("stop_reason") in ("max_tokens", "length")
@@ -426,6 +426,7 @@ def parse_completion(
                 "CLI returned no tool envelope",
                 raw=str(payload.get("result", ""))[:4000],
                 usage=usage,
+                reason="no_envelope",
             )
         envelope = cast("dict[str, Any]", candidate)
         return CompletionResult(
@@ -433,7 +434,7 @@ def parse_completion(
         )
     content = payload.get("result")
     if not isinstance(content, str):
-        raise CompletionInvalid("CLI returned no assistant text", usage=usage)
+        raise CompletionInvalid("CLI returned no assistant text", usage=usage, reason="no_text")
     try:
         content.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:

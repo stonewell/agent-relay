@@ -515,9 +515,11 @@ def parse_completion(
         try:
             event: Any = json.loads(line)
         except (ValueError, RecursionError) as exc:
-            raise CompletionInvalid("Cursor returned invalid event JSON") from exc
+            raise CompletionInvalid(
+                "Cursor returned invalid event JSON", reason="not_json"
+            ) from exc
         if not isinstance(event, dict):
-            raise CompletionInvalid("Cursor returned an invalid event")
+            raise CompletionInvalid("Cursor returned an invalid event", reason="no_envelope")
         event = cast("dict[str, Any]", event)
         if _tool_activity(event):
             raise CompletionError("Cursor reported model-side tools", code="backend_tool_use")
@@ -533,7 +535,7 @@ def parse_completion(
     usage = _usage(payload)
     content = payload.get("result")
     if not isinstance(content, str):
-        raise CompletionInvalid("Cursor returned no assistant text", usage=usage)
+        raise CompletionInvalid("Cursor returned no assistant text", usage=usage, reason="no_text")
     try:
         content.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:
@@ -551,11 +553,17 @@ def parse_completion(
             envelope: Any = json.loads(content)
         except (ValueError, RecursionError) as exc:
             raise CompletionInvalid(
-                "Cursor returned no tool envelope", raw=content[:4000], usage=usage
+                "Cursor returned no tool envelope",
+                raw=content[:4000],
+                usage=usage,
+                reason="not_json",
             ) from exc
         if not isinstance(envelope, dict):
             raise CompletionInvalid(
-                "Cursor returned no tool envelope", raw=content[:4000], usage=usage
+                "Cursor returned no tool envelope",
+                raw=content[:4000],
+                usage=usage,
+                reason="no_envelope",
             )
         return CompletionResult(
             envelope=cast("dict[str, Any]", envelope),

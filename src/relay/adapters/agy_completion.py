@@ -400,6 +400,11 @@ def _observed(payload: dict[str, Any], request_model: str = "default") -> Observ
 _SUCCESS_STATUSES = frozenset({"success", "ok", "completed", "done"})
 
 
+_LOGGED_STATUSES = frozenset(
+    {"SUCCESS", "ERROR", "CANCELED", "INTERRUPTED", "INVALID", "WAITING", "RUNNING"}
+)
+
+
 def _success_status(status: object) -> bool:
     """No status, or a success variant in any case; ERROR, INVALID, CANCELED etc. fail."""
     return status is None or (isinstance(status, str) and status.lower() in _SUCCESS_STATUSES)
@@ -881,6 +886,7 @@ class AgyCompletionAdapter:
                 return CompletionInvalid(
                     "Antigravity CLI completion failed: malformed function call",
                     raw=line[:4000],
+                    reason="malformed_call",
                 )
             return CompletionError("Completion cancelled", status=503, code="request_cancelled")
 
@@ -1064,6 +1070,9 @@ def parse_completion(
         raise CompletionError("Completion deadline expired", status=504, code="timeout")
     stdout_malformed = False
     malformed_line = ""
+    events = 0
+    malformed_at = -1
+    last_result_at = -1
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1076,17 +1085,44 @@ def parse_completion(
             parsed_dict = cast("dict[str, Any]", parsed)
             if _tool_activity(parsed_dict):
                 raise CompletionError("Antigravity reported model-side tools", code="backend_tool_use")
+            events += 1
+            if parsed_dict.get("event") == "result":
+                last_result_at = events
             if not stdout_malformed:
                 is_m, _ = _is_malformed_step(parsed_dict)
                 if is_m:
                     stdout_malformed = True
                     malformed_line = line
+                    malformed_at = events
     payload = agy_envelope(proc.stdout)
     # Only a success status (or none) is success; CANCELED/INTERRUPTED/WAITING/RUNNING also fail.
-    is_error = stdout_malformed or (
-        payload is not None
-        and (not _success_status(payload.get("status")) or payload.get("is_error") is True)
+    payload_failed = payload is not None and (
+        not _success_status(payload.get("status")) or payload.get("is_error") is True
     )
+    if stdout_malformed:
+        # agy may recover from a malformed call itself and end with a successful result.
+        recovered = (
+            proc.exit_code == 0
+            and payload is not None
+            and not payload_failed
+            and last_result_at > malformed_at
+        )
+        status = payload.get("status") if payload is not None else None
+        logger.debug(
+            "agy malformed step: last_result_status=%s is_error=%s payload=%s exit_code=%s "
+            "events=%d decision=%s",
+            (str(status).upper() if str(status).upper() in _LOGGED_STATUSES else "other")
+            if status is not None
+            else "none",
+            payload.get("is_error") is True if payload is not None else "none",
+            str(payload is not None).lower(),
+            proc.exit_code,
+            events,
+            "ignored_successful_result" if recovered else "failed",
+        )
+        if recovered:
+            stdout_malformed = False
+    is_error = stdout_malformed or payload_failed
     if proc.exit_code != 0 or is_error:
         err_msg = envelope_error(payload) if payload else None
         diagnostic = (
@@ -1137,12 +1173,13 @@ def parse_completion(
                 message,
                 raw=raw_content[:4000],
                 usage=_usage(payload) if payload else None,
+                reason="malformed_call" if malformed else "schema_violation",
             )
         raise CompletionError(message)
     if payload is None:
         message = f"Antigravity CLI returned no completion object: exit code {proc.exit_code}"
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
-        raise CompletionInvalid(message, raw=proc.stdout[:4000])
+        raise CompletionInvalid(message, raw=proc.stdout[:4000], reason="no_envelope")
     usage = _usage(payload)
     observed = _observed(payload, request_model=request_model)
     length = payload.get("stop_reason") in ("max_tokens", "length")
@@ -1161,6 +1198,7 @@ def parse_completion(
                 "CLI returned no tool envelope",
                 raw=str(payload.get("response") or payload.get("result", ""))[:4000],
                 usage=usage,
+                reason="no_envelope",
             )
         envelope = cast("dict[str, Any]", candidate)
         return CompletionResult(
@@ -1170,7 +1208,7 @@ def parse_completion(
     if content is None:
         content = payload.get("result")
     if not isinstance(content, str):
-        raise CompletionInvalid("CLI returned no assistant text", usage=usage)
+        raise CompletionInvalid("CLI returned no assistant text", usage=usage, reason="no_text")
     try:
         content.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:

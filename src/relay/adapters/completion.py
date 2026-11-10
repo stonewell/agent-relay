@@ -214,11 +214,18 @@ def stalled_error(backend: str, limit: str, silent_s: float, prompt_bytes: int) 
 
 class CompletionInvalid(CompletionError):
     def __init__(
-        self, message: str, *, raw: str = "", usage: CompletionUsage | None = None
+        self,
+        message: str,
+        *,
+        raw: str = "",
+        usage: CompletionUsage | None = None,
+        reason: str = "unknown",
     ) -> None:
         super().__init__(message, code="invalid_completion")
         self.raw = raw
         self.usage = usage
+        # Fixed category only (never content): safe to log.
+        self.reason = reason
 
 
 class CompletionTerminationError(CompletionError):
