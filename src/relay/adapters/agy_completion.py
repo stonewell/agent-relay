@@ -12,6 +12,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import threading
@@ -769,6 +770,8 @@ class AgyCompletionAdapter:
         # by run_process (and lost only when it raises ProcessCancelled).
         result: list[tuple[float, str]] = []
         malformed: list[tuple[float, str, str]] = []
+        # (seconds since start, event index, origin kind, result already arrived) at first marker.
+        malformed_info: list[tuple[float, int, str, bool]] = []
         # First failed result event line: classifies the error if agy then hangs silently.
         error_result: list[str] = []
         # Why the relay stopped the tree, set once by the watcher: "cancelled", "result",
@@ -784,7 +787,27 @@ class AgyCompletionAdapter:
 
         def note_malformed(err: str, line: str) -> None:
             if not malformed:
-                malformed.append((time.monotonic(), err, line))
+                at = time.monotonic()
+                malformed.append((at, err, line))
+                try:
+                    parsed_line: Any = json.loads(line)
+                except (ValueError, RecursionError):
+                    parsed_line = None
+                kind = "step_update"
+                if (
+                    isinstance(parsed_line, dict)
+                    and cast("dict[str, Any]", parsed_line).get("event") == "result"
+                ):
+                    kind = "result"
+                malformed_info.append((at - started, activity["events"], kind, bool(result)))
+                logger.debug(
+                    "agy malformed marker first seen: at_s=%.1f event_index=%d origin=%s "
+                    "result_already_arrived=%s",
+                    at - started,
+                    activity["events"],
+                    kind,
+                    str(bool(result)).lower(),
+                )
 
         def kill(reason: str) -> None:
             if kill_reason[0] is None:
@@ -1024,6 +1047,19 @@ class AgyCompletionAdapter:
                 now - activity["at"],
                 kill_reason[0] or "-",
             )
+            if malformed_info:
+                m_at, m_index, _m_kind, m_result = malformed_info[0]
+                logger.debug(
+                    "agy malformed summary: malformed_at_s=%.1f malformed_event_index=%d "
+                    "total_events=%d total_duration_s=%.1f result_before_marker=%s "
+                    "fail_fast_fired=%s",
+                    m_at,
+                    m_index,
+                    activity["events"],
+                    now - started,
+                    str(m_result).lower(),
+                    str(kill_reason[0] == "malformed").lower(),
+                )
 
 
 def _parse_candidate(raw: str) -> dict[str, Any] | None:
@@ -1157,7 +1193,12 @@ def parse_completion(
         message = f"Antigravity CLI completion failed: exit code {proc.exit_code}{err_part}"
         # Raw stderr is a private diagnostic: log it redacted, never return it to the client.
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
-        if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
+        # Only stderr and the error text: payload JSON may hold numbers such as token counts.
+        rate_text = (proc.stderr + " " + (err_msg or "")).lower()
+        if any(
+            re.search(r"\b429\b", rate_text) if word == "429" else word in rate_text
+            for word in RATE_LIMIT_MARKERS
+        ):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         if structured and (
             (payload is not None and payload.get("status") == "INVALID") or malformed

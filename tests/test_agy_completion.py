@@ -1980,6 +1980,56 @@ def test_agy_malformed_function_call_fail_fast_kills_hung_process(
     assert "agy malformed function call reported; failing fast after 0.2s events=1" in caplog.text
 
 
+def test_agy_malformed_timing_debug_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(agy_completion, "MALFORMED_FAIL_FAST_GRACE_S", 0.05)
+    monkeypatch.setattr(agy_completion, "resolve_command", fake_agy)
+    line = json.dumps(
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "error_message", "message": "Malformed function call"},
+        }
+    )
+    monkeypatch.setattr(
+        agy_completion, "run_process", fake_killed_run([line], returns=ProcessResult(1, line))
+    )
+    with (
+        caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+        pytest.raises(CompletionInvalid),
+    ):
+        AgyCompletionAdapter(Agent(cmd="agy")).complete(
+            CompletionRequest("hi", "default", output_schema={"type": "object"}),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=30.0,
+            max_output_bytes=10000,
+        )
+    assert "event_index=1 origin=step_update result_already_arrived=false" in caplog.text
+    assert "malformed_event_index=1 total_events=1" in caplog.text
+    assert "result_before_marker=false fail_fast_fired=true" in caplog.text
+
+
+def test_agy_malformed_payload_number_429_is_not_rate_limit() -> None:
+    payload = {
+        "status": "ERROR",
+        "error": "Your previous response contained an improperly formatted function call",
+        "usage": {"input_tokens": 88429, "output_tokens": 12},
+    }
+    with pytest.raises(CompletionInvalid) as exc_info:
+        parse_completion(ProcessResult(0, json.dumps(payload)), structured=True)
+    assert exc_info.value.reason == "malformed_call"
+    assert exc_info.value.status != 429
+
+
+def test_agy_genuine_quota_text_is_rate_limit() -> None:
+    proc = ProcessResult(1, "", stderr="Individual quota reached. Resets in 2h")
+    with pytest.raises(CompletionError) as exc_info:
+        parse_completion(proc, structured=True)
+    assert exc_info.value.status == 429
+    assert exc_info.value.code == "rate_limit_exceeded"
+
+
 @pytest.mark.parametrize("status", ["SUCCESS", "success", "OK", "Completed", "done", None])
 def test_agy_stream_sink_accepts_success_status_variants(status: str | None) -> None:
     results: list[dict[str, Any]] = []
