@@ -328,6 +328,24 @@ def test_error_mapping(proc: ProcessResult, status: int, code: str) -> None:
     assert (caught.value.status, caught.value.code) == (status, code)
 
 
+def test_event_number_429_is_not_rate_limit() -> None:
+    events = [
+        {"type": "turn.completed", "usage": {"input_tokens": 88429, "output_tokens": 12}},
+        {"type": "turn.failed", "error": {"message": "boom"}},
+    ]
+    proc = ProcessResult(1, "\n".join(json.dumps(event) for event in events))
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(proc, structured=False)
+    assert (caught.value.status, caught.value.code) == (502, "completion_failed")
+
+
+def test_failed_event_rate_limit_text_is_rate_limit() -> None:
+    event = {"type": "turn.failed", "error": {"message": "rate limit reached"}}
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(ProcessResult(1, json.dumps(event)), structured=False)
+    assert (caught.value.status, caught.value.code) == (429, "rate_limit_exceeded")
+
+
 def test_unconfirmed_process_drain_is_quarantined(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

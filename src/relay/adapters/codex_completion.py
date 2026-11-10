@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from relay.adapters.claude_completion import RATE_LIMIT_MARKERS, discard_output, launch_failed
+from relay.adapters.claude_completion import discard_output, launch_failed, rate_limited
 from relay.adapters.completion import (
     CompletionChunkSink,
     CompletionError,
@@ -511,7 +511,7 @@ def parse_completion(
             redact(proc.stderr[-2000:], secrets=secrets),
             redact(reasons[-2000:], secrets=secrets),
         )
-        if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
+        if rate_limited(proc.stderr + " " + reasons):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)
     if any(

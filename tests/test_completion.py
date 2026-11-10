@@ -138,6 +138,25 @@ def test_process_error_categories_do_not_expose_stderr(
         assert "secret" in caplog.text
 
 
+def test_payload_number_429_is_not_rate_limit() -> None:
+    usage = {"input_tokens": 88429, "output_tokens": 12}
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(response(is_error=True, result="boom", usage=usage), structured=False)
+    assert (caught.value.status, caught.value.code) == (502, "completion_failed")
+
+
+def test_error_result_rate_limit_text_is_rate_limit() -> None:
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(response(is_error=True, result="rate limit reached"), structured=False)
+    assert (caught.value.status, caught.value.code) == (429, "rate_limit_exceeded")
+
+
+def test_rate_limited_helper() -> None:
+    assert not claude_completion.rate_limited("88429 tokens")
+    assert claude_completion.rate_limited("HTTP 429")
+    assert claude_completion.rate_limited("Quota exceeded")
+
+
 def test_missing_completion_object_logs_stderr_but_returns_fixed_message(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

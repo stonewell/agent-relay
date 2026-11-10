@@ -12,7 +12,6 @@ import contextvars
 import json
 import logging
 import os
-import re
 import shlex
 import sys
 import threading
@@ -23,9 +22,9 @@ from typing import Any, cast
 
 from relay.adapters.antigravity import agy_envelope, envelope_error
 from relay.adapters.claude_completion import (
-    RATE_LIMIT_MARKERS,
     command_line_too_long,
     launch_failed,
+    rate_limited,
 )
 from relay.adapters.completion import (
     REASONING_EFFORT_TIERS,
@@ -1195,10 +1194,7 @@ def parse_completion(
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
         # Only stderr and the error text: payload JSON may hold numbers such as token counts.
         rate_text = (proc.stderr + " " + (err_msg or "")).lower()
-        if any(
-            re.search(r"\b429\b", rate_text) if word == "429" else word in rate_text
-            for word in RATE_LIMIT_MARKERS
-        ):
+        if rate_limited(rate_text):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         if structured and (
             (payload is not None and payload.get("status") == "INVALID") or malformed

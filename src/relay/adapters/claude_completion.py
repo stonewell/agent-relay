@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -184,6 +185,15 @@ RATE_LIMIT_MARKERS: tuple[str, ...] = (
     "too many requests",
     "quota",
 )
+
+
+def rate_limited(text: str) -> bool:
+    """Whether diagnostic text signals rate limiting; "429" must be a whole token."""
+    text = text.lower()
+    return any(
+        re.search(r"\b429\b", text) if word == "429" else word in text
+        for word in RATE_LIMIT_MARKERS
+    )
 
 
 class ClaudeCompletionAdapter:
@@ -402,7 +412,15 @@ def parse_completion(
             )
         message = f"Claude CLI completion failed: exit code {proc.exit_code}"
         logger.warning("%s; stderr: %s", message, redact(proc.stderr[-2000:], secrets=secrets))
-        if any(word in diagnostic for word in RATE_LIMIT_MARKERS):
+        # Only stderr and the error text: usage numbers in the payload may contain "429".
+        error_text = ""
+        if payload is not None:
+            error_text = " ".join(
+                value
+                for value in (payload.get("result"), payload.get("error"))
+                if isinstance(value, str)
+            )
+        if rate_limited(proc.stderr + " " + error_text):
             raise CompletionError(message, status=429, code="rate_limit_exceeded")
         raise CompletionError(message)
     if payload is None:
