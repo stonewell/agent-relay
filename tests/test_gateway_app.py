@@ -1,0 +1,1151 @@
+from __future__ import annotations
+
+import asyncio
+import http.client
+import json
+import logging
+import socket
+import threading
+import time
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+import uvicorn
+from fastapi.testclient import TestClient
+from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
+from starlette.types import Message, Receive, Scope, Send
+from uvicorn.config import LOG_LEVELS
+
+from relay.adapters.completion import (
+    CompletionError,
+    CompletionRequest,
+    CompletionResult,
+    CompletionUsage,
+    ObservedModel,
+    current_chunk_sink,
+    stream_completion_chunks,
+)
+from relay.gateway import app as gateway_app
+from relay.gateway.app import GatewayLimits, RequestSummaryMiddleware, create_app
+from relay.gateway.logctx import ContextFilter
+from relay.gateway.models import ModelCatalog
+from relay.gateway.runtime import GatewayRuntime
+from test_gateway_models import FakeBackend, configuration
+
+
+@pytest.fixture
+def client_backend() -> Iterator[tuple[TestClient, FakeBackend]]:
+    backend = FakeBackend()
+    app = create_app(configuration(), token="test-token", adapters={"fake": backend})
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        yield client, backend
+
+
+@pytest.mark.parametrize("level", ["critical", "error", "warning", "info", "debug", "trace"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_request_response_summaries(
+    client_backend: tuple[TestClient, FakeBackend],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    level: str,
+    stream: bool,
+) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(content="private-answer")]
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with caplog.at_level(LOG_LEVELS[level], logger="uvicorn.error"):
+        response = client.post(
+            "/v1/chat/completions?secret=private-query",
+            json={
+                "model": "fake",
+                "messages": [{"role": "user", "content": "private-prompt"}],
+                "stream": stream,
+            },
+        )
+    assert response.status_code == 200
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    if level not in {"debug", "trace"}:
+        assert messages == []
+        return
+    assert len(messages) == 3
+    assert messages[0] == "request method='POST' path='/v1/chat/completions'"
+    assert messages[1].startswith(
+        f"completion request kind={'stream' if stream else 'json'}+plain model=fake "
+        "resolved=fake/default effort=None messages=1 tools=0 tool_choice=auto "
+        "response_format=none prompt_bytes="
+    )
+    assert messages[2].startswith(
+        "response method='POST' path='/v1/chat/completions' status=200 "
+        f"bytes={len(response.content)} complete=True duration_ms="
+    )
+    assert float(messages[2].split("duration_ms=")[1].split()[0]) >= 0
+    assert all(
+        secret not in "\n".join(messages)
+        for secret in ("private-prompt", "private-answer", "private-query", "test-token")
+    )
+
+
+@pytest.mark.parametrize("status", [401, 400, 502])
+def test_request_response_summaries_include_errors(
+    client_backend: tuple[TestClient, FakeBackend],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(content="\ud800")]
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+        response = client.post(
+            "/v1/chat/completions",
+            content="{"
+            if status == 400
+            else json.dumps({"model": "fake", "messages": [{"role": "user", "content": "hello"}]}),
+            headers={"Authorization": "wrong" if status == 401 else "Bearer test-token"},
+        )
+    assert response.status_code == status
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    # Only a dispatched completion adds its request-hint line.
+    assert len(messages) == (3 if status == 502 else 2)
+    assert f"status={status} bytes={len(response.content)} complete=True" in messages[-1]
+    code = {401: "invalid_api_key", 400: "invalid_request_error", 502: "completion_failed"}
+    assert messages[-1].endswith(f" error_code={code[status]}")
+    assert "kind=json+plain" in messages[-1] if status == 502 else "kind=completion" in messages[-1]
+
+
+def test_response_summary_includes_unexpected_error_response(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(configuration(), token="test-token", adapters={"fake": FakeBackend()})
+
+    @app.get("/broken")
+    async def broken() -> None:
+        raise RuntimeError("private-failure")
+
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with (
+        TestClient(app, base_url="http://localhost", raise_server_exceptions=False) as client,
+        caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+    ):
+        response = client.get("/broken")
+    assert response.status_code == 500
+    assert response.json()["error"]["message"] == "internal gateway error"
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert len(messages) == 2
+    assert f"status=500 bytes={len(response.content)} complete=True" in messages[1]
+    assert "private-failure" not in "\n".join(messages)
+
+
+SENTINEL = "SENTINEL-c0ffee"
+
+
+class SlowBackend(FakeBackend):
+    delay = 0.3
+
+    def complete(
+        self,
+        request: CompletionRequest,
+        *,
+        cwd: Path,
+        cancel: threading.Event,
+        timeout_s: float,
+        max_output_bytes: int,
+    ) -> CompletionResult:
+        time.sleep(self.delay)
+        return super().complete(
+            request, cwd=cwd, cancel=cancel, timeout_s=timeout_s, max_output_bytes=max_output_bytes
+        )
+
+
+def test_completion_log_hints_share_request_id_and_never_log_content(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    monkeypatch.setattr(gateway_app, "STREAM_WAIT_LOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    backend = SlowBackend()
+    call = {"name": "edit", "arguments": {"x": SENTINEL}}
+    backend.results = [
+        CompletionResult(
+            envelope={"content": None, "tool_calls": [call]}, usage=CompletionUsage(7, 3)
+        ),
+        CompletionResult(content=f"answer {SENTINEL}", usage=CompletionUsage(2, 1)),
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": f"tool description {SENTINEL}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": "string", "description": SENTINEL}},
+                    "required": ["x"],
+                },
+            },
+        }
+    ]
+    messages = [{"role": "user", "content": f"prompt {SENTINEL}"}]
+    app = create_app(configuration(), token="test-token", adapters={"fake": backend})
+    context = ContextFilter()
+    caplog.handler.addFilter(context)
+    try:
+        with (
+            TestClient(
+                app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+            ) as client,
+            caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+        ):
+            streamed = client.post(
+                "/v1/chat/completions",
+                json={"model": "fake", "stream": True, "messages": messages, "tools": tools},
+            )
+            plain = client.post(
+                "/v1/chat/completions", json={"model": "fake", "messages": messages}
+            )
+    finally:
+        caplog.handler.removeFilter(context)
+    assert streamed.status_code == 200 and plain.status_code == 200
+    assert SENTINEL in streamed.text and SENTINEL in plain.text
+    records = [record for record in caplog.records if record.name == "uvicorn.error"]
+    responses = [record for record in records if record.getMessage().startswith("response ")]
+    assert len(responses) == 2
+    by_id: dict[str, list[str]] = {}
+    for response in responses:
+        request_id = response.getMessage().split(" id=")[1].split()[0]
+        assert request_id.startswith("chatcmpl-")
+        assert response.request_id == request_id  # type: ignore[attr-defined]
+        by_id[request_id] = [
+            record.getMessage()
+            for record in records
+            if record.request_id == request_id  # type: ignore[attr-defined]
+        ]
+    (stream_lines, plain_lines) = by_id.values()
+
+    assert stream_lines[0].startswith(
+        "completion request kind=stream+tools model=fake resolved=fake/default effort=None "
+        "messages=1 tools=1 tool_choice=auto response_format=none prompt_bytes="
+    )
+    waiting = [line for line in stream_lines if line.startswith("stream waiting heartbeats=")]
+    assert waiting and all(line.endswith(" first_content=false") for line in waiting)
+    stream_response = stream_lines[-1]
+    for hint in (
+        "kind=stream+tools",
+        "finish_reason=tool_calls",
+        "tool_calls=1",
+        "prompt_tokens=7",
+        "completion_tokens=3",
+        "buffered=True",
+    ):
+        assert f" {hint}" in stream_response
+    assert int(stream_response.split(" heartbeats=")[1].split()[0]) >= 1
+    assert int(stream_response.split(" first_content_ms=")[1].split()[0]) >= 0
+
+    assert plain_lines[0].startswith(
+        "completion request kind=json+plain model=fake resolved=fake/default effort=None "
+        "messages=1 tools=0 tool_choice=auto response_format=none prompt_bytes="
+    )
+    assert not any(line.startswith("stream waiting") for line in plain_lines)
+    for hint in ("kind=json+plain", "finish_reason=stop", "tool_calls=0", "prompt_tokens=2"):
+        assert f" {hint}" in plain_lines[-1]
+    assert " heartbeats=" not in plain_lines[-1]
+    # Metadata only: prompt, completion and tool schema text never reach the log.
+    assert SENTINEL not in caplog.text
+    assert all(SENTINEL not in record.getMessage() for record in caplog.records)
+
+
+def test_stream_summary_waits_for_delivery_and_reports_interruption(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delivered: list[Message] = []
+
+    async def streaming_app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
+        assert len(delivered) == 2
+        assert not any(record.getMessage().startswith("response ") for record in caplog.records)
+        raise asyncio.CancelledError
+
+    async def receive() -> Message:
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        delivered.append(message)
+
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    with (
+        caplog.at_level(logging.DEBUG, logger="uvicorn.error"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        asyncio.run(
+            RequestSummaryMiddleware(streaming_app)(
+                {"type": "http", "method": "POST", "path": "/v1/chat/completions"}, receive, send
+            )
+        )
+    assert "status=200 bytes=5 complete=False" in caplog.records[-1].getMessage()
+
+
+def test_auth_every_v1_path_and_health(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    for path in ("/v1/models", "/v1/models/fake/opus", "/v1/unknown"):
+        assert client.get(path, headers={"Authorization": "wrong"}).status_code == 401
+    assert client.get("/healthz", headers={"Authorization": "wrong"}).json() == {"status": "ok"}
+    assert client.get("/v1/unknown").json()["error"]["param"] is None
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/v1/unknown").json()["error"]["message"] == "route not found"
+    wrong_method = client.get("/v1/chat/completions")
+    assert wrong_method.status_code == 405
+    assert wrong_method.json()["error"]["message"] == "method not allowed"
+    assert wrong_method.headers["Allow"] == "POST"
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_invalid_unicode_plain_output_is_502_before_headers(
+    client_backend: tuple[TestClient, FakeBackend], stream: bool
+) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(content="\ud800")]
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "completion contains invalid Unicode"
+
+
+def test_host_origin_and_slash_retrieval(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    assert client.get("/v1/models/fake/opus").json()["id"] == "fake/opus"
+    assert client.get("/v1/models", headers={"Host": "attacker.example"}).status_code == 400
+    assert (
+        client.get("/v1/models", headers={"Origin": "https://attacker.example"}).status_code == 403
+    )
+    assert client.get("/v1/models", headers={"Origin": "http://localhost:3000"}).status_code == 200
+    assert backend.calls == []
+
+
+def test_models_endpoint_exposes_family_and_routes_to_selected_variant() -> None:
+    backend = FakeBackend()
+    backend.limits = {"model-high": ObservedModel("model-high", 100000, 10000)}
+    app = create_app(
+        configuration(), token="test-token", adapters={"fake": backend}, models=["model-high"]
+    )
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.get("/v1/models")
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["data"]] == ["fake/model"]
+        assert "model-high" not in response.text
+        for model in ("fake/model", "fake/model-high"):
+            completion = client.post(
+                "/v1/chat/completions",
+                json={"model": model, "messages": [{"role": "user", "content": "hello"}]},
+            )
+            assert completion.status_code == 200
+            assert backend.calls[-1].model == "model-high"
+    assert backend.probes == ["model-high"]
+
+
+def test_plain_response_and_sse_identical(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    body = {"model": "fake/opus", "messages": [{"role": "user", "content": "hello"}]}
+    response = client.post("/v1/chat/completions", json={**body, "temperature": 0.2})
+    assert response.status_code == 200
+    assert response.headers["X-Relay-Ignored-Parameters"] == "temperature"
+    assert response.headers["X-Relay-Resolved-Model"] == "fake/opus"
+    assert response.json()["usage"] is None
+    streamed = client.post("/v1/chat/completions", json={**body, "stream": True})
+    frames = [line[6:] for line in streamed.text.splitlines() if line.startswith("data: ")]
+    chunks = [json.loads(frame) for frame in frames[:-1]]
+    content = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert content == response.json()["choices"][0]["message"]["content"]
+    assert frames[-1] == "[DONE]"
+    assert len(backend.calls) == 2
+    assert all(invocation.effort is None for invocation in backend.calls)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["fake/opus", "fake", "relay/auto"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_reasoning_effort_keeps_model_identity(
+    client_backend: tuple[TestClient, FakeBackend], stream: bool, model: str, effort: str
+) -> None:
+    client, backend = client_backend
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model,
+            "reasoning_effort": effort,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    invocation = backend.calls[0]
+    assert invocation.model == ("opus" if model == "fake/opus" else "default")
+    assert invocation.effort == effort
+    header = json.loads(invocation.prompt.splitlines()[1])
+    assert header["model"] == invocation.model
+    assert header["effort"] == effort
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert all(chunk["model"] == model for chunk in chunks)
+    else:
+        assert response.json()["model"] == model
+
+
+@pytest.mark.parametrize("changes", [{}, {"reasoning_effort": None}, {"reasoning_effort": "low"}])
+def test_reasoning_effort_overrides_catalog_default(changes: dict[str, object]) -> None:
+    backend = FakeBackend()
+    config = configuration()
+    catalog = ModelCatalog(config, {"fake": backend})
+    catalog.models["fake/opus"] = replace(catalog.models["fake/opus"], effort="high")
+    app = create_app(config, token="test-token", adapters={"fake": backend}, catalog=catalog)
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "fake/opus",
+                "messages": [{"role": "user", "content": "hello"}],
+                **changes,
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert backend.calls[0].effort == (changes.get("reasoning_effort") or "high")
+    assert catalog.models["fake/opus"].effort == "high"
+
+
+def test_validation_happens_before_dispatch(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    body = {"model": "fake", "messages": [{"role": "user", "content": "hello"}]}
+    response = client.post("/v1/chat/completions", json={**body, "n": 2})
+    assert response.status_code == 400 and response.json()["error"]["param"] == "n"
+    response = client.post("/v1/chat/completions", json={**body, "reasoning_effort": "unknown"})
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "reasoning_effort"
+    assert client.post("/v1/chat/completions", content="{").status_code == 400
+    assert backend.calls == []
+
+
+def test_unknown_request_fields_are_ignored(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    body = {
+        "model": "fake",
+        "messages": [{"role": "user", "content": "hello"}],
+        "metadata": {"k": "v"},
+        "stop": ["x"],
+        "user": "u1",
+    }
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200
+    assert len(backend.calls) == 1
+
+
+def test_pattern_tool_schema_is_accepted(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    backend.results = [CompletionResult(envelope={"content": "ok", "tool_calls": []})]
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"x": {"type": "string", "pattern": "^a+$"}},
+                            "required": ["x"],
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(backend.calls) == 1
+
+
+def test_envelope_repair_usage_aggregation(client_backend: tuple[TestClient, FakeBackend]) -> None:
+    client, backend = client_backend
+    backend.results = [
+        CompletionResult(
+            envelope={"content": None, "tool_calls": [{"name": "bad", "arguments": {}}]},
+            usage=CompletionUsage(10, 2),
+        ),
+        CompletionResult(
+            envelope={"content": None, "tool_calls": [{"name": "edit", "arguments": {"x": "ok"}}]},
+            usage=CompletionUsage(20, 3),
+        ),
+    ]
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "edit"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"x": {"type": "string"}},
+                            "required": ["x"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "required",
+        },
+    )
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"x":"ok"}'
+    assert response.json()["usage"]["total_tokens"] == 35
+    assert len(backend.calls) == 2
+    assert backend.calls[0].model == backend.calls[1].model
+    assert backend.calls[0].effort == backend.calls[1].effort == "high"
+
+
+def test_bounded_chunked_body() -> None:
+    backend = FakeBackend()
+    app = create_app(
+        configuration(),
+        token="test-token",
+        adapters={"fake": backend},
+        limits=GatewayLimits(max_request_bytes=32),
+    )
+    with TestClient(app, base_url="http://localhost") as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=iter([b"a" * 20, b"b" * 20]),
+            headers={"Authorization": "Bearer test-token"},
+        )
+    assert response.status_code == 413
+    assert backend.calls == []
+
+
+class WaitingBackend(FakeBackend):
+    def __init__(self, *, failure: bool = False) -> None:
+        super().__init__()
+        self.started, self.finished = threading.Event(), threading.Event()
+        self.release = threading.Event()
+        self.failure = failure
+        self.scratch: Path | None = None
+
+    def complete(
+        self,
+        request: CompletionRequest,
+        *,
+        cwd: Path,
+        cancel: threading.Event,
+        timeout_s: float,
+        max_output_bytes: int,
+    ) -> CompletionResult:
+        self.started.set()
+        self.scratch = cwd
+        try:
+            while not self.release.wait(0.01):
+                if cancel.is_set():
+                    raise CompletionError("cancelled", status=503)
+            if self.failure:
+                raise CompletionError("provider failed")
+            return super().complete(
+                request,
+                cwd=cwd,
+                cancel=cancel,
+                timeout_s=timeout_s,
+                max_output_bytes=max_output_bytes,
+            )
+        finally:
+            self.finished.set()
+
+
+@contextmanager
+def local_server(
+    backend: FakeBackend, *, limits: GatewayLimits | None = None
+) -> Generator[tuple[int, GatewayRuntime]]:
+    limits = limits or GatewayLimits(timeout_s=3)
+    runtime = GatewayRuntime(limits, {"fake": 1})
+    app = create_app(
+        configuration(),
+        token="test-token",
+        adapters={"fake": backend},
+        limits=limits,
+        runtime=runtime,
+    )
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(app, log_level="critical", access_log=False))
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while not server.started and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started
+        try:
+            yield port, runtime
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def raw_completion(port: int, *, stream: bool = False) -> socket.socket:
+    connection = socket.create_connection(("127.0.0.1", port), timeout=3)
+    body = json.dumps(
+        {"model": "fake", "stream": stream, "messages": [{"role": "user", "content": "hello"}]}
+    ).encode()
+    connection.sendall(
+        (
+            f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Authorization: Bearer test-token\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode()
+        + body
+    )
+    return connection
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_real_http_disconnect_drains(stream: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    backend = WaitingBackend()
+    with local_server(backend) as (port, runtime):
+        connection = raw_completion(port, stream=stream)
+        assert backend.started.wait(2)
+        if stream:
+            assert b"200 OK" in connection.recv(4096)
+        connection.close()
+        assert backend.finished.wait(2)
+        deadline = time.monotonic() + 2
+        while runtime.active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert runtime.active == 0
+        assert backend.scratch is not None and not backend.scratch.exists()
+
+
+def test_real_http_post_keepalive_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    backend = WaitingBackend(failure=True)
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "x"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        heartbeat = response.readline()
+        assert heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+        backend.release.set()
+        remainder = response.read()
+        assert b'"error"' in remainder and b"[DONE]" not in remainder
+        assert b'"finish_reason"' not in remainder
+        connection.close()
+
+
+def test_real_http_heartbeat_prevents_client_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    backend = WaitingBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "x"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        heartbeat = response.readline()
+        assert heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+        backend.release.set()
+        remainder = response.read()
+        assert b"data: [DONE]\n\n" in remainder
+        connection.close()
+
+
+def test_real_http_stream_unexpected_backend_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+
+    class ExplodingBackend(WaitingBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            self.started.set()
+            self.scratch = cwd
+            try:
+                while not self.release.wait(0.01):
+                    if cancel.is_set():
+                        raise CompletionError("cancelled", status=503)
+                raise RuntimeError("private-backend-detail")
+            finally:
+                self.finished.set()
+
+    backend = ExplodingBackend()
+    with local_server(backend) as (port, _runtime):
+        # uvicorn's logging config sets the parent "uvicorn" logger to propagate=False;
+        # re-enable it so caplog sees the record emitted by the "uvicorn.error" child.
+        monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+        with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "model": "fake",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "x"}],
+                    }
+                ),
+                headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            heartbeat = response.readline()
+            assert (
+                heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+            )
+            backend.release.set()
+            remainder = response.read()
+            connection.close()
+    assert b'"internal_error"' in remainder
+    assert b'"server_error"' in remainder
+    assert b"[DONE]" not in remainder
+    assert b"private-backend-detail" not in remainder
+    assert b'"finish_reason"' not in remainder
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert "completion stream failed: RuntimeError" in messages
+
+
+def test_real_http_client_abort_is_attributed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(gateway_app, "KEEPALIVE_INTERVAL", 0.02)
+    backend = WaitingBackend()
+    with local_server(backend) as (port, _runtime):
+        # uvicorn's logging config sets the parent "uvicorn" logger to propagate=False;
+        # re-enable it so caplog sees the record emitted by the "uvicorn.error" child.
+        monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+        with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "model": "fake",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "x"}],
+                    }
+                ),
+                headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            heartbeat = response.readline()
+            assert (
+                heartbeat.startswith(b"data: ") and b'"object":"chat.completion.chunk"' in heartbeat
+            )
+            connection.close()
+            assert backend.finished.wait(2)
+    messages = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert any(
+        message.startswith("completion stream cancelled by client heartbeats=1 elapsed_s=")
+        and message.endswith(" first_content=false")
+        for message in messages
+    )
+
+
+def test_real_http_chunked_body_limit() -> None:
+    backend = FakeBackend()
+    with local_server(backend, limits=GatewayLimits(max_request_bytes=32)) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=iter([b"a" * 20, b"b" * 20]),
+            encode_chunked=True,
+            headers={"Authorization": "Bearer test-token"},
+        )
+        response = connection.getresponse()
+        assert response.status == 413
+        response.read()
+        connection.close()
+        assert backend.calls == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_slow_http_consumer_retains_admission_until_deadline(stream: bool) -> None:
+    backend = FakeBackend()
+    backend.results = [CompletionResult(content="x" * (7 * 1024 * 1024))]
+    with local_server(backend, limits=GatewayLimits(concurrency=1, timeout_s=0.8)) as (
+        port,
+        runtime,
+    ):
+        connection = raw_completion(port, stream=stream)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        deadline = time.monotonic() + 0.5
+        while not backend.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert backend.calls
+        time.sleep(0.05)
+        assert runtime.active == 1
+        other = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        other.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps({"model": "fake", "messages": [{"role": "user", "content": "x"}]}),
+            headers={"Authorization": "Bearer test-token"},
+        )
+        response = other.getresponse()
+        assert response.status == 429
+        assert response.getheader("Retry-After") == "1"
+        response.read()
+        other.close()
+        deadline = time.monotonic() + 3
+        while runtime.active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        connection.close()
+        assert runtime.active == 0
+
+
+def test_pinned_openai_sdk_real_http_tools_roundtrip_and_stream() -> None:
+    backend = FakeBackend()
+    backend.results = [
+        CompletionResult(
+            envelope={
+                "content": None,
+                "tool_calls": [{"name": "edit", "arguments": {"text": "hello\n雪"}}],
+            }
+        ),
+        CompletionResult(envelope={"content": "finished", "tool_calls": []}),
+        CompletionResult(content="stream\n雪", usage=CompletionUsage(3, 4)),
+    ]
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            },
+        }
+    ]
+    messages: list[ChatCompletionMessageParam] = [{"role": "user", "content": "edit"}]
+    with (
+        local_server(backend) as (port, _runtime),
+        OpenAI(api_key="test-token", max_retries=0, base_url=f"http://127.0.0.1:{port}/v1") as sdk,
+    ):
+        first = sdk.chat.completions.create(model="fake/opus", messages=messages, tools=tools)
+        calls = first.choices[0].message.tool_calls
+        assert calls and calls[0].type == "function"
+        call = calls[0]
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": call.function.arguments,
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call.id, "content": "edited"},
+            ]
+        )
+        second = sdk.chat.completions.create(model="fake/opus", messages=messages, tools=tools)
+        assert second.choices[0].message.content == "finished"
+        assert call.id in backend.calls[1].prompt
+        chunks = list(
+            sdk.chat.completions.create(
+                model="fake/opus",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+        )
+        assert (
+            "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+            == "stream\n雪"
+        )
+        assert chunks[-1].choices == [] and chunks[-1].usage is not None
+        assert chunks[-1].usage.total_tokens == 7
+
+
+def test_real_http_live_streaming_chunks() -> None:
+    first_chunk_received = threading.Event()
+
+    class LiveStreamingBackend(FakeBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            self.calls.append(request)
+            sink = current_chunk_sink()
+            assert sink is not None
+            sink("Hel")
+            assert first_chunk_received.wait(3)
+            sink("lo")
+            return CompletionResult(content="Hello")
+
+    backend = LiveStreamingBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert "text/event-stream" in response.getheader("Content-Type", "")
+
+        # Read line by line:
+        line1 = response.readline()
+        _ = response.readline()
+        chunk1 = json.loads(line1.removeprefix(b"data: "))
+        assert chunk1["choices"][0]["delta"] == {"role": "assistant"}
+
+        line2 = response.readline()
+        _ = response.readline()
+        chunk2 = json.loads(line2.removeprefix(b"data: "))
+        assert chunk2["choices"][0]["delta"] == {"content": "Hel"}
+
+        # Signal that the client has received the first chunk before backend finishes
+        first_chunk_received.set()
+
+        remainder = response.read()
+        connection.close()
+
+        assert b'"content":"lo"' in remainder or b'"content": "lo"' in remainder
+        assert b"data: [DONE]\n\n" in remainder
+
+
+def test_real_http_stream_invalid_unicode_before_headers() -> None:
+    class InvalidUnicodeEarlyBackend(FakeBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            sink = current_chunk_sink()
+            assert sink is not None
+            sink("\ud800")
+            return CompletionResult(content="Hello")
+
+    backend = InvalidUnicodeEarlyBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 502
+        body = json.loads(response.read())
+        assert body["error"]["code"] in ("invalid_completion", "completion_failed")
+        assert "invalid Unicode" in body["error"]["message"]
+        connection.close()
+
+
+def test_real_http_stream_invalid_unicode_after_first_chunk() -> None:
+    first_chunk_received = threading.Event()
+
+    class InvalidUnicodeLateBackend(FakeBackend):
+        def complete(
+            self,
+            request: CompletionRequest,
+            *,
+            cwd: Path,
+            cancel: threading.Event,
+            timeout_s: float,
+            max_output_bytes: int,
+        ) -> CompletionResult:
+            sink = current_chunk_sink()
+            assert sink is not None
+            sink("valid")
+            assert first_chunk_received.wait(3)
+            sink("\ud800")
+            return CompletionResult(content="valid")
+
+    backend = InvalidUnicodeLateBackend()
+    with local_server(backend) as (port, _runtime):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(
+                {"model": "fake", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ),
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        line1 = response.readline()
+        _ = response.readline()
+        chunk1 = json.loads(line1.removeprefix(b"data: "))
+        assert chunk1["choices"][0]["delta"] == {"role": "assistant"}
+
+        line2 = response.readline()
+        _ = response.readline()
+        chunk2 = json.loads(line2.removeprefix(b"data: "))
+        assert chunk2["choices"][0]["delta"] == {"content": "valid"}
+
+        first_chunk_received.set()
+
+        remainder = response.read()
+        connection.close()
+
+        assert b'"error"' in remainder
+        assert b"invalid Unicode" in remainder
+        assert b"[DONE]" not in remainder
+
+
+def test_stream_completion_chunks_context() -> None:
+    chunks: list[str] = []
+    assert current_chunk_sink() is None
+    with stream_completion_chunks(chunks.append):
+        sink = current_chunk_sink()
+        assert sink is not None
+        sink("test")
+    assert current_chunk_sink() is None
+    assert chunks == ["test"]
+
+
+def test_runtime_owns_the_shared_request_deadline() -> None:
+    # Body read, app and runtime share one budget; the runtime's 504 wins the transport backstop.
+    backend = WaitingBackend()
+    app = create_app(
+        configuration(),
+        token="test-token",
+        adapters={"fake": backend},
+        limits=GatewayLimits(timeout_s=0.3),
+    )
+    with TestClient(
+        app, base_url="http://localhost", headers={"Authorization": "Bearer test-token"}
+    ) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "fake", "messages": [{"role": "user", "content": "x"}]},
+        )
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "timeout"
+    assert backend.finished.is_set()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_deadline_error_frame_only_follows_a_complete_sse_frame(
+    monkeypatch: pytest.MonkeyPatch, partial: bool
+) -> None:
+    monkeypatch.setattr(gateway_app, "DEADLINE_GRACE_S", 0.0)
+    delivered: list[Message] = []
+    frame = b"data: {}\n\n"
+
+    async def streaming_app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        body = frame[:5] if partial else frame
+        await send({"type": "http.response.body", "body": body, "more_body": True})
+        await asyncio.sleep(5)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        delivered.append(message)
+
+    middleware = gateway_app.BoundaryMiddleware(
+        streaming_app, token="t", max_bytes=1024, timeout_s=0.05
+    )
+    scope: Scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/healthz",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+    started = time.monotonic()
+    if partial:
+        # Never append an error frame to a cut event; the transport is closed instead.
+        with pytest.raises(TimeoutError):
+            asyncio.run(middleware(scope, receive, send))
+        assert len(delivered) == 2
+    else:
+        asyncio.run(middleware(scope, receive, send))
+        assert len(delivered) == 3
+        assert delivered[-1]["more_body"] is False
+        assert b"deadline_exceeded" in delivered[-1]["body"]
+    assert time.monotonic() - started < 2

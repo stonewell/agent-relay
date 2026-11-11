@@ -1,18 +1,24 @@
 [project]
 name = "agent-relay"
 version = "0.0.0"
-description = "Routes programming tasks to agent CLIs and passes context between them as specs"
+description = "Serves agent CLIs through a local OpenAI-compatible completion API"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.8",
     "pyyaml>=6",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "jsonschema>=4.23",
 ]
 
 [project.scripts]
 relay = "relay.cli.main:main"
 
+[project.optional-dependencies]
+serve = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "jsonschema>=4.23"]
+
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380"]
+dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380", "httpx>=0.27", "httpx2>=1", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "jsonschema>=4.23", "types-jsonschema>=4", "openai==2.8.1"]
 
 [build-system]
 requires = ["hatchling"]
@@ -23,6 +29,7 @@ packages = ["src/relay"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test_*.py", "test-*.py", "*_test.py"]
 
 [tool.ruff]
 line-length = 100

@@ -1,0 +1,14 @@
+# Project-local Codex configuration. Start a new session in this directory.
+# Routing policy lives in ../AGENTS.md; custom roles live in agents/.
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"
+
+[features]
+multi_agent = true
+
+[agents]
+enabled = true
+# Three subagents plus the primary coordinator.
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-6.1-sol"
+default_subagent_reasoning_effort = "medium"

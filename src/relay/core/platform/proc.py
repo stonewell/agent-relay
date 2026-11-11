@@ -1,0 +1,1029 @@
+"""Process supervision and command resolution (design sections 7.1, 7.2, 15).
+
+The adapter layer resolves a CLI command to a :class:`ResolvedCommand` with
+:func:`resolve_command` (PATH and PATHEXT lookup, plus Windows ``.cmd``/``.bat`` shim
+wrapping into a raw command line), then :func:`run_process` spawns it with the resolved
+environment and stdin, captures stdout/stderr, enforces a timeout, and kills the whole
+process tree. No shell is ever used.
+
+Tree kill: on POSIX the child is started in its own session, so ``killpg`` reaches every
+process in the tree (``SIGTERM``, a short grace period, then ``SIGKILL``); on Windows the
+child is assigned to a kill-on-close Job Object through ``ctypes`` and the tree is killed
+with ``TerminateJobObject`` (design section 15).
+
+This module imports only the stdlib-only :mod:`relay.core.env` (for log redaction) from the
+rest of the package, and its platform-specific imports are kept inside the
+``sys.platform == "win32"`` branch so it imports on both OSes.
+
+Each run logs metadata only (never stdin or stdout content) to the ``uvicorn.error`` logger: a
+``cli silent`` WARNING every :data:`SILENCE_LOG_INTERVAL_S` while a live child writes nothing,
+a ``cli stalled`` WARNING naming the limit when a no-output watchdog kills the tree, and one
+``cli exit`` line when it finishes, with a redacted stderr tail on failure.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from contextvars import ContextVar
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TextIO
+
+from relay.core.env import redact
+
+logger = logging.getLogger("uvicorn.error")
+
+IS_WINDOWS = sys.platform == "win32"
+
+SILENCE_LOG_INTERVAL_S = 30.0
+"""While a live child writes nothing, log a ``cli silent`` warning this often (seconds)."""
+
+_STDERR_TAIL_CHARS = 2000
+_FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_.-]*")
+_CONFIG_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+_CMD_EXTENSIONS = frozenset({".cmd", ".bat"})
+_TERM_GRACE = 0.2  # seconds between SIGTERM and SIGKILL on POSIX
+_CREATE_SUSPENDED = 0x00000004  # Windows: start the process with its main thread suspended
+
+# `os.killpg` does not exist on Windows; fall back to killing the direct child.
+_killpg = getattr(os, "killpg", None)
+# Detects leader exit without reaping it (absent on Windows and on macOS before Python 3.13).
+_waitid = None if IS_WINDOWS else getattr(os, "waitid", None)
+
+
+OutputSink = Callable[[str], None]
+"""Receives each stdout line while a process runs; it must not block (design section 11)."""
+
+MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+"""Default bound on captured output when streaming; exceeding it fails the attempt."""
+
+
+class OutputLimitExceeded(RuntimeError):
+    """Captured output passed its configured limit; the process tree was stopped."""
+
+
+class ProcessDrainError(RuntimeError):
+    """A child or inherited pipe remains alive after the termination/drain grace period."""
+
+
+class ProcessStalled(RuntimeError):
+    """The child wrote nothing past a no-output limit; the process tree was stopped.
+
+    `limit` is ``"first-output"`` (nothing written since spawn) or ``"idle"`` (silent since
+    the last output); `silent_s` is how long it had been silent and `limit_s` the limit.
+    """
+
+    def __init__(self, limit: str, silent_s: float, limit_s: float) -> None:
+        super().__init__(f"no output for {silent_s:.1f}s ({limit} limit {limit_s:.1f}s)")
+        self.limit = limit
+        self.silent_s = silent_s
+        self.limit_s = limit_s
+
+
+class CommandNotFound(FileNotFoundError):
+    """A command could not be resolved to an executable (design section 7.2)."""
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    """Outcome of one supervised process, in the form adapters parse (design section 7.1)."""
+
+    exit_code: int | None
+    stdout: str = ""
+    stderr: str = ""
+    duration_s: float = 0.0
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class ResolvedCommand:
+    """A resolved executable and how to spawn it (design section 7.2).
+
+    ``argv`` is the list form used on POSIX and for ordinary Windows commands; it is what
+    :func:`run_process` passes to ``subprocess.Popen`` when there is no raw Windows command
+    line. On Windows a ``.cmd``/``.bat`` shim must reach ``cmd.exe /d /s /c`` as a single
+    raw string: ``Popen`` re-applies ``list2cmdline`` to a list argument, which would corrupt
+    the already-quoted inner command line (``cmd /s`` would then be unable to strip the outer
+    quotes). In that case ``windows_command_line`` holds the exact command line and
+    :func:`run_process` passes it to ``Popen`` verbatim, bypassing the second quoting pass.
+    """
+
+    argv: tuple[str, ...]
+    windows_command_line: str | None = None
+
+
+def _split_pathext(pathext: str) -> list[str]:
+    """Normalise a ``PATHEXT`` value into a dotted-extension list (Windows)."""
+    extensions: list[str] = []
+    for entry in pathext.split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if not entry.startswith("."):
+            entry = "." + entry
+        extensions.append(entry)
+    return extensions
+
+
+def _has_extension(name: str) -> bool:
+    return os.path.splitext(name)[1] != ""
+
+
+def _iter_candidates(
+    cmd: str, path_value: str, extensions: Sequence[str], explicit: bool
+) -> Iterator[str]:
+    # On Windows an extensionless file (e.g. npm's POSIX-sh `claude` beside `claude.cmd`)
+    # cannot be spawned, so a command without an extension is tried with PATHEXT only.
+    suffixes: Sequence[str] = extensions if extensions and not _has_extension(cmd) else ("",)
+    if explicit:
+        yield from (cmd + ext for ext in suffixes)
+        return
+    for directory in path_value.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, cmd)
+        yield from (candidate + ext for ext in suffixes)
+
+
+def _cmd_shim_command_line(shim: str, args: Sequence[str], comspec: str) -> str:
+    """Build the raw command line for a ``.cmd``/``.bat`` shim (Windows only).
+
+    Escape the shell command and both parsing passes of arguments forwarded with ``%*``.
+    Delayed expansion is disabled so exclamation marks stay literal. The outer quote pair
+    belongs to CMD's ``/s`` rule. Pass the result to ``Popen`` as a raw string to avoid
+    another Windows argument-quoting pass.
+    """
+    inner = _cmd_shim_inner(shim, args)
+    return f'{subprocess.list2cmdline([comspec])} /d /s /v:off /c "{inner}"'
+
+
+_CMD_META = re.compile(r'([()\[\]%!^"`<>&|;, *?])')
+
+
+def _cmd_escape(value: str) -> str:
+    if any(ch in value for ch in "\r\n\0"):
+        raise ValueError("batch arguments cannot contain newlines or NUL; use stdin or a file")
+    return _CMD_META.sub(r"^\1", value)
+
+
+def _cmd_shim_inner(shim: str, args: Sequence[str]) -> str:
+    quoted: list[str] = []
+    for arg in args:
+        # Quote for the eventual native executable, then escape both CMD parsing passes:
+        # the outer /c invocation and the batch shim's %* expansion.
+        value = re.sub(r'(\\*)"', lambda match: match[1] * 2 + '\\"', arg)
+        value = re.sub(r"(\\+)$", lambda match: match[1] * 2, value)
+        quoted.append(_cmd_escape(_cmd_escape(f'"{value}"')))
+    return " ".join([_cmd_escape(shim), *quoted])
+
+
+def _wrap_cmd_shim(shim: str, args: Sequence[str], env: Mapping[str, str]) -> ResolvedCommand:
+    """Wrap a ``.cmd``/``.bat`` shim so it runs through ``cmd.exe`` (design section 7.2).
+
+    Returns a :class:`ResolvedCommand` whose ``windows_command_line`` is the raw command line
+    (see :func:`_cmd_shim_command_line`); ``argv`` is the equivalent list form, kept only for
+    inspection. ``run_process`` uses the raw string on Windows, never the list, so the inner
+    quoting is preserved.
+    """
+    comspec = next((value for name, value in env.items() if name.upper() == "COMSPEC"), "cmd.exe")
+    command_line = _cmd_shim_command_line(shim, args, comspec)
+    return ResolvedCommand(
+        argv=(comspec, "/d", "/s", "/v:off", "/c", f'"{_cmd_shim_inner(shim, args)}"'),
+        windows_command_line=command_line,
+    )
+
+
+def resolve_command(
+    cmd: str,
+    args: Sequence[str] = (),
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | str | None = None,
+) -> ResolvedCommand:
+    """Resolve `cmd` to a concrete executable and return the full command (never via a shell).
+
+    - A command containing a path separator is an explicit path; it must be a file and, on
+      POSIX, executable.
+    - Otherwise the command is looked up on ``PATH`` and, on Windows, ``PATHEXT``.
+    - On Windows a resolved ``.cmd``/``.bat`` file is wrapped through ``cmd.exe /d /s /c``;
+      the returned :class:`ResolvedCommand` then carries a raw ``windows_command_line`` so
+      ``run_process`` can pass it to ``Popen`` without a second quoting pass (see
+      :class:`ResolvedCommand`).
+
+    Raises :class:`CommandNotFound` when nothing resolves. `args` are appended verbatim to
+    the resolved executable (or folded into the shim command line).
+    """
+    if not cmd:
+        raise CommandNotFound("command is empty")
+    effective = dict(os.environ) if env is None else dict(env)
+    path_value = effective.get("PATH", "")
+    base = Path(cwd) if cwd is not None else Path.cwd()
+    extensions: tuple[str, ...] = ()
+    if IS_WINDOWS:
+        extensions = tuple(_split_pathext(effective.get("PATHEXT", _DEFAULT_PATHEXT)))
+    explicit = os.sep in cmd or bool(os.altsep and os.altsep in cmd)
+
+    tried: list[str] = []
+    for candidate in _iter_candidates(cmd, path_value, extensions, explicit):
+        path = Path(candidate)
+        if not path.is_absolute():
+            path = base / path
+        tried.append(str(path))
+        try:
+            is_file = path.is_file()
+        except OSError:
+            # An unreadable PATH entry is skipped, not fatal; an explicit path still rejects.
+            if explicit:
+                raise CommandNotFound(f"{path} is not executable") from None
+            continue
+        if not is_file:
+            continue
+        if not IS_WINDOWS:
+            try:
+                executable = os.access(path, os.X_OK)
+            except OSError:
+                executable = False
+            if not executable:
+                if explicit:
+                    raise CommandNotFound(f"{path} is not executable")
+                continue  # keep searching later PATH entries for an executable one
+        resolved = str(path)
+        if IS_WINDOWS and os.path.splitext(resolved)[1].lower() in _CMD_EXTENSIONS:
+            return _wrap_cmd_shim(resolved, args, effective)
+        return ResolvedCommand(argv=(resolved, *args))
+
+    tried_note = f" (tried: {', '.join(tried)})" if tried else ""
+    raise CommandNotFound(f"command {cmd!r} not found{tried_note}")
+
+
+# --- Windows Job Object tree kill (lazy ctypes import) -----------------------------------------
+
+if sys.platform == "win32":
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    _kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _IO_COUNTERS(_ctypes.Structure):
+        _fields_ = [  # noqa: RUF012 - ctypes protocol
+            ("ReadOperationCount", _ctypes.c_ulonglong),
+            ("WriteOperationCount", _ctypes.c_ulonglong),
+            ("OtherOperationCount", _ctypes.c_ulonglong),
+            ("ReadTransferCount", _ctypes.c_ulonglong),
+            ("WriteTransferCount", _ctypes.c_ulonglong),
+            ("OtherTransferCount", _ctypes.c_ulonglong),
+        ]
+
+    class _JOB_BASIC_LIMIT(_ctypes.Structure):
+        _fields_ = [  # noqa: RUF012 - ctypes protocol
+            ("PerProcessUserTimeLimit", _ctypes.c_longlong),
+            ("PerJobUserTimeLimit", _ctypes.c_longlong),
+            ("LimitFlags", _wintypes.DWORD),
+            ("MinimumWorkingSetSize", _ctypes.c_size_t),
+            ("MaximumWorkingSetSize", _ctypes.c_size_t),
+            ("ActiveProcessLimit", _wintypes.DWORD),
+            ("Affinity", _ctypes.c_size_t),
+            ("PriorityClass", _wintypes.DWORD),
+            ("SchedulingClass", _wintypes.DWORD),
+        ]
+
+    class _JOB_EXTENDED_LIMIT(_ctypes.Structure):
+        _fields_ = [  # noqa: RUF012 - ctypes protocol
+            ("BasicLimitInformation", _JOB_BASIC_LIMIT),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", _ctypes.c_size_t),
+            ("JobMemoryLimit", _ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", _ctypes.c_size_t),
+            ("PeakJobMemoryUsed", _ctypes.c_size_t),
+        ]
+
+    class _THREADENTRY32(_ctypes.Structure):
+        _fields_ = [  # noqa: RUF012 - ctypes protocol
+            ("dwSize", _wintypes.DWORD),
+            ("cntUsage", _wintypes.DWORD),
+            ("th32ThreadID", _wintypes.DWORD),
+            ("th32OwnerProcessID", _wintypes.DWORD),
+            ("tpBasePri", _ctypes.c_long),
+            ("tpDeltaPri", _ctypes.c_long),
+            ("dwFlags", _wintypes.DWORD),
+        ]
+
+    _kernel32.CreateJobObjectW.argtypes = [_ctypes.c_void_p, _wintypes.LPCWSTR]
+    _kernel32.CreateJobObjectW.restype = _wintypes.HANDLE
+    _kernel32.SetInformationJobObject.argtypes = [
+        _wintypes.HANDLE,
+        _ctypes.c_int,
+        _ctypes.c_void_p,
+        _wintypes.DWORD,
+    ]
+    _kernel32.SetInformationJobObject.restype = _wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [_wintypes.HANDLE, _wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = _wintypes.BOOL
+    _kernel32.OpenProcess.argtypes = [_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD]
+    _kernel32.OpenProcess.restype = _wintypes.HANDLE
+    _kernel32.TerminateJobObject.argtypes = [_wintypes.HANDLE, _wintypes.UINT]
+    _kernel32.TerminateJobObject.restype = _wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [_wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = _wintypes.BOOL
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [_wintypes.DWORD, _wintypes.DWORD]
+    _kernel32.CreateToolhelp32Snapshot.restype = _wintypes.HANDLE
+    _kernel32.Thread32First.argtypes = [_wintypes.HANDLE, _ctypes.POINTER(_THREADENTRY32)]
+    _kernel32.Thread32First.restype = _wintypes.BOOL
+    _kernel32.Thread32Next.argtypes = [_wintypes.HANDLE, _ctypes.POINTER(_THREADENTRY32)]
+    _kernel32.Thread32Next.restype = _wintypes.BOOL
+    _kernel32.OpenThread.argtypes = [_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD]
+    _kernel32.OpenThread.restype = _wintypes.HANDLE
+    _kernel32.ResumeThread.argtypes = [_wintypes.HANDLE]
+    _kernel32.ResumeThread.restype = _wintypes.DWORD
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
+    _TH32CS_SNAPTHREAD = 0x00000004
+    _THREAD_SUSPEND_RESUME = 0x0002
+    _INVALID_HANDLE_VALUE = _wintypes.HANDLE(-1).value
+
+    def _assign_to_job(pid: int) -> int | None:
+        """Put `pid` in a new kill-on-close Job Object; returns the handle, or None on failure."""
+        handle = _kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+        info = _JOB_EXTENDED_LIMIT()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _kernel32.SetInformationJobObject(
+            handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            _ctypes.byref(info),
+            _ctypes.sizeof(info),
+        ):
+            _kernel32.CloseHandle(handle)
+            return None
+        child = _kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+        if not child:
+            _kernel32.CloseHandle(handle)
+            return None
+        assigned = _kernel32.AssignProcessToJobObject(handle, child)
+        _kernel32.CloseHandle(child)
+        if not assigned:
+            _kernel32.CloseHandle(handle)
+            return None
+        return int(handle)
+
+    def _terminate_job(handle: int) -> None:
+        _kernel32.TerminateJobObject(handle, 1)
+
+    def _close_job(handle: int | None) -> None:
+        if handle is not None:
+            _kernel32.CloseHandle(handle)
+
+    def _resume_main_thread(pid: int) -> bool:
+        """Resume the single suspended main thread of a ``CREATE_SUSPENDED`` process.
+
+        A process created with ``CREATE_SUSPENDED`` has exactly one thread (its main thread),
+        which has not run any code yet, so enumerating the threads that belong to `pid` and
+        resuming them is safe and unambiguous. Returns True when at least one thread was
+        resumed, False on failure (the caller then terminates the still-suspended child).
+        """
+        snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if snapshot is None or snapshot == _INVALID_HANDLE_VALUE:
+            return False
+        try:
+            entry = _THREADENTRY32()
+            entry.dwSize = _ctypes.sizeof(_THREADENTRY32)
+            if not _kernel32.Thread32First(snapshot, _ctypes.byref(entry)):
+                return False
+            resumed = False
+            while True:
+                if entry.th32OwnerProcessID == pid:
+                    thread = _kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    if thread:
+                        try:
+                            resumed = _kernel32.ResumeThread(thread) != 0xFFFFFFFF
+                        finally:
+                            _kernel32.CloseHandle(thread)
+                if not _kernel32.Thread32Next(snapshot, _ctypes.byref(entry)):
+                    break
+            return resumed
+        finally:
+            _kernel32.CloseHandle(snapshot)
+
+else:
+
+    def _assign_to_job(pid: int) -> int | None:
+        return None
+
+    def _terminate_job(handle: int) -> None:
+        return None
+
+    def _close_job(handle: int | None) -> None:
+        return None
+
+    def _resume_main_thread(pid: int) -> bool:
+        return True
+
+
+def _leader_exited(popen: subprocess.Popen[str]) -> bool:
+    """Whether the child exited; on POSIX (with ``waitid``) it is left unreaped.
+
+    An unreaped (zombie) leader pins its PID, and so its process-group ID, so a later
+    ``killpg`` cannot reach an unrelated group that reused the number.
+    """
+    if popen.returncode is not None:
+        return True
+    if _waitid is None:
+        return popen.poll() is not None
+    try:
+        flags = os.WEXITED | os.WNOHANG | os.WNOWAIT  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType, reportUnknownMemberType]
+        return _waitid(os.P_PID, popen.pid, flags) is not None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+    except ChildProcessError:
+        return popen.poll() is not None
+
+
+def _wait_exit(popen: subprocess.Popen[str], grace: float) -> None:
+    deadline = time.monotonic() + grace
+    while not _leader_exited(popen) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def _posix_killer(
+    popen: subprocess.Popen[str],
+) -> tuple[Callable[[], None], Callable[[], None]]:
+    """Return ``(kill_tree, close)``; ``close`` sweeps the group, then reaps the leader.
+
+    The group is signalled only while the leader is unreaped (see :func:`_leader_exited`);
+    the lock keeps a late pump-thread kill from racing the reap in ``close``.
+    """
+    lock = threading.RLock()
+
+    def signal_group(sig: int) -> None:
+        if popen.returncode is None or _waitid is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                _killpg(popen.pid, sig)  # pyright: ignore[reportOptionalCall]
+
+    def kill_tree() -> None:
+        if _killpg is None:
+            with contextlib.suppress(OSError):
+                popen.kill()
+            return
+        with lock:
+            signal_group(signal.SIGTERM)
+            _wait_exit(popen, _TERM_GRACE)
+            # The leader may exit while descendants keep running and hold the pipes open.
+            signal_group(getattr(signal, "SIGKILL", 9))
+
+    def close() -> None:
+        with lock:
+            kill_tree()
+            popen.wait()
+
+    return kill_tree, close
+
+
+class _JobHandle:
+    """A Job Object handle that is never used after (or concurrently with) its close.
+
+    A pump thread may still call ``kill_tree`` after the supervisor closed the job; a closed
+    handle value can be reused by the OS for an unrelated object, so it must not be touched.
+    """
+
+    def __init__(self, handle: int) -> None:
+        self._handle: int | None = handle
+        self._lock = threading.Lock()
+
+    def terminate(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                _terminate_job(self._handle)
+
+    def close(self) -> None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+            _close_job(handle)
+
+
+def _windows_killer(popen: subprocess.Popen[str], job: _JobHandle | None) -> Callable[[], None]:
+    def kill_tree() -> None:
+        if job is not None:
+            # Descendants can retain pipes after the leader exits. Once the job is closed,
+            # kill-on-close has already terminated every member, so this becomes a no-op.
+            job.terminate()
+        elif popen.returncode is None:
+            # Job assignment failed (e.g. nested-job limits): kill the direct child only.
+            with contextlib.suppress(OSError):
+                popen.terminate()
+
+    return kill_tree
+
+
+class SupervisedProcess:
+    """A spawned process plus the handle that kills its whole tree (design section 7.1).
+
+    Implements the ``WorkerHandle`` protocol used by ``AgentAdapter.cancel``.
+    """
+
+    def __init__(
+        self,
+        popen: subprocess.Popen[str],
+        kill_tree: Callable[[], None],
+        close: Callable[[], None],
+        *,
+        flags: Sequence[str] = (),
+        secrets: Mapping[str, str] | None = None,
+    ) -> None:
+        self._popen = popen
+        self._kill_tree = kill_tree
+        self._close = close
+        self._started = time.monotonic()
+        self._flags = tuple(flags)  # option names only, for diagnostics
+        self._secrets = dict(secrets or {})  # the child env, redacted from logged stderr
+
+    @property
+    def pid(self) -> int:
+        return self._popen.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self._popen.returncode
+
+    def poll(self) -> int | None:
+        return self._popen.poll()
+
+    def kill_tree(self) -> None:
+        """Terminate the whole tree (TERM then KILL on POSIX; TerminateJobObject on Windows)."""
+        self._kill_tree()
+
+    def run(
+        self,
+        stdin: str | None = None,
+        timeout_s: float | None = None,
+        *,
+        sink: OutputSink | None = None,
+        max_output_bytes: int = MAX_CAPTURE_BYTES,
+        first_output_timeout_s: float | None = None,
+        idle_timeout_s: float | None = None,
+    ) -> ProcessResult:
+        """Drive the child to completion, capturing output and enforcing `timeout_s`.
+
+        Stdout and stderr are drained continuously on their own threads, and stdin is fed on
+        another, so the timeout and cancellation are enforced even when the child or a
+        descendant stops reading or keeps a pipe open. With a `sink`, every stdout line is
+        also offered to it; capture and final parsing stay independent of whatever the sink
+        does (design section 11). Capture is bounded by `max_output_bytes`: exceeding it kills
+        the tree and raises :class:`OutputLimitExceeded` instead of truncating silently.
+
+        No-output watchdog: when nothing reaches stdout or stderr within
+        `first_output_timeout_s` of spawn, or for `idle_timeout_s` after the last output, the
+        tree is killed and :class:`ProcessStalled` is raised (distinct from the overall
+        `timeout_s`, which returns ``timed_out=True``).
+        """
+        return _stream_run(
+            self, stdin, timeout_s, sink, max_output_bytes, first_output_timeout_s, idle_timeout_s
+        )
+
+
+def _stream_pump(
+    stream: TextIO,
+    chunks: list[str],
+    counter: list[int],
+    limit: int,
+    overflow: threading.Event,
+    kill: Callable[[], None],
+    forward: OutputSink | None,
+) -> None:
+    """Drain one pipe line by line: bounded capture first, best-effort forwarding second."""
+    pending: list[str] = []
+    try:
+        with contextlib.suppress(OSError, ValueError):
+            while True:
+                # readline() without a size allocates an arbitrarily large unterminated line.
+                part = stream.readline(min(65536, max(1, limit - counter[0] + 1)))
+                if not part:
+                    return
+                counter[0] += len(part.encode("utf-8", errors="replace"))
+                if counter[0] > limit:
+                    overflow.set()
+                    kill()
+                    return
+                chunks.append(part)
+                if forward is not None:
+                    pending.append(part)
+                    if part.endswith("\n"):
+                        with contextlib.suppress(Exception):  # a bad sink must never stall
+                            forward("".join(pending))
+                        pending.clear()
+    finally:
+        # EOF, a pipe error or overflow: forward the captured unterminated tail exactly once.
+        if pending and forward is not None:
+            with contextlib.suppress(Exception):
+                forward("".join(pending))
+
+
+def _stream_run(
+    self: SupervisedProcess,
+    stdin: str | None,
+    timeout_s: float | None,
+    sink: OutputSink | None,
+    max_bytes: int,
+    first_output_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
+) -> ProcessResult:
+    popen = self._popen  # pyright: ignore[reportPrivateUsage]
+    out: list[str] = []
+    err: list[str] = []
+    out_size, err_size = [0], [0]
+    overflow = threading.Event()
+    assert popen.stdout is not None and popen.stderr is not None and popen.stdin is not None
+    stdin_pipe = popen.stdin
+
+    def feed() -> None:
+        with contextlib.suppress(OSError, ValueError):
+            if stdin is not None:
+                stdin_pipe.write(stdin)
+        with contextlib.suppress(OSError, ValueError):
+            stdin_pipe.close()
+
+    threads = [
+        threading.Thread(target=feed, daemon=True),
+        threading.Thread(
+            target=_stream_pump,
+            args=(popen.stdout, out, out_size, max_bytes, overflow, self.kill_tree, sink),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_stream_pump,
+            args=(popen.stderr, err, err_size, max_bytes, overflow, self.kill_tree, None),
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    cancellation = _CANCELLATION.get()
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+    timed_out = False
+    error: str | None = None
+    started = self._started  # pyright: ignore[reportPrivateUsage]
+    flags = " ".join(self._flags) or "-"  # pyright: ignore[reportPrivateUsage]
+    # Output liveness, sampled from the pump byte counters on each poll (never the content).
+    first_output_at: float | None = None
+    last_output_at = last_silence_log = started
+    seen = 0
+    stalled: ProcessStalled | None = None
+    stalled_exited = False
+
+    def observe(now: float) -> None:
+        nonlocal first_output_at, last_output_at, last_silence_log, seen
+        total = out_size[0] + err_size[0]
+        if total != seen:
+            seen = total
+            last_output_at = last_silence_log = now
+            if first_output_at is None:
+                first_output_at = now
+
+    def watchdog(now: float) -> ProcessStalled | None:
+        """The no-output limit that has expired, if any (after `observe`)."""
+        if first_output_at is None:
+            if first_output_timeout_s is not None and now - started >= first_output_timeout_s:
+                return ProcessStalled("first-output", now - started, first_output_timeout_s)
+        elif idle_timeout_s is not None and now - last_output_at >= idle_timeout_s:
+            return ProcessStalled("idle", now - last_output_at, idle_timeout_s)
+        return None
+
+    try:
+        try:
+            while not _leader_exited(popen) and not overflow.is_set():
+                if cancellation is not None and cancellation.is_set():
+                    self.kill_tree()
+                    raise ProcessCancelled("attempt cancelled")
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    timed_out = True
+                    self.kill_tree()
+                    break
+                observe(now)
+                stalled = watchdog(now)
+                if stalled is not None:
+                    logger.warning(
+                        "cli stalled limit=%s limit_s=%.1f since_output_s=%.1f elapsed_s=%.1f "
+                        "stdout_bytes=%d stderr_bytes=%d pid=%s flags=%s",
+                        stalled.limit,
+                        stalled.limit_s,
+                        stalled.silent_s,
+                        now - started,
+                        out_size[0],
+                        err_size[0],
+                        popen.pid,
+                        flags,
+                    )
+                    # The leader may have written its last output and exited within this poll.
+                    stalled_exited = _leader_exited(popen)
+                    self.kill_tree()
+                    break
+                if now - last_silence_log >= SILENCE_LOG_INTERVAL_S:
+                    last_silence_log = now
+                    logger.warning(
+                        "cli silent elapsed_s=%.1f since_output_s=%.1f stdout_bytes=%d "
+                        "stderr_bytes=%d pid=%s flags=%s",
+                        now - started,
+                        now - last_output_at,
+                        out_size[0],
+                        err_size[0],
+                        popen.pid,
+                        flags,
+                    )
+                time.sleep(0.02)
+        except BaseException:
+            self.kill_tree()
+            raise
+        finally:
+            # Wait without reaping on POSIX: group kills below must not outlive the leader's PID.
+            while not _leader_exited(popen):
+                time.sleep(0.01)
+            for thread in threads:
+                thread.join(timeout=2.0)
+            if any(thread.is_alive() for thread in threads):
+                self.kill_tree()  # a descendant still holds a pipe open
+            self._close()  # pyright: ignore[reportPrivateUsage]
+            popen.wait()
+            if any(thread.is_alive() for thread in threads):
+                for thread in threads:
+                    thread.join(timeout=2.0)
+            if any(thread.is_alive() for thread in threads):
+                raise ProcessDrainError("process pipes did not drain after tree termination")
+        if overflow.is_set():
+            raise OutputLimitExceeded(
+                f"agent output exceeded the {max_bytes}-byte capture limit; the attempt was stopped"
+            )
+        if stalled is not None:
+            # Output the pumps had not counted yet at the stall decision, from a leader that
+            # had already exited on its own, is a finished run, not a stall.
+            if not (stalled_exited and out_size[0] + err_size[0] != seen):
+                raise stalled
+            logger.info("cli stall dropped: late output from exited leader pid=%s", popen.pid)
+        return ProcessResult(
+            exit_code=None if timed_out else self.returncode,
+            stdout="".join(out),
+            stderr="".join(err),
+            duration_s=time.monotonic() - started,
+            timed_out=timed_out,
+        )
+    except BaseException as exc:
+        error = type(exc).__name__
+        raise
+    finally:
+        with contextlib.suppress(Exception):  # diagnostics must never mask the outcome
+            now = time.monotonic()
+            observe(now)
+            _log_exit(
+                self,
+                code=None if timed_out else popen.returncode,
+                timed_out=timed_out,
+                error=error,
+                duration_s=now - started,
+                out_bytes=out_size[0],
+                err_bytes=err_size[0],
+                stderr="".join(err),
+                first_output_s=None if first_output_at is None else first_output_at - started,
+                since_output_s=now - last_output_at,
+                flags=flags,
+            )
+
+
+def _log_exit(
+    self: SupervisedProcess,
+    *,
+    code: int | None,
+    timed_out: bool,
+    error: str | None,
+    duration_s: float,
+    out_bytes: int,
+    err_bytes: int,
+    stderr: str,
+    first_output_s: float | None,
+    since_output_s: float,
+    flags: str,
+) -> None:
+    """Log one ``cli exit`` line: metadata, plus a redacted stderr tail on failure or stderr."""
+    failed = timed_out or error is not None or code != 0
+    message = (
+        "cli exit code=%s timed_out=%s duration_s=%.1f stdout_bytes=%d stderr_bytes=%d "
+        "first_output_s=%s since_last_output_s=%.1f flags=%s"
+    )
+    args: list[object] = [
+        code,
+        timed_out,
+        duration_s,
+        out_bytes,
+        err_bytes,
+        "None" if first_output_s is None else f"{first_output_s:.1f}",
+        since_output_s,
+        flags,
+    ]
+    if error is not None:
+        message += " error=%s"
+        args.append(error)
+    if stderr:
+        message += "; stderr: %s"
+        secrets = self._secrets  # pyright: ignore[reportPrivateUsage]
+        # Redact a window wide enough that no secret is cut at the edge, then trim to the tail.
+        margin = max((len(value) for value in secrets.values()), default=0)
+        window = stderr[-(_STDERR_TAIL_CHARS + margin) :]
+        args.append(redact(window, secrets=secrets)[-_STDERR_TAIL_CHARS:])
+    logger.log(logging.WARNING if failed else logging.INFO, message, *args)
+
+
+def _option_names(argv: Sequence[str]) -> tuple[str, ...]:
+    """Option names from `argv` (``--name`` of ``--name=value``); never values or operands."""
+    names: list[str] = []
+    args = argv[1:]
+    for index, arg in enumerate(args):
+        name, eq, attached = arg.partition("=")
+        if not _FLAG.fullmatch(name):
+            continue
+        # Config overrides also show the key (never the value): `-c key=value`,
+        # `-c=key=value`, `-ckey=value`, `--config key=value` and `--config=key=value`.
+        flag, override = name, ""
+        if name in ("-c", "--config"):
+            override = attached if eq else (args[index + 1] if index + 1 < len(args) else "")
+        elif eq and name.startswith("-c") and not name.startswith("--"):
+            flag, override = "-c", name[2:] + "=" + attached
+        key, sep, _ = override.partition("=")
+        names.append(f"{flag} {key}" if sep and _CONFIG_KEY.fullmatch(key) else name)
+    return tuple(names)
+
+
+def _spawn(
+    command: Sequence[str] | ResolvedCommand,
+    *,
+    cwd: Path | str,
+    env: Mapping[str, str],
+) -> SupervisedProcess:
+    environment = {str(key): str(value) for key, value in env.items()}
+    if isinstance(command, ResolvedCommand):
+        argv = list(command.argv)
+        windows_command_line = command.windows_command_line
+    else:
+        argv = [str(arg) for arg in command]
+        windows_command_line = None
+    # A cmd-shim argv holds only cmd.exe switches and the escaped inner line: log no flags.
+    flags = () if windows_command_line is not None else _option_names(argv)
+    if IS_WINDOWS:
+        # The raw command line, when present, must be handed to `Popen` as a single string
+        # (no `list2cmdline` pass). Spawn suspended, assign to the kill-on-close Job Object,
+        # then resume so no grandchild can escape the tree kill in between.
+        cmd_or_argv: str | list[str] = (
+            windows_command_line if windows_command_line is not None else argv
+        )
+        popen = subprocess.Popen(
+            cmd_or_argv,
+            cwd=str(cwd),
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=_CREATE_SUSPENDED,
+        )
+        job = _assign_to_job(popen.pid)
+        if job is None or not _resume_main_thread(popen.pid):
+            # Could not guarantee a supervised tree: terminate the still-suspended child
+            # rather than run it unmanaged.
+            with contextlib.suppress(OSError):
+                popen.kill()
+            popen.communicate()
+            _close_job(job)
+            raise OSError(f"could not attach process {popen.pid} to a Job Object")
+        owned = _JobHandle(job)
+        return SupervisedProcess(
+            popen, _windows_killer(popen, owned), owned.close, flags=flags, secrets=environment
+        )
+    popen = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    kill_tree, close = _posix_killer(popen)
+    return SupervisedProcess(popen, kill_tree, close, flags=flags, secrets=environment)
+
+
+ProcessObserver = Callable[[str, int | None], None]
+_OUTPUT_SINK: ContextVar[tuple[OutputSink, int] | None] = ContextVar(
+    "relay_output_sink", default=None
+)
+_CANCELLATION: ContextVar[threading.Event | None] = ContextVar(
+    "relay_process_cancellation", default=None
+)
+
+
+@contextlib.contextmanager
+def stream_output(sink: OutputSink, *, max_bytes: int = MAX_CAPTURE_BYTES) -> Generator[None]:
+    """Offer every stdout line of supervised processes in this context to `sink`.
+
+    The sink runs on the pipe-draining thread and must not block; its failures are ignored.
+    The full output is still captured (bounded by `max_bytes`) for result parsing.
+    """
+    token = _OUTPUT_SINK.set((sink, max_bytes))
+    try:
+        yield
+    finally:
+        _OUTPUT_SINK.reset(token)
+
+
+class ProcessCancelled(RuntimeError):
+    """The foreground scheduler cancelled this attempt and its process tree."""
+
+
+@contextlib.contextmanager
+def cancel_processes_when(event: threading.Event) -> Generator[None]:
+    """Make every supervised process in this context observe scheduler cancellation."""
+    token = _CANCELLATION.set(event)
+    try:
+        if event.is_set():
+            raise ProcessCancelled("attempt cancelled")
+        yield
+    finally:
+        _CANCELLATION.reset(token)
+
+
+_PROCESS_OBSERVER: ContextVar[ProcessObserver | None] = ContextVar(
+    "relay_process_observer", default=None
+)
+
+
+@contextlib.contextmanager
+def observe_processes(observer: ProcessObserver) -> Generator[None]:
+    """Observe managed children within a foreground attempt, including repair and verification."""
+    token = _PROCESS_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _PROCESS_OBSERVER.reset(token)
+
+
+def run_process(
+    argv: Sequence[str] | ResolvedCommand,
+    *,
+    cwd: Path | str,
+    env: Mapping[str, str],
+    stdin: str | None = None,
+    timeout_s: float | None = None,
+    first_output_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
+) -> ProcessResult:
+    """Spawn `argv` (already resolved, no shell), capture output, enforce `timeout_s`.
+
+    `argv` is a plain argv list, or a :class:`ResolvedCommand` from :func:`resolve_command`
+    whose ``windows_command_line`` (for ``.cmd``/``.bat`` shims) is passed to ``Popen``
+    verbatim on Windows. On timeout the whole process tree is killed. `stdin`, when given, is
+    the prompt text piped to the child's stdin and then closed; otherwise stdin is closed
+    immediately so the child cannot hang waiting for input. The optional no-output limits
+    kill the tree and raise :class:`ProcessStalled` (see :meth:`SupervisedProcess.run`).
+    """
+    observer = _PROCESS_OBSERVER.get()
+    cancellation = _CANCELLATION.get()
+    if cancellation is not None and cancellation.is_set():
+        raise ProcessCancelled("attempt cancelled")
+    if observer is not None:
+        observer("starting", None)
+    process = _spawn(argv, cwd=cwd, env=env)
+    try:
+        if observer is not None:
+            observer("started", process.pid)
+    except BaseException:
+        process.kill_tree()
+        process.run()
+        raise
+    try:
+        streaming = _OUTPUT_SINK.get()
+        sink, max_bytes = (None, MAX_CAPTURE_BYTES) if streaming is None else streaming
+        return process.run(
+            stdin,
+            timeout_s,
+            sink=sink,
+            max_output_bytes=max_bytes,
+            first_output_timeout_s=first_output_timeout_s,
+            idle_timeout_s=idle_timeout_s,
+        )
+    finally:
+        if observer is not None:
+            observer("finished", process.pid)

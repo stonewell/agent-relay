@@ -1,0 +1,733 @@
+"""Codex completion transport, terminal status, usage and policy boundaries."""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from relay.adapters import codex_completion as module
+from relay.adapters.codex_completion import CodexCompletionAdapter, parse_completion
+from relay.adapters.completion import (
+    CompletionError,
+    CompletionInvalid,
+    CompletionRequest,
+    stream_completion_chunks,
+)
+from relay.core.env import CompleteEnv
+from relay.core.platform.proc import (
+    _OUTPUT_SINK,  # pyright: ignore[reportPrivateUsage]
+    CommandNotFound,
+    OutputLimitExceeded,
+    ProcessCancelled,
+    ProcessDrainError,
+    ProcessResult,
+)
+from relay.core.registry import Agent
+
+HOOK_TRUST_NOTICE = (
+    "`--dangerously-bypass-hook-trust` is enabled. "
+    "Enabled hooks may run without review for this invocation."
+)
+
+
+def result(content: str = "hello", **terminal: Any) -> ProcessResult:
+    return ProcessResult(
+        0,
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {"type": "thread.started", "thread_id": "t"},
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": content}},
+                {"type": "turn.completed", **terminal},
+            ]
+        ),
+    )
+
+
+def test_recorded_plain_usage_includes_cached_input_once() -> None:
+    raw = Path("tests/fixtures/recorded/codex_plain.jsonl").read_text(encoding="utf-8")
+    completion = parse_completion(ProcessResult(0, raw), structured=False)
+    assert completion.content == "OK"
+    assert completion.observed is None
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 13990
+    assert completion.usage.cached_tokens == 12288
+    assert completion.usage.completion_tokens == 5
+    assert parse_completion(result(), structured=False).usage is None
+
+
+def test_exact_hook_trust_advisory_is_allowed_only_before_turn_start() -> None:
+    advisory = {
+        "type": "item.completed",
+        "item": {
+            "id": "item_0",
+            "type": "error",
+            "message": HOOK_TRUST_NOTICE,
+        },
+    }
+    events = [json.loads(line) for line in result().stdout.splitlines()]
+    # Actual CLI emits the same advisory twice during startup.
+    allowed = [events[0], advisory, advisory, *events[1:]]
+    proc = ProcessResult(0, "\n".join(json.dumps(event) for event in allowed))
+    assert parse_completion(proc, structured=False).content == "hello"
+    rejected = [*events[:2], advisory, *events[2:]]
+    with pytest.raises(CompletionError):
+        parse_completion(
+            ProcessResult(0, "\n".join(json.dumps(event) for event in rejected)), structured=False
+        )
+
+
+@pytest.mark.parametrize("kind", ["item.started", "item.updated"])
+def test_hook_trust_advisory_requires_completed_item(kind: str) -> None:
+    item = json.dumps({"type": kind, "item": {"type": "error", "message": HOOK_TRUST_NOTICE}})
+    with pytest.raises(CompletionError):
+        parse_completion(ProcessResult(0, item + "\n" + result().stdout), structured=False)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Unknown startup failure",
+        "PreToolUse hook failed to start",
+        HOOK_TRUST_NOTICE + " A hook failed.",
+        " " + HOOK_TRUST_NOTICE,
+    ],
+)
+def test_other_startup_error_items_are_not_ignored(message: str) -> None:
+    item = json.dumps({"type": "item.completed", "item": {"type": "error", "message": message}})
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(ProcessResult(0, item + "\n" + result().stdout), structured=False)
+    assert caught.value.code == "completion_failed"
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": True, "output_tokens": 1},
+        {"input_tokens": 2, "output_tokens": 1, "cached_input_tokens": 3},
+        {"input_tokens": 2},
+    ],
+)
+def test_invalid_usage_stays_unknown(usage: dict[str, Any]) -> None:
+    assert parse_completion(result(usage=usage), structured=False).usage is None
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["command_execution", "mcp_tool_call", "file_change", "web_search", "todo_list", "future_tool"],
+)
+def test_tool_activity_is_rejected_even_with_successful_final_text(kind: str) -> None:
+    activity = json.dumps({"type": "item.started", "item": {"type": kind}})
+    proc = result()
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(ProcessResult(0, activity + "\n" + proc.stdout), structured=False)
+    assert caught.value.code == "backend_tool_activity"
+
+
+@pytest.mark.parametrize(
+    "proc",
+    [
+        ProcessResult(
+            0, '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}'
+        ),
+        ProcessResult(0, '{"type":"turn.failed","error":{"message":"failed"}}'),
+        ProcessResult(0, '{"type":"turn.cancelled"}'),
+        ProcessResult(0, "not JSON"),
+        result(status="cancelled"),
+        result(stop_reason="interrupted"),
+        ProcessResult(
+            0,
+            result().stdout
+            + '\n{"type":"item.completed","item":{"type":"agent_message","text":"late"}}',
+        ),
+        ProcessResult(0, result().stdout + '\n{"type":"turn.started"}'),
+        ProcessResult(0, result().stdout, stderr="PreToolUse hook failed to start"),
+    ],
+)
+def test_failure_or_missing_terminal_result_cannot_become_success(proc: ProcessResult) -> None:
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(proc, structured=False)
+    assert not isinstance(caught.value, CompletionInvalid)
+
+
+def test_tool_argument_transport_decodes_without_losing_nulls_or_dynamic_keys() -> None:
+    arguments = {"anything": [1, None, "雪"], "nested": {"key": True}}
+    envelope = {
+        "content": None,
+        "tool_calls": [{"name": "edit", "arguments": json.dumps(arguments)}],
+    }
+    completion = parse_completion(result(json.dumps(envelope)), structured=True)
+    assert completion.envelope == {
+        "content": None,
+        "tool_calls": [{"name": "edit", "arguments": arguments}],
+    }
+    assert json.loads(completion.raw) == completion.envelope
+    with pytest.raises(CompletionInvalid):
+        parse_completion(result("not an envelope"), structured=True)
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(result(json.dumps(envelope), stop_reason="length"), structured=True)
+    assert caught.value.code == "incomplete_tool_output"
+    assert (
+        parse_completion(result("partial", stop_reason="length"), structured=False).finish_reason
+        == "length"
+    )
+
+
+def test_fixed_invocation_preserves_prompt_and_env_and_installs_deny_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def no_models(*_: object) -> tuple[str, ...]:
+        return ()
+
+    monkeypatch.setattr(module, "_enumerated_models", no_models)
+    agent = Agent(
+        cmd=sys.executable, env={"OPENAI_API_KEY": "configured"}, models={"deep": "gpt-deep"}
+    )
+    adapter = CodexCompletionAdapter(
+        agent,
+        parent_env={
+            "PATH": "inherited",
+            "OPENAI_API_KEY": "parent",
+            "UNRELATED_SECRET": "no",
+            "RELAY_GATEWAY_TOKEN": "no",
+        },
+    )
+    prompt = "quotes \"' ! $() and Unicode 雪\n"
+    request = CompletionRequest(prompt, "gpt-deep", "high")
+    seen: dict[str, Any] = {}
+
+    def run(command: Any, **kwargs: Any) -> ProcessResult:
+        seen.update(kwargs)
+        return result()
+
+    def resolve(cmd: str, args: tuple[str, ...], **kwargs: Any) -> str:
+        seen["args"] = args
+        return cmd
+
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    assert (
+        adapter.complete(
+            request, cwd=tmp_path, cancel=threading.Event(), timeout_s=5, max_output_bytes=10000
+        ).content
+        == "hello"
+    )
+    assert adapter.default_aliases == ("default", "gpt-deep")
+    assert seen["stdin"] == prompt and prompt not in seen["args"]
+    assert isinstance(seen["env"], CompleteEnv)
+    assert seen["env"]["OPENAI_API_KEY"] == "configured"
+    assert "UNRELATED_SECRET" not in seen["env"] and "RELAY_GATEWAY_TOKEN" not in seen["env"]
+    assert seen["args"][seen["args"].index("--sandbox") + 1] == "read-only"
+    assert "--ephemeral" in seen["args"] and "--ignore-user-config" in seen["args"]
+    assert 'model_reasoning_effort="high"' in seen["args"]
+    assert "features.shell_tool=false" in seen["args"]
+    assert "features.view_image=false" in seen["args"]
+    assert "tools.view_image=false" not in seen["args"]
+    assert 'web_search="disabled"' in seen["args"]
+    policy = next(arg for arg in seen["args"] if arg.startswith("hooks.PreToolUse="))
+    assert "command_windows=" in policy and "relay-deny-tools.py" in policy
+    process = subprocess.run(
+        [sys.executable, str(tmp_path / "relay-deny-tools.py")], capture_output=True, check=False
+    )
+    assert process.returncode == 2 and (tmp_path / "relay-tool-denied").exists()
+    with pytest.raises(CompletionError) as caught:
+        adapter.complete(
+            request, cwd=tmp_path, cancel=threading.Event(), timeout_s=5, max_output_bytes=10000
+        )
+    assert caught.value.code == "backend_tool_activity"
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_output_schema_encodes_only_dynamic_arguments_and_remains_strict(
+    tmp_path: Path, forced: bool
+) -> None:
+    from relay.gateway.envelope import prepare_envelope
+    from relay.gateway.protocol import parse_request
+
+    request: dict[str, Any] = {
+        "model": "codex",
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "edit", "parameters": {"type": "object"}},
+            }
+        ],
+    }
+    if forced:
+        request["tool_choice"] = {"type": "function", "function": {"name": "edit"}}
+    schema = prepare_envelope(parse_request(request))
+    assert schema is not None
+    arguments = CodexCompletionAdapter.arguments(
+        CompletionRequest("x", output_schema=schema), tmp_path
+    )
+    stored = json.loads(
+        Path(arguments[arguments.index("--output-schema") + 1]).read_text(encoding="utf-8")
+    )
+    stored_flat = stored["properties"]["tool_calls"]["items"]["anyOf"][0]
+    stored_nested = stored["properties"]["tool_calls"]["items"]["anyOf"][1]
+    assert stored_flat["properties"]["arguments"] == {"type": "string"}
+    assert stored_nested["properties"]["function"]["properties"]["arguments"] == {"type": "string"}
+    raw_flat = schema["properties"]["tool_calls"]["items"]["anyOf"][0]
+    assert raw_flat["properties"]["arguments"] == {"type": ["object", "string"]}
+    assert stored["additionalProperties"] is False
+    assert stored_flat["additionalProperties"] is False
+    assert stored_nested["additionalProperties"] is False
+    assert stored_flat["properties"]["name"] == {
+        "type": "string",
+        "enum": ["edit"],
+    }
+    assert stored_nested["properties"]["function"]["properties"]["name"] == {
+        "type": "string",
+        "enum": ["edit"],
+    }
+    # Strict mode requires every property; optional id/type must already accept the nulls
+    # Codex then emits, without an anyOf wrapper the gateway schema would not match.
+    for item in (stored_flat, stored_nested):
+        assert {"id", "type"} <= set(item["required"])
+        assert item["properties"]["id"] == {"type": ["string", "null"]}
+        assert item["properties"]["type"] == {"type": ["string", "null"]}
+
+
+def test_nested_tool_arguments_decode_and_non_object_function_is_invalid() -> None:
+    nested = {
+        "content": None,
+        "tool_calls": [
+            {"function": {"name": "edit", "arguments": '{"x": 1}'}, "id": None, "type": None}
+        ],
+    }
+    completion = parse_completion(result(json.dumps(nested)), structured=True)
+    assert completion.envelope is not None
+    assert completion.envelope["tool_calls"][0]["function"]["arguments"] == {"x": 1}
+    bad = {"content": None, "tool_calls": [{"function": "edit", "arguments": "{}"}]}
+    with pytest.raises(CompletionInvalid) as caught:
+        parse_completion(result(json.dumps(bad)), structured=True)
+    assert "invalid tool arguments" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("proc", "status", "code"),
+    [
+        (ProcessResult(None, timed_out=True), 504, "timeout"),
+        (ProcessResult(1, stderr="context_length_exceeded"), 400, "context_length_exceeded"),
+        (ProcessResult(1, stderr="429 quota"), 429, "rate_limit_exceeded"),
+    ],
+)
+def test_error_mapping(proc: ProcessResult, status: int, code: str) -> None:
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(proc, structured=False)
+    assert (caught.value.status, caught.value.code) == (status, code)
+
+
+def test_event_number_429_is_not_rate_limit() -> None:
+    events = [
+        {"type": "turn.completed", "usage": {"input_tokens": 88429, "output_tokens": 12}},
+        {"type": "turn.failed", "error": {"message": "boom"}},
+    ]
+    proc = ProcessResult(1, "\n".join(json.dumps(event) for event in events))
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(proc, structured=False)
+    assert (caught.value.status, caught.value.code) == (502, "completion_failed")
+
+
+def test_failed_event_rate_limit_text_is_rate_limit() -> None:
+    event = {"type": "turn.failed", "error": {"message": "rate limit reached"}}
+    with pytest.raises(CompletionError) as caught:
+        parse_completion(ProcessResult(1, json.dumps(event)), structured=False)
+    assert (caught.value.status, caught.value.code) == (429, "rate_limit_exceeded")
+
+
+def test_unconfirmed_process_drain_is_quarantined(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter = CodexCompletionAdapter(Agent(cmd=sys.executable))
+
+    def resolve(*args: Any, **kwargs: Any) -> str:
+        return sys.executable
+
+    monkeypatch.setattr(module, "resolve_command", resolve)
+
+    def run(*args: Any, **kwargs: Any) -> ProcessResult:
+        raise ProcessDrainError("undrained")
+
+    monkeypatch.setattr(module, "run_process", run)
+    with pytest.raises(CompletionError) as caught:
+        adapter.complete(
+            CompletionRequest("x"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert caught.value.code == "termination_unknown"
+
+
+def test_debug_models_json_lists_visible_valid_slugs_in_cli_order() -> None:
+    # Shape from the real `codex debug models` response; context metadata alone is
+    # deliberately not treated as a complete context/output observation.
+    payload = {
+        "models": [
+            {"slug": "gpt-main", "visibility": "list", "context_window": 500000},
+            {"slug": "gpt-internal", "visibility": "hide"},
+            {"slug": "gpt-main", "visibility": "list"},
+            {"slug": "gpt-compatible"},
+            {"slug": "--unsafe"},
+            {"slug": 123},
+            None,
+        ]
+    }
+    assert module._model_slugs(json.dumps(payload)) == ("gpt-main", "gpt-compatible")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_debug_models_enumeration_uses_configured_command_and_environment_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "_ENUMERATED", {})
+    calls: list[dict[str, Any]] = []
+
+    def resolve(cmd: str, args: tuple[str, ...], **kwargs: Any) -> tuple[str, ...]:
+        assert args == ("debug", "models")
+        return (cmd, *args)
+
+    def run(argv: tuple[str, ...], **kwargs: Any) -> ProcessResult:
+        assert kwargs["timeout_s"] == module.ENUMERATION_TIMEOUT_S
+        calls.append({"argv": argv, **kwargs})
+        return ProcessResult(0, '{"models":[{"slug":"gpt-listed"}]}')
+
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    agent = Agent(cmd="configured-codex", models={"fallback": "configured-only"})
+    first = CodexCompletionAdapter(agent, parent_env={"OPENAI_API_KEY": "first"})
+    second = CodexCompletionAdapter(agent, parent_env={"OPENAI_API_KEY": "first"})
+    assert first.default_aliases == second.default_aliases == ("default", "gpt-listed")
+    assert len(calls) == 1
+    assert calls[0]["argv"] == ("configured-codex", "debug", "models")
+    assert calls[0]["env"]["OPENAI_API_KEY"] == "first"
+    third = CodexCompletionAdapter(agent, parent_env={"OPENAI_API_KEY": "second"})
+    assert third.default_aliases == ("default", "gpt-listed")
+    assert len(calls) == 2
+    assert all("first" not in fingerprint for _, fingerprint in module._ENUMERATED)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "proc",
+    [
+        ProcessResult(1, stderr="private provider diagnostic"),
+        ProcessResult(0, '{"models":[{"slug":"gpt-partial"}]}', timed_out=True),
+        ProcessResult(0, "not json"),
+        ProcessResult(0, "[]"),
+        ProcessResult(0, '{"models":{}}'),
+        ProcessResult(0, '{"models":[]}'),
+        ProcessResult(0, '{"models":[{"slug":"hidden","visibility":"hide"}]}'),
+    ],
+)
+def test_failed_enumeration_warns_once_and_falls_back_to_configured_models(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, proc: ProcessResult
+) -> None:
+    monkeypatch.setattr(module, "_ENUMERATED", {})
+    calls = 0
+
+    def run(*_: Any, **__: Any) -> ProcessResult:
+        nonlocal calls
+        calls += 1
+        return proc
+
+    def resolve(*_: object, **__: object) -> tuple[str, ...]:
+        return ("codex",)
+
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    agent = Agent(cmd="codex", models={"custom": "gpt-configured"})
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+        assert CodexCompletionAdapter(agent, parent_env={}).default_aliases == (
+            "default",
+            "gpt-configured",
+        )
+        assert CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).default_aliases == (
+            "default",
+        )
+    assert calls == 1
+    assert len(caplog.records) == 1
+    assert "using configured models" in caplog.text
+    assert "private provider diagnostic" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error", [CommandNotFound("missing"), OSError("failed"), OutputLimitExceeded("too large")]
+)
+def test_enumeration_process_failures_warn_and_fall_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
+) -> None:
+    monkeypatch.setattr(module, "_ENUMERATED", {})
+
+    def run(*_: Any, **__: Any) -> ProcessResult:
+        raise error
+
+    def resolve(*_: object, **__: object) -> tuple[str, ...]:
+        return ("codex",)
+
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+        assert CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).default_aliases == (
+            "default",
+        )
+    assert len(caplog.records) == 1
+
+
+@pytest.mark.parametrize("error", [ProcessCancelled("stop"), ProcessDrainError("undrained")])
+def test_enumeration_preserves_shutdown_and_process_ownership_failures(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr(module, "_ENUMERATED", {})
+
+    def run(*_: Any, **__: Any) -> ProcessResult:
+        raise error
+
+    def resolve(*_: object, **__: object) -> tuple[str, ...]:
+        return ("codex",)
+
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    with pytest.raises(type(error)):
+        _ = CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).default_aliases
+    assert not module._ENUMERATED  # pyright: ignore[reportPrivateUsage]
+
+
+def test_codex_stream_sink(tmp_path: Path) -> None:
+    chunks: list[str] = []
+    sink = module._stream_sink(chunks.append, tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    # 1. turn.started
+    sink(json.dumps({"type": "turn.started"}))
+
+    # 2. item.started with agent_message text
+    sink(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {"type": "agent_message", "text": "start "},
+            }
+        )
+    )
+    assert chunks == ["start "]
+
+    # 3. item.updated with delta
+    sink(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "update ",
+            }
+        )
+    )
+    assert chunks == ["start ", "update "]
+
+    # 4. item.completed with cumulative text
+    sink(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "start update completed"},
+            }
+        )
+    )
+    assert chunks == ["start ", "update ", "completed"]
+
+    # 5. reasoning item is allowed without emitting or failing
+    sink(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "reasoning", "text": "thinking"},
+            }
+        )
+    )
+    assert chunks == ["start ", "update ", "completed"]
+
+    # 6. immediate halt if non-agent_message/reasoning item occurs
+    chunks.clear()
+    sink2 = module._stream_sink(chunks.append, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    sink2(json.dumps({"type": "turn.started"}))
+    sink2(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "ok",
+            }
+        )
+    )
+    assert chunks == ["ok"]
+    # Send a tool/other item
+    sink2(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {"type": "command_execution"},
+            }
+        )
+    )
+    # Subsequent message is ignored
+    sink2(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "ignored",
+            }
+        )
+    )
+    assert chunks == ["ok"]
+
+    # 7. immediate halt if denied marker exists
+    chunks.clear()
+    denied_marker = tmp_path / module._DENIED  # pyright: ignore[reportPrivateUsage]
+    denied_marker.touch()
+    sink3 = module._stream_sink(chunks.append, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    sink3(json.dumps({"type": "turn.started"}))
+    sink3(
+        json.dumps(
+            {
+                "type": "item.updated",
+                "item": {"type": "agent_message"},
+                "delta": "ignored",
+            }
+        )
+    )
+    assert chunks == []
+    denied_marker.unlink()
+
+
+def test_codex_complete_streaming(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_no_models(*_a: object, **_k: object) -> tuple[str, ...]:
+        return ()
+
+    def fake_resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        return ("codex",)
+
+    monkeypatch.setattr(module, "_enumerated_models", fake_no_models)
+    agent = Agent(cmd="codex")
+    adapter = CodexCompletionAdapter(agent, parent_env={})
+
+    events = [
+        {"type": "turn.started"},
+        {"type": "item.started", "item": {"type": "agent_message", "text": "first "}},
+        {"type": "item.updated", "item": {"type": "agent_message"}, "delta": "second"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "first second"}},
+        {"type": "turn.completed"},
+    ]
+    raw_lines = [json.dumps(e) for e in events]
+
+    def mock_run_process(cmd: Any, **kwargs: Any) -> ProcessResult:
+        entry = _OUTPUT_SINK.get()
+        if entry is not None:
+            sink, _ = entry
+            for line in raw_lines:
+                sink(line)
+        return ProcessResult(0, "\n".join(raw_lines))
+
+    monkeypatch.setattr(module, "run_process", mock_run_process)
+    monkeypatch.setattr(module, "resolve_command", fake_resolve)
+
+    chunks: list[str] = []
+    res = adapter.complete(
+        CompletionRequest("test", "default"),
+        cwd=tmp_path,
+        cancel=threading.Event(),
+        timeout_s=5,
+        max_output_bytes=10000,
+        on_chunk=chunks.append,
+    )
+    assert res.content == "first second"
+    assert chunks == ["first ", "second"]
+
+    # Also test with stream_completion_chunks
+    chunks_ctx: list[str] = []
+    with stream_completion_chunks(chunks_ctx.append):
+        res2 = adapter.complete(
+            CompletionRequest("test", "default"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert res2.content == "first second"
+    assert chunks_ctx == ["first ", "second"]
+
+
+def test_windows_hook_command_propagates_powershell_exit_code(tmp_path: Path) -> None:
+    command, windows = module._hook_command(  # pyright: ignore[reportPrivateUsage]
+        Path("C:/Py's/python.exe"), tmp_path / "relay-deny-tools.py"
+    )
+    assert windows.startswith("& 'C:")
+    assert "'C:\\Py''s\\python.exe'" in windows or "'C:/Py''s/python.exe'" in windows
+    assert windows.endswith("; exit $LASTEXITCODE")
+    assert "LASTEXITCODE" not in command
+
+
+def test_process_failure_logs_stderr_but_returns_fixed_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = ProcessResult(1, stderr="private provider diagnostic key-secret")
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        pytest.raises(CompletionError) as caught,
+    ):
+        parse_completion(proc, structured=False, secrets={"OPENAI_API_KEY": "key-secret"})
+    assert str(caught.value) == "Codex CLI completion failed: exit code 1"
+    assert caught.value.code == "completion_failed"
+    assert "private provider diagnostic" in caplog.text
+    assert "key-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("failure", [OSError("[WinError 206] too long"), ValueError("newline")])
+def test_launch_failures_are_not_reported_as_policy_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: Exception
+) -> None:
+    def no_models(*_: object) -> tuple[str, ...]:
+        return ()
+
+    def resolve(*_a: object, **_k: object) -> tuple[str, ...]:
+        if isinstance(failure, ValueError):
+            raise failure
+        return ("codex",)
+
+    def run(*_a: object, **_k: object) -> ProcessResult:
+        raise failure
+
+    monkeypatch.setattr(module, "_enumerated_models", no_models)
+    monkeypatch.setattr(module, "resolve_command", resolve)
+    monkeypatch.setattr(module, "run_process", run)
+    with pytest.raises(CompletionError) as caught:
+        CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).complete(
+            CompletionRequest("x"),
+            cwd=tmp_path,
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert str(caught.value) == "Codex CLI could not be started"
+    assert caught.value.code == "completion_failed"
+
+
+def test_policy_write_failure_remains_policy_setup_failed(tmp_path: Path) -> None:
+    with pytest.raises(CompletionError) as caught:
+        CodexCompletionAdapter(Agent(cmd="codex"), parent_env={}).complete(
+            CompletionRequest("x"),
+            cwd=tmp_path / "missing",
+            cancel=threading.Event(),
+            timeout_s=5,
+            max_output_bytes=10000,
+        )
+    assert caught.value.code == "policy_setup_failed"

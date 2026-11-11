@@ -1,0 +1,398 @@
+"""Admission and child lifetime for the foreground completion service.
+
+All entry points belong to one asyncio loop. Permits cover the HTTP response lifetime:
+the route must call ``handle.drain()`` after sending or abandoning its response.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import functools
+import logging
+import math
+import shutil
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from relay.adapters.completion import (
+    CompletionCapable,
+    CompletionError,
+    CompletionInvalid,
+    CompletionRequest,
+    CompletionResult,
+    CompletionTerminationError,
+    aggregate_usage,
+    stream_completion_chunks,
+)
+
+from .logctx import AGENT
+from .render import render_repair
+
+logger = logging.getLogger("uvicorn.error")
+
+DRAIN_GRACE_S = 15.0
+
+
+@dataclass(frozen=True)
+class GatewayLimits:
+    concurrency: int = 4
+    timeout_s: float = 1800
+    max_request_bytes: int = 8 * 1024 * 1024
+    max_output_bytes: int = 8 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        for name in ("concurrency", "max_request_bytes", "max_output_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if isinstance(self.timeout_s, bool) or not math.isfinite(self.timeout_s):
+            raise ValueError("timeout_s must be positive and finite")
+        if self.timeout_s <= 0:
+            raise ValueError("timeout_s must be positive and finite")
+
+
+class CompletionHandle:
+    def __init__(self, runtime: GatewayRuntime, agent: str) -> None:
+        self._runtime = runtime
+        self._agent = agent
+        self._cancel = threading.Event()
+        self._released = False
+        self._quarantined = False
+        self.chunks: asyncio.Queue[str | None] = asyncio.Queue()
+        self.streamed_content: str = ""
+        self.result: asyncio.Task[CompletionResult]
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    async def drain(self) -> None:
+        """Cancel pending work and release only after real drainage; cleanup never masks errors."""
+        self.cancel()
+        while not self.result.done():
+            try:
+                await asyncio.shield(self.result)
+            except asyncio.CancelledError:
+                # Repeated ASGI cancellation must not abandon the child future.
+                continue
+            except Exception:
+                break
+        if not self.result.cancelled():
+            self.result.exception()  # consume a failed task even after the client disconnected
+        if not self._released and not self._quarantined:
+            self._released = True
+            self._runtime._release(self)  # pyright: ignore[reportPrivateUsage]
+
+
+class GatewayRuntime:
+    def __init__(self, limits: GatewayLimits, agent_limits: Mapping[str, int]) -> None:
+        if any(isinstance(v, bool) or v < 1 for v in agent_limits.values()):
+            raise ValueError("agent concurrency must be positive")
+        self.limits = limits
+        self._agent_limits = dict(agent_limits)
+        self._counts: dict[str, int] = {}
+        self._handles: set[CompletionHandle] = set()
+        self._closed = False
+        self._healthy = True
+        self._workers: set[asyncio.Future[CompletionResult]] = set()
+        # Admission bounds completion workers to `concurrency`; +1 for the single discovery
+        # thread. A dedicated pool means an admitted worker never queues behind unrelated
+        # default-executor work (which would look like an unconfirmed termination).
+        self.executor = ThreadPoolExecutor(
+            max_workers=limits.concurrency + 1, thread_name_prefix="relay-completion"
+        )
+
+    @property
+    def active(self) -> int:
+        return len(self._handles)
+
+    @property
+    def healthy(self) -> bool:
+        return self._healthy
+
+    def quarantine(self) -> None:
+        """Stop admission after child termination outside a permit could not be confirmed."""
+        self._healthy = False
+
+    def start(
+        self,
+        backend: CompletionCapable,
+        request: CompletionRequest,
+        *,
+        validate: Callable[[CompletionResult], CompletionResult] | None = None,
+        timeout_s: float | None = None,
+        max_output_bytes: int | None = None,
+    ) -> CompletionHandle:
+        # No await between checking capacity and reserving both counters.
+        if self._closed:
+            # Shutdown aborts request waiters; discovery must not mistake it for a missing CLI.
+            raise CompletionError("Gateway is shutting down", status=503, code="request_cancelled")
+        if not self._healthy:
+            raise CompletionError(
+                "Gateway is not accepting requests", status=503, code="unavailable"
+            )
+        count = self._counts.get(backend.id, 0)
+        cap = self._agent_limits.get(backend.id, self.limits.concurrency)
+        if self.active >= self.limits.concurrency or count >= cap:
+            raise CompletionError(
+                "Gateway capacity is full", status=429, code="rate_limit_exceeded"
+            )
+        limits = replace(
+            self.limits,
+            timeout_s=min(
+                self.limits.timeout_s,
+                self.limits.timeout_s if timeout_s is None else timeout_s,
+            ),
+            max_output_bytes=min(
+                self.limits.max_output_bytes,
+                self.limits.max_output_bytes if max_output_bytes is None else max_output_bytes,
+            ),
+        )
+        handle = CompletionHandle(self, backend.id)
+        self._counts[backend.id] = count + 1
+        self._handles.add(handle)
+        handle.result = asyncio.create_task(
+            self._execute(handle, backend, request, validate, limits)
+        )
+        return handle
+
+    async def complete_when_available(
+        self,
+        backend: CompletionCapable,
+        request: CompletionRequest,
+        *,
+        cancel: threading.Event,
+        timeout_s: float,
+        max_output_bytes: int,
+    ) -> CompletionResult:
+        """Run background discovery under the same admission and drainage as HTTP work."""
+        while True:
+            if cancel.is_set():
+                raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
+            try:
+                handle = self.start(
+                    backend, request, timeout_s=timeout_s, max_output_bytes=max_output_bytes
+                )
+                break
+            except CompletionError as exc:
+                if exc.status != 429:
+                    raise
+                # Saturation defers a probe; it is not an observation about the alias.
+                await asyncio.sleep(0.05)
+        try:
+            while not handle.result.done():
+                if cancel.is_set():
+                    handle.cancel()
+                await asyncio.wait({handle.result}, timeout=0.05)
+            return handle.result.result()
+        finally:
+            await handle.drain()
+
+    def _release(self, handle: CompletionHandle) -> None:
+        self._handles.discard(handle)
+        agent = handle._agent  # pyright: ignore[reportPrivateUsage]
+        self._counts[agent] -= 1
+
+    async def shutdown(self) -> None:
+        self._closed = True
+        handles = tuple(self._handles)
+        for handle in handles:
+            handle.cancel()
+        if handles:
+            # Each handle drains its thread; cancellation of shutdown cannot lose ownership.
+            drainage = asyncio.gather(*(handle.drain() for handle in handles))
+            while not drainage.done():
+                try:
+                    await asyncio.shield(drainage)
+                except asyncio.CancelledError:
+                    continue
+        # Drained workers are done; never block the loop on a quarantined (stuck) thread.
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _call(
+        self,
+        handle: CompletionHandle,
+        backend: CompletionCapable,
+        request: CompletionRequest,
+        cwd: Path,
+        deadline: float,
+        validate: Callable[[CompletionResult], CompletionResult] | None,
+        max_output_bytes: int,
+        *,
+        stream_chunks: bool = True,
+    ) -> CompletionResult:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CompletionError("Completion deadline expired", status=504, code="timeout")
+        cancellation = handle._cancel  # pyright: ignore[reportPrivateUsage]
+        if cancellation.is_set():
+            raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
+
+        loop = asyncio.get_running_loop()
+        streamed: list[str] = []
+        unicode_error: CompletionError | None = None
+
+        def on_chunk(text: str) -> None:
+            nonlocal unicode_error
+            if not text or cancellation.is_set() or unicode_error is not None:
+                return
+            try:
+                text.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                unicode_error = CompletionError("completion contains invalid Unicode")
+                cancellation.set()
+                return
+            streamed.append(text)
+            loop.call_soon_threadsafe(handle.chunks.put_nowait, text)
+
+        def invoke_and_validate() -> CompletionResult:
+            sink = on_chunk if stream_chunks else None
+            with stream_completion_chunks(sink):
+                result = backend.complete(
+                    request,
+                    cwd=cwd,
+                    cancel=cancellation,
+                    timeout_s=remaining,
+                    max_output_bytes=max_output_bytes,
+                )
+            if unicode_error is not None:
+                raise unicode_error
+            if cancellation.is_set():
+                raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
+            # A result that finished in time is validated even if the deadline passes meanwhile.
+            # Validation is bounded separately and belongs to this same owned worker. It
+            # must never block the ASGI loop or escape the request deadline/drain accounting;
+            # the loop below still times out a worker that has not finished by the deadline.
+            return validate(result) if validate is not None else result
+
+        worker = loop.run_in_executor(
+            self.executor, functools.partial(contextvars.copy_context().run, invoke_and_validate)
+        )
+        self._workers.add(worker)
+        worker.add_done_callback(self._workers.discard)
+        interrupted = False
+        try:
+            # Polling observes disconnect without cancelling the worker future itself.
+            while not worker.done() and not cancellation.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.wait({worker}, timeout=min(0.05, remaining))
+        except asyncio.CancelledError:
+            interrupted = True
+            cancellation.set()
+        # A worker that finished in the same tick the deadline passed keeps its result.
+        expired = not worker.done() and time.monotonic() >= deadline
+        if not worker.done():
+            cancellation.set()
+            drain_until = time.monotonic() + DRAIN_GRACE_S
+            while not worker.done() and time.monotonic() < drain_until:
+                try:
+                    await asyncio.wait({worker}, timeout=max(0, drain_until - time.monotonic()))
+                except asyncio.CancelledError:
+                    interrupted = True
+            if not worker.done():
+                worker.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
+                raise CompletionTerminationError()
+        if unicode_error is not None and not expired and not interrupted:
+            failure = worker.exception()
+            if isinstance(failure, CompletionTerminationError):
+                raise failure
+            raise unicode_error
+        if expired or interrupted or cancellation.is_set():
+            # Consume the worker exception, but preserve termination failures over cancellation.
+            failure = worker.exception()
+            if isinstance(failure, CompletionTerminationError):
+                raise failure
+            if expired:
+                raise CompletionError("Completion deadline expired", status=504, code="timeout")
+            raise CompletionError("Completion cancelled", status=503, code="request_cancelled")
+        if stream_chunks:
+            handle.streamed_content = "".join(streamed)
+        return worker.result()
+
+    async def _execute(
+        self,
+        handle: CompletionHandle,
+        backend: CompletionCapable,
+        request: CompletionRequest,
+        validate: Callable[[CompletionResult], CompletionResult] | None,
+        limits: GatewayLimits,
+    ) -> CompletionResult:
+        # This task runs in its own context copy; _call copies it into the worker thread.
+        AGENT.set(handle._agent)  # pyright: ignore[reportPrivateUsage]
+        directory: Path | None = None
+        deadline = time.monotonic() + limits.timeout_s
+        try:
+            directory = Path(tempfile.mkdtemp(prefix="relay-completion-"))
+            first_invalid: CompletionInvalid | None = None
+            current = request
+            for attempt in range(2):
+                try:
+                    result = await self._call(
+                        handle,
+                        backend,
+                        current,
+                        directory,
+                        deadline,
+                        validate,
+                        limits.max_output_bytes,
+                        stream_chunks=(attempt == 0),
+                    )
+                    if first_invalid is not None:
+                        result = replace(
+                            result, usage=aggregate_usage(first_invalid.usage, result.usage)
+                        )
+                    return result
+                except CompletionInvalid as exc:
+                    if request.output_schema is None or attempt:
+                        if first_invalid is not None:
+                            logger.warning(
+                                "completion invalid after repair retry first_reason=%s "
+                                "second_reason=%s",
+                                first_invalid.reason,
+                                exc.reason,
+                            )
+                        raise
+                    # Class name and fixed reason only: the message and raw output can carry
+                    # completion content.
+                    logger.debug(
+                        "completion repair retry error=%s reason=%s",
+                        type(exc).__name__,
+                        exc.reason,
+                    )
+                    first_invalid = exc
+                    current = replace(
+                        request, prompt=render_repair(request.prompt, exc.raw, str(exc))
+                    )
+            raise AssertionError("completion repair loop exhausted")
+        except CompletionTerminationError:
+            # Fail closed, but never silently: the operator must be able to attribute the lockout.
+            logger.error(
+                "completion termination unconfirmed; quarantining gateway backend=%s",
+                handle._agent,  # pyright: ignore[reportPrivateUsage]
+            )
+            self._healthy = False
+            handle._quarantined = True  # pyright: ignore[reportPrivateUsage]
+            raise
+        finally:
+            handle.chunks.put_nowait(None)
+            if directory is not None and not handle._quarantined:  # pyright: ignore[reportPrivateUsage]
+                try:
+                    shutil.rmtree(directory)
+                except OSError as exc:
+                    # The child has already exited here (otherwise _call raised above), so a failed
+                    # cleanup of the private scratch dir is not grounds to stop serving. Retain the
+                    # residue and warn with its path and error type only — never its contents.
+                    logger.warning(
+                        "scratch cleanup failed; retaining residue path=%s error=%s",
+                        directory,
+                        type(exc).__name__,
+                    )

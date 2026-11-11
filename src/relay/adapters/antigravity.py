@@ -1,0 +1,107 @@
+"""Antigravity completion envelope parsing."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, cast
+
+_AGY_STATUSES = frozenset(
+    {"SUCCESS", "ERROR", "CANCELED", "INTERRUPTED", "INVALID", "WAITING", "RUNNING"}
+)
+
+
+def _try_json(text: str) -> dict[str, Any] | None:
+    """Parse `text` as a JSON object, or None."""
+    try:
+        data: Any = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return cast("dict[str, Any]", data) if isinstance(data, dict) else None
+
+
+def _is_envelope(data: dict[str, Any]) -> bool:
+    """True when `data` looks like the `agy` JSON envelope (design section 7.2).
+
+    The envelope carries ``conversation_id``, ``status``, ``response``, ``error``,
+    ``structured_output`` and ``usage``; it has no ``"type"`` marker like Claude's.
+    """
+    if data.get("status") in _AGY_STATUSES:
+        return True
+    return "conversation_id" in data or "structured_output" in data
+
+
+def _unwrap_envelope(data: dict[str, Any]) -> dict[str, Any] | None:
+    if data.get("event") == "result" and isinstance(data.get("result"), dict):
+        inner = cast("dict[str, Any]", data["result"])
+        return inner if _is_envelope(inner) else None
+    if _is_envelope(data):
+        return data
+    return None
+
+
+def _agy_payload(stdout: str) -> dict[str, Any] | None:
+    """Parse the `agy` ``--output-format json`` envelope from stdout, or None.
+
+    The envelope is a single JSON object (the whole stdout for ``--output-format json``);
+    a line scan is the fallback in case progress text precedes it.
+    """
+    text = stdout.strip()
+    if not text:
+        return None
+    data = _try_json(text)
+    if data is not None:
+        unwrapped = _unwrap_envelope(data)
+        if unwrapped is not None:
+            return unwrapped
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        data = _try_json(line)
+        if data is not None:
+            unwrapped = _unwrap_envelope(data)
+            if unwrapped is not None:
+                return unwrapped
+    return None
+
+
+def _extract_dict_error(err_dict: dict[str, Any]) -> str | None:
+    for key in ("message", "detail", "error"):
+        val = err_dict.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            nested = _extract_dict_error(cast("dict[str, Any]", val))
+            if nested is not None:
+                return nested
+    return None
+
+
+def _error_text(payload: dict[str, Any]) -> str | None:
+    """The envelope's `error` text, when present."""
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    if isinstance(error, dict):
+        error_dict = cast("dict[str, Any]", error)
+        text = _extract_dict_error(error_dict)
+        if text is not None:
+            return text
+        if error_dict:
+            try:
+                return json.dumps(error_dict)
+            except (TypeError, ValueError):
+                return str(error_dict)
+    elif error is not None:
+        text = str(error).strip()
+        if text:
+            return text
+    for key in ("message", "detail", "reason"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+agy_envelope = _agy_payload
+envelope_error = _error_text
