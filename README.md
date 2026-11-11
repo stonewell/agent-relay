@@ -70,6 +70,20 @@ The gateway accepts OpenAI-compatible `POST /v1/chat/completions` requests. Stre
 proposals are supported; proposed tools are returned to the client and never executed by Relay.
 Reasoning effort depends on the backend.
 
+## Examples
+
+[`examples/opencode`](examples/opencode) is an [opencode](https://opencode.ai) (v2 config format)
+project that uses the gateway:
+
+- `opencode.json` defines a `relay` provider at `http://127.0.0.1:8765/v1` with the Claude and
+  Codex models. Set `apiKey` to the token you pass to `relay serve --key`. The default model is
+  `relay/codex/gpt-5.6-luna` and the default agent is `router`.
+- `.opencode/agents/` defines three agents. `router` is a cheap primary agent that cannot edit or
+  run commands and delegates each task. `flash` handles small, clear tasks and `pro` handles
+  complex or risky work.
+
+Run `opencode` from `examples/opencode` after starting the gateway.
+
 ## Development
 
 ```sh
